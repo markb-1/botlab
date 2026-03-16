@@ -1,0 +1,44 @@
+appId: com.botlab.app
+productName: BotLab
+copyright: Copyright © 2025
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist-electron/**/*
+  - web/client/dist/**/*
+  - src/core/**/*
+  - src/utils/**/*
+  - node_modules/**/*
+  - package.json
+
+extraMetadata:
+  main: dist-electron/electron/main.js
+
+mac:
+  category: public.app-category.finance
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+win:
+  target:
+    - nsis
+    - portable
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Finance
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+# Rebuild native modules for Electron
+npmRebuild: true

@@ -1,0 +1,400 @@
+/**
+ * BotContext SDK Type Definitions
+ *
+ * This is the public API surface available to user scripts running in worker threads.
+ * Scripts receive a BotContext object with trading, data, scheduling, and storage capabilities.
+ * Private keys and CLOB clients remain in the main process -- workers communicate via RPC.
+ */
+
+// ============================================================================
+// Core BotContext Interface
+// ============================================================================
+
+export interface BotContext {
+  /** User-defined config values (from UI form, driven by script's configSchema) */
+  readonly config: Readonly<Record<string, unknown>>;
+
+  /** Bot metadata */
+  readonly botId: string;
+  readonly botName: string;
+
+  /** Current timestamp (ms). Use instead of Date.now() for backtest compatibility. */
+  readonly now: number;
+
+  // === Trading ===
+  buy(tokenId: string, amountUsd: number, opts?: OrderOpts): Promise<TradeResult>;
+  sell(tokenId: string, amountTokens: number, opts?: OrderOpts): Promise<TradeResult>;
+  getOrderBook(tokenId: string): Promise<OrderBook>;
+  getPositions(): Promise<Position[]>;
+  getBalance(): Promise<number>;
+
+  // === Market Data ===
+  getMarkets(query?: MarketQuery): Promise<Market[]>;
+  getMarketPrice(tokenId: string): Promise<MarketPrice>;
+  getEvent(eventSlug: string): Promise<PolymarketEvent>;
+
+  // === HTTP (runs directly in worker) ===
+  fetch(url: string, init?: RequestInit): Promise<Response>;
+
+  // === Scheduling (tracked for cleanup on stop) ===
+  setInterval(fn: () => void | Promise<void>, ms: number): string;
+  setTimeout(fn: () => void | Promise<void>, ms: number): string;
+  clearInterval(handle: string): void;
+  clearTimeout(handle: string): void;
+
+  // === Logging (forwarded to main process) ===
+  log: BotLogger;
+
+  // === Events (forwarded to main process) ===
+  emit(type: string, data?: Record<string, unknown>): void;
+
+  // === Per-bot key-value storage (persisted to SQLite) ===
+  storage: BotStorage;
+
+  // === Wallet info (read-only, no private key exposed) ===
+  readonly wallet: WalletInfo;
+
+  // === Binance spot trading ===
+  binance: BinanceContext;
+
+  // === Kelly Criterion position sizing ===
+  kelly: KellyContext;
+}
+
+// ============================================================================
+// Trading Types
+// ============================================================================
+
+export interface OrderOpts {
+  /** Maximum price willing to pay/accept. If not set, uses best available. */
+  maxPrice?: number;
+  /** Maximum slippage from current price (e.g., 0.05 = 5 cents) */
+  maxSlippage?: number;
+  /** Number of retries on transient failures (default: 3) */
+  retries?: number;
+}
+
+export interface TradeResult {
+  success: boolean;
+  /** Total USD executed */
+  executedAmount: number;
+  /** Average execution price */
+  price: number;
+  /** Tokens received (for buy) or sold (for sell) */
+  tokenAmount: number;
+  /** Error message if failed */
+  error?: string;
+  /** Sizing reasoning (for copy strategies) */
+  reasoning?: string;
+}
+
+export interface OrderBook {
+  bids: OrderBookEntry[];
+  asks: OrderBookEntry[];
+}
+
+export interface OrderBookEntry {
+  price: string;
+  size: string;
+}
+
+export interface Position {
+  /** Token ID (asset) */
+  tokenId: string;
+  /** Market slug or title */
+  market?: string;
+  /** Condition ID */
+  conditionId?: string;
+  /** Outcome label (e.g., "Yes", "No") */
+  outcome?: string;
+  /** Number of tokens held */
+  size: number;
+  /** Current value in USD */
+  currentValue: number;
+  /** Average purchase price */
+  avgPrice: number;
+}
+
+// ============================================================================
+// Market Data Types
+// ============================================================================
+
+export interface MarketQuery {
+  /** Search term for market title */
+  search?: string;
+  /** Filter by tag/category */
+  tag?: string;
+  /** Only active markets */
+  active?: boolean;
+  /** Only closed markets */
+  closed?: boolean;
+  /** Max results to return */
+  limit?: number;
+  /** Offset for pagination */
+  offset?: number;
+}
+
+export interface Market {
+  conditionId: string;
+  questionId: string;
+  slug: string;
+  title: string;
+  description: string;
+  outcomes: string[];
+  outcomePrices: string[];
+  tokens: MarketToken[];
+  active: boolean;
+  closed: boolean;
+  volume: string;
+  liquidity: string;
+  endDate?: string;
+  createdAt: string;
+}
+
+export interface MarketToken {
+  tokenId: string;
+  outcome: string;
+  price: number;
+  winner?: boolean;
+}
+
+export interface MarketPrice {
+  bid: number;
+  ask: number;
+  mid: number;
+  spread: number;
+}
+
+export interface PolymarketEvent {
+  id: string;
+  slug: string;
+  title: string;
+  description: string;
+  markets: Market[];
+  startDate?: string;
+  endDate?: string;
+  createdAt: string;
+}
+
+// ============================================================================
+// Logging
+// ============================================================================
+
+export interface BotLogger {
+  info(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+  debug(...args: unknown[]): void;
+}
+
+// ============================================================================
+// Storage
+// ============================================================================
+
+export interface BotStorage {
+  get<T = unknown>(key: string): Promise<T | null>;
+  set(key: string, value: unknown): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+// ============================================================================
+// Binance Types
+// ============================================================================
+
+export interface BinanceTradeResult {
+  success: boolean;
+  orderId?: number;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  executedQty: number;
+  cummulativeQuoteQty: number;
+  avgPrice: number;
+  error?: string;
+}
+
+export interface BinanceOrderBook {
+  bids: Array<{ price: string; quantity: string }>;
+  asks: Array<{ price: string; quantity: string }>;
+}
+
+export interface BinancePosition {
+  asset: string;
+  free: number;
+  locked: number;
+  total: number;
+  estimatedValueUsdt?: number;
+}
+
+export interface BinancePrice {
+  symbol: string;
+  price: number;
+}
+
+/**
+ * Binance trading context available to scripts via ctx.binance.*
+ */
+export interface BinanceContext {
+  buy(symbol: string, quoteAmountUsdt: number): Promise<BinanceTradeResult>;
+  sell(symbol: string, quantity: number): Promise<BinanceTradeResult>;
+  getBalance(asset?: string): Promise<number>;
+  getOrderBook(symbol: string, limit?: number): Promise<BinanceOrderBook>;
+  getPrice(symbol: string): Promise<BinancePrice>;
+  getPositions(): Promise<BinancePosition[]>;
+}
+
+// ============================================================================
+// Kelly Criterion Types
+// ============================================================================
+
+export interface KellyConfig {
+  /** Fraction of Kelly to use (0.25 = quarter Kelly) */
+  kellyFraction: number;
+  /** Minimum edge required (e.g., 0.03 = 3%) */
+  minEdge: number;
+  /** Maximum position as fraction of bankroll (e.g., 0.05 = 5%) */
+  maxPositionFraction: number;
+  /** Minimum sample size to trust win rate */
+  minSampleSize: number;
+  /** Confidence decay rate for small samples */
+  confidenceDecayRate: number;
+}
+
+export interface KellyResult {
+  /** Should we take this position? */
+  shouldTrade: boolean;
+  /** Recommended position size (fraction of bankroll) */
+  positionFraction: number;
+  /** Actual dollar amount to trade */
+  tradeAmount: number;
+  /** Calculated edge */
+  edge: number;
+  /** Raw Kelly fraction (before adjustments) */
+  rawKelly: number;
+  /** Confidence score (0-1) based on sample size */
+  confidence: number;
+  /** Reason for decision */
+  reason: string;
+}
+
+/**
+ * Kelly Criterion calculator available to scripts via ctx.kelly.
+ * Pure math — runs locally in the worker, no RPC needed.
+ */
+export interface KellyContext {
+  /**
+   * Calculate Kelly-optimal position size.
+   * @param winRate     - Historical win rate (0-1)
+   * @param sampleSize  - Number of resolved trades
+   * @param marketPrice - Current market price (0-1 for prediction markets)
+   * @param bankroll    - Available capital
+   * @param config      - Optional Kelly parameters (defaults to quarter Kelly)
+   */
+  calculate(
+    winRate: number,
+    sampleSize: number,
+    marketPrice: number,
+    bankroll: number,
+    config?: KellyConfig,
+  ): KellyResult;
+
+  /** Default config (quarter Kelly, 3% min edge, 5% max position) */
+  DEFAULT_CONFIG: KellyConfig;
+}
+
+// ============================================================================
+// Wallet Info (read-only)
+// ============================================================================
+
+export interface WalletInfo {
+  address: string;
+  proxyAddress?: string;
+}
+
+// ============================================================================
+// Script Metadata & Exports
+// ============================================================================
+
+/**
+ * The meta object exported by user scripts.
+ * Contains script metadata and a JSON Schema config definition.
+ */
+export interface ScriptMeta {
+  name: string;
+  description?: string;
+  version?: string;
+  author?: string;
+  configSchema?: Record<string, unknown>;
+}
+
+/**
+ * A compiled user script module.
+ * Scripts export these functions for lifecycle management.
+ *
+ * Two patterns are supported:
+ *   - Simple: export onTick(ctx) — called automatically on a polling interval
+ *   - Advanced: export onStart(ctx) — set up your own intervals and logic
+ *
+ * At least one of onStart or onTick must be defined.
+ */
+export interface ScriptModule {
+  meta?: ScriptMeta;
+  onStart?: (ctx: BotContext) => Promise<void> | void;
+  onStop?: (ctx: BotContext) => Promise<void> | void;
+  onHeartbeat?: (ctx: BotContext) => Record<string, unknown> | Promise<Record<string, unknown>>;
+  onTick?: (ctx: BotContext) => Promise<void> | void;
+}
+
+// ============================================================================
+// RPC Protocol (internal -- between worker and main process)
+// ============================================================================
+
+export type RpcMethod =
+  | 'polymarket:buy'
+  | 'polymarket:sell'
+  | 'polymarket:getOrderBook'
+  | 'polymarket:getPositions'
+  | 'polymarket:getBalance'
+  | 'polymarket:getMarkets'
+  | 'polymarket:getMarketPrice'
+  | 'polymarket:getEvent'
+  | 'storage:get'
+  | 'storage:set'
+  | 'storage:delete'
+  | 'log'
+  | 'emit'
+  | 'recordTrade'
+  | 'binance:buy'
+  | 'binance:sell'
+  | 'binance:getBalance'
+  | 'binance:getOrderBook'
+  | 'binance:getPrice'
+  | 'binance:getPositions';
+
+export interface RpcRequest {
+  id: string;
+  method: RpcMethod;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  args: any[];
+}
+
+export interface RpcResponse {
+  id: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  result?: any;
+  error?: string;
+}
+
+/** Messages from main process to worker */
+export type MainToWorkerMessage =
+  | { type: 'start' }
+  | { type: 'stop' }
+  | { type: 'heartbeat' }
+  | { type: 'rpc-response'; response: RpcResponse };
+
+/** Messages from worker to main process */
+export type WorkerToMainMessage =
+  | { type: 'started' }
+  | { type: 'stopped' }
+  | { type: 'error'; error: string }
+  | { type: 'heartbeat-result'; metrics: Record<string, unknown> }
+  | { type: 'rpc-request'; request: RpcRequest };

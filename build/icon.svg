@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="90" fill="#0a0a0a"/>
+
+  <!-- Bot head outline -->
+  <rect x="96" y="140" width="320" height="240" rx="36" stroke="#e8622c" stroke-width="14" fill="none"/>
+
+  <!-- Antenna -->
+  <line x1="256" y1="90" x2="256" y2="140" stroke="#e8622c" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="256" cy="80" r="14" fill="#e8622c"/>
+
+  <!-- Left eye: > chevron -->
+  <polyline points="160,220 200,256 160,292" stroke="#e8622c" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+  <!-- Right eye: underscore cursor -->
+  <rect x="260" y="272" width="90" height="16" rx="4" fill="#e8622c"/>
+
+  <!-- Ear nubs -->
+  <rect x="68" y="230" width="28" height="52" rx="14" fill="#e8622c"/>
+  <rect x="416" y="230" width="28" height="52" rx="14" fill="#e8622c"/>
+</svg>

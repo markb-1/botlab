@@ -1,0 +1,64 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-electron/
+
+# Environment variables (contains secrets)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Web client build
+web/client/dist/
+
+# Web server build
+web/server/dist/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Design references
+UI/
+
+# Ad-hoc scripts
+scripts/
+
+# Saved templates (local only)
+_saved-templates/
+
+release/
+dist/
+*.dmg
+*.zip
