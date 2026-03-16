@@ -52,8 +52,8 @@ web/server/dist/
 # Design references
 UI/
 
-# Ad-hoc scripts
-scripts/
+# Ad-hoc scripts (root-level only)
+/scripts/
 
 # Saved templates (local only)
 _saved-templates/
