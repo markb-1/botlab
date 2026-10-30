@@ -20,6 +20,16 @@ Implementation log for `docs/SPEC.md`. Each chunk is implemented, reviewed indep
 Testing policy: tests only for safety- and money-critical logic and core domain logic; existing suite must stay green.
 Known pre-existing failures: `tests/copytrading/1-polymarket-data-api.test.ts` calls the live Polymarket API (fails without network; skipped when `SKIP_NETWORK_TESTS=1`).
 
+## Decisions to review
+
+Judgement calls made during the overnight run. Each says how to reverse it.
+
+| # | chunk | decision | why | to reverse |
+|---|---|---|---|---|
+| R1 | 1a | Risk-exit sells are exempt from `max_order_usd`, `max_orders_per_hour`, `max_open_orders` and `max_spread` (still bound by scope, held position, price range, slippage). | Otherwise an exit from an ambiguous/rule-changed market can be impossible on a wide book or after the per-order cap. | Remove the exemptions in `RiskEngine` step 3/4. |
+| R2 | 1a | "Long horizon" is fixed at 30 days; mandate `resolves_within_days[1]` must be ≤ 30. | A mandate edit could otherwise switch off the long-horizon cap. | Change `LONG_HORIZON_DAYS` and the schema refinement. |
+| R3 | 1a | Market-quality gates (category, ambiguity, rules-changed, liquidity) apply to buys only. | Exits must remain possible from markets that became risky. | `RiskEngine` step 2. |
+
 ## Log
 
 ### 2026-10-30 — chunk 1a
