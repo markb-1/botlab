@@ -76,7 +76,7 @@ describe('RiskEngine — property: limits are never exceeded', () => {
           mandate: MandateSchema.parse({ markets: { min_liquidity_usd: 0 } }),
         };
         const engine = new RiskEngine(config);
-        const { limits, mandate } = config;
+        const { limits } = config;
 
         // position cost (USD) and shares per bot+market
         const cost = new Map<string, number>();
@@ -116,6 +116,7 @@ describe('RiskEngine — property: limits are never exceeded', () => {
             riskExit: o.riskExit,
             forecast: o.ledger ? { forecastId: 'f', probability: o.side === 'buy' ? 0.95 : 0.05 } : null,
             market: {
+              tokenId: mkt.id,
               category: mkt.category,
               endDate: new Date(START + mkt.days * DAY).toISOString(),
               ambiguityScore: 0,
@@ -139,7 +140,7 @@ describe('RiskEngine — property: limits are never exceeded', () => {
               botUsd: sum((b) => b === bot.id),
               marketUsd: sum((_b, m) => m === mkt.id),
               totalUsd: sum(() => true),
-              longHorizonUsd: sum((_b, m) => isLongHorizon(daysLeft(marketById(m)), mandate)),
+              longHorizonUsd: sum((_b, m) => isLongHorizon(daysLeft(marketById(m)))),
             },
             categoryBucket: {
               state: 'trading',
@@ -148,7 +149,7 @@ describe('RiskEngine — property: limits are never exceeded', () => {
             },
             botOrdersLastHour: 0,
             openOrdersCount: 0,
-            position: shares.has(k) ? { size: shares.get(k)!, openedAt: openedAt.get(k)! } : null,
+            position: shares.has(k) ? { size: shares.get(k)!, openSellSize: 0, openedAt: openedAt.get(k)! } : null,
           };
 
           const decision = engine.check(order, state);
@@ -170,7 +171,7 @@ describe('RiskEngine — property: limits are never exceeded', () => {
           // Invariants
           const totalLimit = Math.min(limits.global.max_total_exposure_usd, limits.global.max_total_exposure_pct * cfg.equity);
           expect(sum(() => true)).toBeLessThanOrEqual(totalLimit + EPS);
-          expect(sum((_b, m) => isLongHorizon(daysLeft(marketById(m)), mandate))).toBeLessThanOrEqual(
+          expect(sum((_b, m) => isLongHorizon(daysLeft(marketById(m))))).toBeLessThanOrEqual(
             limits.global.max_long_horizon_pct * totalLimit + EPS
           );
           for (const b of BOTS) {

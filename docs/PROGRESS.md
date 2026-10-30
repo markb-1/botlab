@@ -43,18 +43,36 @@ Files:
 Interpretations / deviations from spec:
 - Step 2 market checks: category, ambiguity, rules-changed and liquidity apply to **buys only**, so exits stay possible
   (the position manager must be able to exit on ambiguity ≥ 2 / rules change, §9.2). Market scope applies to all orders;
-  the end-of-market buffer applies to sells too except `riskExit` sells.
+  the end-of-market buffer applies to sells too except `riskExit` sells. (Risk-exit exemptions: see review fixes below.)
 - `bots.market_ids = null` means unscoped (existing human bots); `[]` allows nothing.
 - `bots.allocation_usd` can only lower the configured allocation, never raise it.
 - Liquidity check (`max(per_market.min_liquidity_usd, mandate.markets.min_liquidity_usd)`) added to step 2; the spec lists
   the limit but not the check.
-- Step 5 sells: a sell passes only if size ≤ the bot's held position (that is what "reduces exposure" means).
+- Step 5 sells: a sell passes only if size ≤ the bot's held position minus its resting sells (that is what "reduces exposure" means).
 - Ledger-driven buys also require the (category, horizon) bucket to be in `trading` state.
 - Step 7 edge is directional (buy: p − price, sell: price − p) rather than `|p − price|`, so buying above the forecast fails.
   Expected fee = taker rate × price for marketable orders, 0 for resting (maker) orders; chunk 1b's FeeService supplies the rate.
-- Long horizon = days > `mandate.markets.resolves_within_days[1]` (30 by default); the 90-day hard cap is a constant and
-  mandate horizons may not exceed it. Unknown end date ⇒ buys rejected.
+- Long horizon = days > 30, a fixed constant (`LONG_HORIZON_DAYS`, same boundary as `horizonBucket()`), not taken from the
+  mandate. The schema requires `resolves_within_days[1] ≤ 30` and `long_horizon_days` within 30–90; the 90-day hard cap is
+  a constant. Unknown end date ⇒ buys rejected.
 - Binance: step 2 is `binance.enabled` + market scope; step 3 is `binance.max_order_usd` only (no price-range/spread/slippage);
   bot allocation capped at `binance.allocation_usd`; total-exposure check uses whatever totals the provider supplies.
 - Spread, slippage and depth checks apply to all Polymarket orders (incl. risk exits), per spec step 3; depth only for marketable orders.
+
+### 2026-10-30 — chunk 1a review fixes
+- Notional consistency (`notionalUsd ≥ price × size`) now enforced for **all** order types; previously a market order
+  could understate its notional and slip past every USD limit.
+- Long horizon fixed at 30 days (see deviation note above); a mandate of `[0, 90]` is now a config error instead of
+  silently disabling the long-horizon cap.
+- New step 0 `state_invalid`: exposures, counts, equity, position (size, open sells, open time), category-bucket values,
+  market fee rate and book fields must be finite and ≥ 0, and `market.tokenId` must equal the order's token.
+- Sells are netted against resting sells: `position.openSellSize` added to the snapshot.
+- Crossed book (bid > ask) fails the spread check.
+- **Risk exits** (sells flagged `riskExit`): exempt from `max_order_usd`, `max_orders_per_hour`, `max_open_orders`,
+  `max_spread`, the end-of-market buffer and hold time. Still required: market scope, held position net of open sells,
+  price range [0.01, 0.99], and `max_slippage` / top-of-book when marketable. `riskExit` on a buy grants nothing.
+- Config loader: all fs errors are wrapped in `ConfigError`; `resolveConfigDir()` replaces `getConfigDir()`:
+  `BOTLAB_CONFIG_DIR`, else in production the OS app-data dir (§15.2) + `/config`, else `<cwd>/config`.
+- `risk_state` timestamps are ISO everywhere (including `updated_at`).
+- Deferred to 1b: requiring a forecast for forecast-strategy bots.
 

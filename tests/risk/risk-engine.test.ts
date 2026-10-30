@@ -20,8 +20,10 @@ function makeConfig(limits: Record<string, unknown> = {}, mandate: Record<string
 }
 
 type OrderOverrides = Partial<Omit<OrderRequest, 'market'>> & { market?: Partial<MarketSnapshot> | null };
-type StateOverrides = Partial<Omit<RiskStateSnapshot, 'bot' | 'exposure'>> & {
+type Position = NonNullable<RiskStateSnapshot['position']>;
+type StateOverrides = Partial<Omit<RiskStateSnapshot, 'bot' | 'exposure' | 'position'>> & {
   bot?: Partial<BotRiskInfo> | null;
+  position?: (Omit<Position, 'openSellSize'> & { openSellSize?: number }) | null;
   exposure?: Partial<RiskStateSnapshot['exposure']>;
 };
 
@@ -45,6 +47,7 @@ function makeOrder(o: OrderOverrides = {}): OrderRequest {
       market === null
         ? null
         : {
+            tokenId: rest.tokenId ?? 't1',
             category: 'economics',
             endDate: iso(NOW + 10 * DAY),
             ambiguityScore: 1,
@@ -61,7 +64,7 @@ function makeOrder(o: OrderOverrides = {}): OrderRequest {
 }
 
 function makeState(s: StateOverrides = {}): RiskStateSnapshot {
-  const { bot, exposure, ...rest } = s;
+  const { bot, exposure, position, ...rest } = s;
   return {
     now: NOW,
     globalHalted: false,
@@ -69,8 +72,8 @@ function makeState(s: StateOverrides = {}): RiskStateSnapshot {
     categoryBucket: null,
     botOrdersLastHour: 0,
     openOrdersCount: 0,
-    position: null,
     ...rest,
+    position: position ? { openSellSize: 0, ...position } : null,
     bot:
       bot === null
         ? null
@@ -95,6 +98,22 @@ interface Case {
 
 const cases: Case[] = [
   { name: 'baseline buy passes', fails: null },
+
+  // Step 0 — snapshot validation
+  { name: 'negative bot exposure', state: { exposure: { botUsd: -50 } }, fails: 'state_invalid' },
+  { name: 'negative market exposure', state: { exposure: { marketUsd: -1 } }, fails: 'state_invalid' },
+  { name: 'NaN total exposure', state: { exposure: { totalUsd: NaN } }, fails: 'state_invalid' },
+  { name: 'negative long-horizon exposure', state: { exposure: { longHorizonUsd: -1 } }, fails: 'state_invalid' },
+  { name: 'negative orders-last-hour count', state: { botOrdersLastHour: -5 }, fails: 'state_invalid' },
+  { name: 'negative open orders count', state: { openOrdersCount: -1 }, fails: 'state_invalid' },
+  { name: 'infinite equity', state: { equityUsd: Infinity }, fails: 'state_invalid' },
+  { name: 'negative taker fee rate', order: { market: { takerFeeRate: -0.5 } }, fails: 'state_invalid' },
+  { name: 'negative best bid', order: { market: { bestBid: -0.1 } }, fails: 'state_invalid' },
+  { name: 'negative position size', order: sell(), state: { position: { size: -10, openedAt: NOW - 60 * MIN } }, fails: 'state_invalid' },
+  { name: 'negative open sell size', order: sell(), state: held({ position: { size: 100, openSellSize: -50, openedAt: NOW - 60 * MIN } }), fails: 'state_invalid' },
+  { name: 'negative category bucket exposure', state: { categoryBucket: { state: 'trading', exposureUsd: -10, maxAllocationUsd: 50 } }, fails: 'state_invalid' },
+  { name: 'market snapshot for a different token', order: { market: { tokenId: 't2' } }, fails: 'state_invalid' },
+  { name: 'invalid state is rejected even before halts', state: { globalHalted: true, botOrdersLastHour: -1 }, fails: 'state_invalid' },
 
   // Step 1 — halts and stage
   { name: 'global halt', state: { globalHalted: true }, fails: 'global_halt' },
@@ -138,16 +157,19 @@ const cases: Case[] = [
   { name: 'zero size', order: { size: 0 }, fails: 'order_input' },
   { name: 'NaN price', order: { price: NaN }, fails: 'order_input' },
   { name: 'understated notional on a limit order', order: { size: 40, notionalUsd: 10 }, fails: 'order_input' },
+  { name: 'understated notional on a market order', order: { orderType: 'market', price: 0.52, size: 10_000, notionalUsd: 1 }, fails: 'order_input' },
+  { name: 'market order with consistent notional passes', order: { orderType: 'market', price: 0.52, size: 20, notionalUsd: 10.4 }, fails: null },
   { name: 'price above 0.99', order: { price: 0.995, size: 10, notionalUsd: 9.95, market: { bestAsk: 0.999, bestBid: 0.99 } }, fails: 'price_range' },
   { name: 'price below 0.01', order: { price: 0.005, size: 100, notionalUsd: 0.5 }, fails: 'price_range' },
   { name: 'spread exactly at max passes', order: { price: 0.46, size: 20, notionalUsd: 9.2, market: { bestBid: 0.46, bestAsk: 0.52 } }, fails: null },
   { name: 'spread above max', order: { market: { bestBid: 0.45, bestAsk: 0.52 } }, fails: 'spread' },
   { name: 'missing best bid', order: { market: { bestBid: null } }, fails: 'spread' },
+  { name: 'crossed book (bid > ask)', order: { price: 0.5, market: { bestBid: 0.53, bestAsk: 0.52 } }, fails: 'spread' },
   { name: 'marketable buy at best ask passes', order: { price: 0.52, size: 20, notionalUsd: 10.4 }, fails: null },
   { name: 'marketable buy slippage exactly at max passes', order: { price: 0.54, size: 20, notionalUsd: 10.8 }, fails: null },
   { name: 'marketable buy slippage above max', order: { price: 0.55, size: 20, notionalUsd: 11 }, fails: 'slippage' },
   { name: 'marketable sell slippage above max', order: sell({ price: 0.46, notionalUsd: 9.2 }), state: held(), fails: 'slippage' },
-  { name: 'market order type is checked as marketable', order: { orderType: 'market', price: 0.6 }, fails: 'slippage' },
+  { name: 'market order type is checked as marketable', order: { orderType: 'market', price: 0.6, notionalUsd: 12 }, fails: 'slippage' },
   { name: 'marketable disabled', order: { price: 0.52, notionalUsd: 10.4 }, config: makeConfig({ orders: { allow_marketable: false } }), fails: 'marketable_allowed' },
   { name: 'top of book below minimum when taking', order: { price: 0.52, notionalUsd: 10.4, market: { bestAskSizeUsd: 199 } }, fails: 'top_of_book' },
   { name: 'top of book exactly at minimum passes', order: { price: 0.52, notionalUsd: 10.4, market: { bestAskSizeUsd: 200 } }, fails: null },
@@ -194,6 +216,21 @@ const cases: Case[] = [
   },
   { name: 'sell of more than held', order: sell(), state: held({ position: { size: 19.99, openedAt: NOW - 60 * MIN } }), fails: 'sell_position' },
   { name: 'sell with no position', order: sell(), fails: 'sell_position' },
+  { name: 'resting sells reduce what can be sold', order: sell(), state: held({ position: { size: 100, openSellSize: 85, openedAt: NOW - 60 * MIN } }), fails: 'sell_position' },
+  { name: 'sell exactly at position net of resting sells passes', order: sell(), state: held({ position: { size: 100, openSellSize: 80, openedAt: NOW - 60 * MIN } }), fails: null },
+  { name: '31 days counts toward the long-horizon cap', order: { market: daysOut(31) }, state: { exposure: { longHorizonUsd: 65.01 } }, fails: 'long_horizon' },
+
+  // Risk exits: exempt from max_order, rate limits and spread; still scoped, position-bound, price-ranged, slippage-checked
+  { name: 'risk exit exempt from max_order_usd', order: sell({ riskExit: true, size: 61, notionalUsd: 29.89 }), state: held(), fails: null },
+  { name: 'risk exit exempt from max_orders_per_hour', order: sell({ riskExit: true }), state: held({ botOrdersLastHour: 20 }), fails: null },
+  { name: 'risk exit exempt from max_open_orders', order: sell({ riskExit: true }), state: held({ openOrdersCount: 50 }), fails: null },
+  { name: 'risk exit exempt from max_spread', order: sell({ riskExit: true, price: 0.3, notionalUsd: 6, market: { bestBid: 0.3, bestAsk: 0.5 } }), state: held(), fails: null },
+  { name: 'risk exit still needs market scope', order: sell({ riskExit: true, marketId: 'm2' }), state: held(), fails: 'market_scope' },
+  { name: 'risk exit still needs a held position', order: sell({ riskExit: true }), state: held({ position: { size: 100, openSellSize: 90, openedAt: NOW } }), fails: 'sell_position' },
+  { name: 'risk exit still needs price range', order: sell({ riskExit: true, price: 0.005, size: 20, notionalUsd: 0.1 }), state: held(), fails: 'price_range' },
+  { name: 'risk exit still needs slippage when marketable', order: sell({ riskExit: true, price: 0.4, notionalUsd: 8 }), state: held(), fails: 'slippage' },
+  { name: 'riskExit flag on a buy grants no exemption', order: { riskExit: true, size: 52, notionalUsd: 26 }, fails: 'max_order' },
+  { name: 'non-risk-exit sell above max_order_usd', order: sell({ size: 61, notionalUsd: 29.89 }), state: held(), fails: 'max_order' },
 
   // Step 6 — hold time
   { name: 'sell before min hold time', order: sell(), state: { position: { size: 100, openedAt: NOW - 29 * MIN } }, fails: 'hold_time' },
@@ -241,7 +278,7 @@ describe('RiskEngine — decision shape', () => {
     expect(d.checks.every((c) => c.passed)).toBe(true);
     const names = d.checks.map((c) => c.name);
     expect(names).toEqual([
-      'global_halt', 'bot_halt', 'bot_stage', 'market_data', 'market_scope', 'category', 'end_buffer',
+      'state_invalid', 'global_halt', 'bot_halt', 'bot_stage', 'market_data', 'market_scope', 'category', 'end_buffer',
       'ambiguity', 'rules_changed', 'liquidity', 'order_input', 'max_order', 'price_range', 'spread',
       'bot_rate', 'open_orders', 'horizon', 'bot_exposure', 'market_exposure', 'total_exposure',
     ]);

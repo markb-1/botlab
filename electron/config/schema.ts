@@ -13,6 +13,13 @@ import { z } from 'zod';
 /** Nothing settling beyond this many days is ever traded (spec §3.4). */
 export const MAX_HORIZON_DAYS = 90;
 
+/**
+ * Markets settling beyond this many days count toward max_long_horizon_pct (spec §3.1, §3.4).
+ * Fixed (not taken from the mandate) so a wide mandate horizon cannot disable the cap;
+ * matches the medium/long category-rights bucket boundary (§6.3).
+ */
+export const LONG_HORIZON_DAYS = 30;
+
 const usd = z.number().finite().nonnegative();
 const fraction = z.number().finite().min(0).max(1);
 const count = z.number().int().nonnegative();
@@ -132,16 +139,19 @@ export const MandateSchema = z.strictObject({
     })
     .prefault({})
     .superRefine((m, ctx) => {
-      for (const key of ['resolves_within_days', 'long_horizon_days'] as const) {
-        if (m[key][1] > MAX_HORIZON_DAYS) {
-          ctx.addIssue({ code: 'custom', path: [key], message: `must not extend beyond ${MAX_HORIZON_DAYS} days` });
-        }
+      if (m.resolves_within_days[1] > LONG_HORIZON_DAYS) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['resolves_within_days'],
+          message: `default horizon must end within ${LONG_HORIZON_DAYS} days (longer markets use long_horizon_days)`,
+        });
       }
-      if (m.long_horizon_days[0] < m.resolves_within_days[1]) {
+      const [longMin, longMax] = m.long_horizon_days;
+      if (longMin < LONG_HORIZON_DAYS || longMax > MAX_HORIZON_DAYS) {
         ctx.addIssue({
           code: 'custom',
           path: ['long_horizon_days'],
-          message: 'long horizon must start at or after the end of resolves_within_days',
+          message: `must lie within ${LONG_HORIZON_DAYS}–${MAX_HORIZON_DAYS} days`,
         });
       }
     }),

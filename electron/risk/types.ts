@@ -12,6 +12,8 @@ export type HorizonBucket = 'short' | 'medium' | 'long';
 
 /** Market metadata captured when the order is checked (Polymarket only). */
 export interface MarketSnapshot {
+  /** Token the book fields (best bid/ask, sizes) describe; must equal the order's tokenId */
+  tokenId: string;
   category: string | null;
   /** ISO timestamp of the market end date */
   endDate: string | null;
@@ -52,7 +54,7 @@ export interface OrderRequest {
   price: number;
   size: number;
   notionalUsd: number;
-  /** Exit flagged by the position manager or a human; exempt from hold time and the end-of-market buffer */
+  /** Sell flagged as a risk exit by the position manager or a human; see RiskEngine for exemptions */
   riskExit?: boolean;
   forecast?: ForecastEdgeInfo | null;
   /** Required for Polymarket orders; null for Binance */
@@ -108,7 +110,12 @@ export interface RiskStateSnapshot {
   /** Open orders across all bots */
   openOrdersCount: number;
   /** This bot's holding in the order's token; needed for sells */
-  position: { size: number; openedAt: number } | null;
+  position: {
+    size: number;
+    /** Size already committed to this bot's resting sell orders in the token */
+    openSellSize: number;
+    openedAt: number;
+  } | null;
 }
 
 export interface RiskStateProvider {
@@ -116,6 +123,7 @@ export interface RiskStateProvider {
 }
 
 export type RiskCheckName =
+  | 'state_invalid'
   | 'global_halt'
   | 'bot_halt'
   | 'bot_stage'
@@ -147,7 +155,7 @@ export type RiskCheckName =
   | 'edge';
 
 export interface RiskCheckResult {
-  /** Spec §4.1 step number (1–7) */
+  /** Spec §4.1 step number (1–7); 0 = snapshot validation */
   step: number;
   name: RiskCheckName;
   passed: boolean;

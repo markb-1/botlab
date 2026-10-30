@@ -8,7 +8,7 @@ import {
   validateCrossFile,
   loadConfig,
   loadLimits,
-  getConfigDir,
+  resolveConfigDir,
   ConfigError,
   DEFAULT_LIMITS_YAML,
   DEFAULT_MANDATE_YAML,
@@ -89,15 +89,31 @@ describe('config loader', () => {
     expect(fs.existsSync(path.join(nested, 'limits.yaml'))).toBe(true);
   });
 
-  it('uses BOTLAB_CONFIG_DIR when set', () => {
-    const prev = process.env.BOTLAB_CONFIG_DIR;
-    process.env.BOTLAB_CONFIG_DIR = dir;
-    try {
-      expect(getConfigDir()).toBe(dir);
-    } finally {
-      if (prev === undefined) delete process.env.BOTLAB_CONFIG_DIR;
-      else process.env.BOTLAB_CONFIG_DIR = prev;
-    }
+  describe('resolveConfigDir', () => {
+    const home = path.join(path.sep, 'home', 'me');
+
+    it('uses BOTLAB_CONFIG_DIR when set, even in production', () => {
+      expect(resolveConfigDir({ BOTLAB_CONFIG_DIR: dir, NODE_ENV: 'production' }, 'linux', home)).toBe(dir);
+    });
+
+    it('defaults to <cwd>/config outside production', () => {
+      expect(resolveConfigDir({}, 'darwin', home)).toBe(path.join(process.cwd(), 'config'));
+    });
+
+    it.each([
+      ['darwin', {}, path.join(home, 'Library', 'Application Support', 'BotLab', 'config')],
+      ['win32', { APPDATA: path.join(home, 'AppData', 'Roaming') }, path.join(home, 'AppData', 'Roaming', 'BotLab', 'config')],
+      ['linux', {}, path.join(home, '.local', 'share', 'botlab', 'config')],
+    ] as const)('uses the OS app-data dir in production on %s', (platform, env, expected) => {
+      expect(resolveConfigDir({ ...env, NODE_ENV: 'production' }, platform, home)).toBe(expected);
+    });
+  });
+
+  it('wraps filesystem errors in ConfigError', () => {
+    // A regular file where the config directory should be
+    const blocker = path.join(dir, 'blocker');
+    fs.writeFileSync(blocker, 'x');
+    expect(() => loadConfig(path.join(blocker, 'config'))).toThrow(ConfigError);
   });
 
   it.each([
@@ -127,6 +143,19 @@ describe('config loader', () => {
   it('rejects mandate horizons beyond 90 days', () => {
     write('mandate.yaml', 'markets:\n  long_horizon_days: [30, 120]\n');
     expect(() => loadConfig(dir)).toThrow(/90 days/);
+  });
+
+  it.each([
+    ['default horizon past 30 days (would disable the long-horizon cap)', 'markets:\n  resolves_within_days: [0, 90]\n', 'resolves_within_days'],
+    ['long horizon starting before 30 days', 'markets:\n  long_horizon_days: [20, 60]\n', 'long_horizon_days'],
+  ])('rejects %s', (_name, text, expected) => {
+    write('mandate.yaml', text);
+    expect(() => loadConfig(dir)).toThrow(expected);
+  });
+
+  it('accepts narrower horizons within the fixed bounds', () => {
+    write('mandate.yaml', 'markets:\n  resolves_within_days: [1, 14]\n  long_horizon_days: [45, 60]\n');
+    expect(loadConfig(dir).mandate.markets.long_horizon_days).toEqual([45, 60]);
   });
 });
 

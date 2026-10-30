@@ -6,12 +6,12 @@ export interface RiskStateRow {
   scope: string; // 'global' or a bot id
   halted: number; // SQLite boolean (0/1)
   halted_reason: string | null;
-  halted_at: string | null;
+  halted_at: string | null; // ISO
   day_start_equity: number | null;
   day_realized_pnl: number;
   day_unrealized_pnl: number;
   orders_last_hour: number;
-  updated_at: string;
+  updated_at: string; // ISO
 }
 
 /**
@@ -39,18 +39,18 @@ export class RiskStateRepository {
 
   /** Set or clear a halt. Clearing is a human-only action (enforced by callers). */
   setHalted(scope: string, halted: boolean, reason: string | null = null): void {
-    const haltedAt = halted ? new Date().toISOString() : null;
+    const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO risk_state (scope, halted, halted_reason, halted_at, updated_at)
-         VALUES (?, ?, ?, ?, datetime('now'))
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(scope) DO UPDATE SET
            halted = excluded.halted,
            halted_reason = excluded.halted_reason,
            halted_at = excluded.halted_at,
            updated_at = excluded.updated_at`
       )
-      .run(scope, halted ? 1 : 0, halted ? reason : null, haltedAt);
+      .run(scope, halted ? 1 : 0, halted ? reason : null, halted ? now : null, now);
   }
 
   updateDaily(
@@ -62,7 +62,8 @@ export class RiskStateRepository {
       ordersLastHour: number;
     }>
   ): void {
-    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope) VALUES (?)').run(scope);
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope, updated_at) VALUES (?, ?)').run(scope, now);
 
     const sets: string[] = [];
     const values: unknown[] = [];
@@ -72,8 +73,8 @@ export class RiskStateRepository {
     if (data.ordersLastHour !== undefined) { sets.push('orders_last_hour = ?'); values.push(data.ordersLastHour); }
     if (sets.length === 0) return;
 
-    sets.push("updated_at = datetime('now')");
-    values.push(scope);
+    sets.push('updated_at = ?');
+    values.push(now, scope);
     this.db.prepare(`UPDATE risk_state SET ${sets.join(', ')} WHERE scope = ?`).run(...values);
   }
 }

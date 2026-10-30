@@ -269,7 +269,7 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       day_realized_pnl REAL NOT NULL DEFAULT 0,
       day_unrealized_pnl REAL NOT NULL DEFAULT 0,
       orders_last_hour INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )`,
     "INSERT OR IGNORE INTO risk_state (scope) VALUES ('global')",
   ];

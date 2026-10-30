@@ -1,4 +1,4 @@
-import { MAX_HORIZON_DAYS, type BotLabConfig, type MandateConfig } from '../config/schema';
+import { LONG_HORIZON_DAYS, MAX_HORIZON_DAYS, type BotLabConfig } from '../config/schema';
 import type {
   BotRiskInfo,
   Exchange,
@@ -19,6 +19,13 @@ import type {
  *
  * Checks run in spec order and stop at the first failure. Every check that ran is
  * recorded in the decision so it can be stored in `orders.risk_decision`.
+ * Step 0 rejects malformed state before any limit is evaluated.
+ *
+ * Risk exits (sells flagged `riskExit` by the position manager or a human) must be
+ * able to close positions under stress, so they are exempt from `max_order_usd`,
+ * `max_orders_per_hour`, `max_open_orders`, `max_spread`, the end-of-market buffer
+ * and the hold time. They still require market scope, a held position (net of open
+ * sells), the price range, and `max_slippage` / top-of-book when marketable.
  */
 
 const MS_PER_MINUTE = 60_000;
@@ -54,9 +61,55 @@ export function horizonBucket(days: number): HorizonBucket {
   return 'long';
 }
 
-/** Market counts toward the long-horizon budget when it settles after the default horizon. */
-export function isLongHorizon(days: number, mandate: MandateConfig): boolean {
-  return days > mandate.markets.resolves_within_days[1];
+/** Market counts toward the long-horizon budget (max_long_horizon_pct) when it settles in > 30 days. */
+export function isLongHorizon(days: number): boolean {
+  return days > LONG_HORIZON_DAYS;
+}
+
+const isNonNegative = (n: unknown): boolean => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+
+/** Problems with a snapshot/market that would make limit checks meaningless; empty = valid. */
+function findStateProblems(order: OrderRequest, state: RiskStateSnapshot): string[] {
+  const problems: string[] = [];
+  const need = (label: string, n: unknown) => {
+    if (!isNonNegative(n)) problems.push(`${label} must be a finite number >= 0 (got ${String(n)})`);
+  };
+  const needOptional = (label: string, n: number | null) => {
+    if (n !== null) need(label, n);
+  };
+
+  need('now', state.now);
+  need('equityUsd', state.equityUsd);
+  need('exposure.botUsd', state.exposure.botUsd);
+  need('exposure.marketUsd', state.exposure.marketUsd);
+  need('exposure.totalUsd', state.exposure.totalUsd);
+  need('exposure.longHorizonUsd', state.exposure.longHorizonUsd);
+  need('botOrdersLastHour', state.botOrdersLastHour);
+  need('openOrdersCount', state.openOrdersCount);
+  if (state.categoryBucket) {
+    need('categoryBucket.exposureUsd', state.categoryBucket.exposureUsd);
+    need('categoryBucket.maxAllocationUsd', state.categoryBucket.maxAllocationUsd);
+  }
+  if (state.position) {
+    need('position.size', state.position.size);
+    need('position.openSellSize', state.position.openSellSize);
+    need('position.openedAt', state.position.openedAt);
+  }
+
+  const market = order.market;
+  if (market) {
+    if (market.tokenId !== order.tokenId) {
+      problems.push(`market snapshot is for token ${market.tokenId}, order is for ${order.tokenId}`);
+    }
+    need('market.takerFeeRate', market.takerFeeRate);
+    needOptional('market.bestBid', market.bestBid);
+    needOptional('market.bestAsk', market.bestAsk);
+    needOptional('market.bestBidSizeUsd', market.bestBidSizeUsd);
+    needOptional('market.bestAskSizeUsd', market.bestAskSizeUsd);
+    needOptional('market.liquidityUsd', market.liquidityUsd);
+    needOptional('market.ambiguityScore', market.ambiguityScore);
+  }
+  return problems;
 }
 
 const round = (n: number) => Math.round(n * 1e6) / 1e6;
@@ -108,6 +161,7 @@ export class RiskEngine {
     const { now, bot, exposure } = state;
     const checks: RiskCheckResult[] = [];
     const isBuy = order.side === 'buy';
+    const isRiskExit = order.side === 'sell' && order.riskExit === true;
     const isPoly = order.exchange === 'polymarket';
     const market = order.market;
 
@@ -130,6 +184,13 @@ export class RiskEngine {
         evaluatedAt: new Date(now).toISOString(),
       };
     };
+
+    // ── Step 0: snapshot sanity ──────────────────────────────────────
+    const problems = findStateProblems(order, state);
+    if (!record(0, 'state_invalid', problems.length === 0,
+      problems.length === 0 ? 'State snapshot valid' : `Invalid risk state: ${problems.join('; ')}`)) {
+      return decide();
+    }
 
     // ── Step 1: halts and stage ──────────────────────────────────────
     if (!record(1, 'global_halt', !state.globalHalted,
@@ -184,7 +245,7 @@ export class RiskEngine {
       }
 
       // End-of-market buffer applies to sells too, except flagged risk exits
-      if (!(order.side === 'sell' && order.riskExit)) {
+      if (!isRiskExit) {
         const minutesToEnd = days === null ? null : (days * MS_PER_DAY) / MS_PER_MINUTE;
         const minMinutes = limits.per_market.no_trade_before_end_minutes;
         const ok = minutesToEnd === null ? !isBuy : minutesToEnd >= minMinutes;
@@ -229,8 +290,9 @@ export class RiskEngine {
     // ── Step 3: order shape ──────────────────────────────────────────
     const { price, size, notionalUsd } = order;
     const finitePositive = [price, size, notionalUsd].every((n) => Number.isFinite(n) && n > 0);
-    // Limit orders: notional must not understate price × size (it drives every exposure check)
-    const notionalOk = order.orderType !== 'limit' || notionalUsd >= price * size * (1 - 1e-6);
+    // Notional must not understate price × size for any order type (it drives every USD check;
+    // for market orders price is the worst acceptable price, so price × size is the max spend)
+    const notionalOk = notionalUsd >= price * size * (1 - 1e-6) - EPS;
     if (!record(3, 'order_input', finitePositive && notionalOk,
       !finitePositive ? 'Price, size and notional must be positive numbers'
         : notionalOk ? 'Order input valid' : `Notional ${notionalUsd} < price × size ${round(price * size)}`,
@@ -239,7 +301,7 @@ export class RiskEngine {
     }
 
     const maxOrder = isPoly ? limits.per_bot_defaults.max_order_usd : limits.binance.max_order_usd;
-    if (!record(3, 'max_order', notionalUsd <= maxOrder + EPS,
+    if (!isRiskExit && !record(3, 'max_order', notionalUsd <= maxOrder + EPS,
       notionalUsd <= maxOrder + EPS ? `Notional ${notionalUsd} <= ${maxOrder}` : `Notional ${notionalUsd} > max_order_usd ${maxOrder}`,
       { notionalUsd, limit: maxOrder })) {
       return decide();
@@ -256,10 +318,12 @@ export class RiskEngine {
       const { bestBid, bestAsk } = market;
       const spread = bestBid !== null && bestAsk !== null ? bestAsk - bestBid : null;
       const maxSpread = limits.per_market.max_spread;
-      const spreadOk = spread !== null && spread <= maxSpread + EPS;
-      if (!record(3, 'spread', spreadOk,
+      // A crossed book (bid > ask) means the data is stale or wrong
+      const spreadOk = spread !== null && spread >= -EPS && spread <= maxSpread + EPS;
+      if (!isRiskExit && !record(3, 'spread', spreadOk,
         spread === null ? 'Order book incomplete (no best bid/ask)'
-          : spreadOk ? `Spread ${round(spread)} <= ${maxSpread}` : `Spread ${round(spread)} > ${maxSpread}`,
+          : spread < -EPS ? `Crossed book: bid ${bestBid} > ask ${bestAsk}`
+            : spreadOk ? `Spread ${round(spread)} <= ${maxSpread}` : `Spread ${round(spread)} > ${maxSpread}`,
         { bestBid, bestAsk, spread: spread === null ? null : round(spread), limit: maxSpread })) {
         return decide();
       }
@@ -275,12 +339,14 @@ export class RiskEngine {
           return decide();
         }
 
-        const best = (isBuy ? bestAsk : bestBid) as number;
-        const slip = Math.abs(price - best);
+        const best = isBuy ? bestAsk : bestBid;
+        const slip = best === null ? null : Math.abs(price - best);
         const maxSlip = limits.per_market.max_slippage;
-        if (!record(3, 'slippage', slip <= maxSlip + EPS,
-          slip <= maxSlip + EPS ? `Price ${price} within ${maxSlip} of best ${best}` : `Price ${price} is ${round(slip)} from best ${best} > ${maxSlip}`,
-          { price, best, slippage: round(slip), limit: maxSlip })) {
+        const slipOk = slip !== null && slip <= maxSlip + EPS;
+        if (!record(3, 'slippage', slipOk,
+          slip === null ? 'No best price on the side being taken'
+            : slipOk ? `Price ${price} within ${maxSlip} of best ${best}` : `Price ${price} is ${round(slip)} from best ${best} > ${maxSlip}`,
+          { price, best, slippage: slip === null ? null : round(slip), limit: maxSlip })) {
           return decide();
         }
 
@@ -296,14 +362,15 @@ export class RiskEngine {
     }
 
     // ── Step 4: rate ─────────────────────────────────────────────────
+    // Risk exits are exempt from rate limits
     const maxPerHour = limits.per_bot_defaults.max_orders_per_hour;
-    if (!record(4, 'bot_rate', state.botOrdersLastHour < maxPerHour,
+    if (!isRiskExit && !record(4, 'bot_rate', state.botOrdersLastHour < maxPerHour,
       `${state.botOrdersLastHour} orders in the last hour (max ${maxPerHour})`,
       { ordersLastHour: state.botOrdersLastHour, limit: maxPerHour })) {
       return decide();
     }
     const maxOpen = limits.global.max_open_orders;
-    if (!record(4, 'open_orders', state.openOrdersCount < maxOpen,
+    if (!isRiskExit && !record(4, 'open_orders', state.openOrdersCount < maxOpen,
       `${state.openOrdersCount} open orders (max ${maxOpen})`,
       { openOrders: state.openOrdersCount, limit: maxOpen })) {
       return decide();
@@ -311,11 +378,15 @@ export class RiskEngine {
 
     // ── Step 5: exposure ─────────────────────────────────────────────
     if (!isBuy) {
-      // A sell can only reduce exposure if the bot holds at least that much
+      // A sell only reduces exposure if the bot holds that much, net of its resting sells
       const held = state.position?.size ?? 0;
-      if (!record(5, 'sell_position', size <= held + EPS,
-        size <= held + EPS ? `Sell ${size} <= held ${held} (reduces exposure)` : `Sell ${size} > held ${held}`,
-        { size, held })) {
+      const openSells = state.position?.openSellSize ?? 0;
+      const available = held - openSells;
+      if (!record(5, 'sell_position', size <= available + EPS,
+        size <= available + EPS
+          ? `Sell ${size} <= available ${round(available)} (reduces exposure)`
+          : `Sell ${size} > available ${round(available)} (held ${held}, open sells ${openSells})`,
+        { size, held, openSellSize: openSells })) {
         return decide();
       }
     } else {
@@ -361,7 +432,7 @@ export class RiskEngine {
         return decide();
       }
 
-      if (isPoly && days !== null && isLongHorizon(days, mandate)) {
+      if (isPoly && days !== null && isLongHorizon(days)) {
         const longLimit = limits.global.max_long_horizon_pct * totalLimit;
         const longAfter = exposure.longHorizonUsd + notionalUsd;
         if (!record(5, 'long_horizon', longAfter <= longLimit + EPS,
