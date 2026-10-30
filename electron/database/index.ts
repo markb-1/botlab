@@ -223,6 +223,55 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       close_time INTEGER,
       PRIMARY KEY (symbol, interval, open_time)
     )`,
+    // v3 bot ramp + scoping (spec §2.1). Existing bots are treated as stage=full, created by a human.
+    "ALTER TABLE bots ADD COLUMN stage TEXT NOT NULL DEFAULT 'full' CHECK(stage IN ('paper','probation','full','retired'))",
+    'ALTER TABLE bots ADD COLUMN allocation_usd REAL',
+    "ALTER TABLE bots ADD COLUMN created_by TEXT NOT NULL DEFAULT 'human' CHECK(created_by IN ('human','agent'))",
+    'ALTER TABLE bots ADD COLUMN market_ids TEXT',
+    'ALTER TABLE bots ADD COLUMN strategy TEXT',
+    'ALTER TABLE bots ADD COLUMN paused_by TEXT',
+    'ALTER TABLE bots ADD COLUMN retire_reason TEXT',
+    // Every order attempt, including risk rejections (spec §2.2)
+    `CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      exchange TEXT NOT NULL CHECK(exchange IN ('polymarket','binance')),
+      market_id TEXT NOT NULL,
+      token_id TEXT NOT NULL,
+      side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+      order_type TEXT NOT NULL CHECK(order_type IN ('limit','market')),
+      price REAL NOT NULL,
+      size REAL NOT NULL,
+      notional_usd REAL NOT NULL,
+      expires_at TEXT,
+      status TEXT NOT NULL CHECK(status IN ('rejected_risk','submitted','open','partially_filled','filled','cancelled','expired','failed')),
+      risk_decision TEXT,
+      exchange_order_id TEXT,
+      filled_size REAL NOT NULL DEFAULT 0,
+      avg_fill_price REAL,
+      fee_usd REAL NOT NULL DEFAULT 0,
+      reason TEXT,
+      forecast_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_orders_bot_created ON orders(bot_id, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)',
+    'CREATE INDEX IF NOT EXISTS idx_orders_market ON orders(market_id)',
+    'CREATE INDEX IF NOT EXISTS idx_orders_exchange_order ON orders(exchange_order_id)',
+    // Halts and daily P&L: one 'global' row plus one row per bot (spec §2.2)
+    `CREATE TABLE IF NOT EXISTS risk_state (
+      scope TEXT PRIMARY KEY,
+      halted INTEGER NOT NULL DEFAULT 0,
+      halted_reason TEXT,
+      halted_at TEXT,
+      day_start_equity REAL,
+      day_realized_pnl REAL NOT NULL DEFAULT 0,
+      day_unrealized_pnl REAL NOT NULL DEFAULT 0,
+      orders_last_hour INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    "INSERT OR IGNORE INTO risk_state (scope) VALUES ('global')",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

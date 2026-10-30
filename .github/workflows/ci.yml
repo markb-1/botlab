@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22]
+    env:
+      # Electron's postinstall binary download is not needed for lint/typecheck/tests
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      # Skip tests that call live exchange APIs
+      SKIP_NETWORK_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - name: Typecheck
+        run: npx tsc -p electron/tsconfig.json --noEmit
+      - run: npm test

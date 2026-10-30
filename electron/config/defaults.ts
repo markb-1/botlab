@@ -1,0 +1,67 @@
+/**
+ * Default config file contents, written on first start when a file is missing.
+ * Kept identical to config/*.example.yaml (enforced by tests/config/config.test.ts).
+ */
+
+export const DEFAULT_LIMITS_YAML = `# BotLab hard limits (spec §3.1). Human-owned: the agent can read but never write this file.
+# Copy to limits.yaml (or start the app once and it is created with these defaults).
+global:
+  max_total_exposure_usd: 300        # open position cost + open buy order notional
+  max_total_exposure_pct: 0.60       # of wallet equity; the lower of the two applies
+  max_long_horizon_pct: 0.25         # max share of total exposure in markets settling in > 30 days
+  daily_loss_limit_usd: 100          # trips global halt
+  max_open_orders: 50
+per_bot_defaults:
+  max_order_usd: 25
+  allocation_usd: 100                # max exposure for a bot at stage=full
+  daily_loss_limit_usd: 50           # trips bot halt
+  max_orders_per_hour: 20
+  min_hold_minutes: 30               # cannot sell a position opened < N min ago (exits flagged risk_exit are exempt)
+per_market:
+  max_exposure_usd: 50               # across all bots
+  min_liquidity_usd: 5000            # 24h volume
+  min_top_of_book_usd: 200           # size at best price on the side we take
+  no_trade_before_end_minutes: 60
+  max_slippage: 0.02                 # absolute price units from best price for marketable orders
+  max_spread: 0.06                   # don't trade if spread wider
+orders:
+  default_type: limit                # resting post-only by default
+  allow_marketable: true             # crossing orders allowed but subject to slippage + fees
+  resting_order_ttl_minutes: 240     # GTD expiry
+ramp:
+  probation_allocation_usd: 20
+  probation_min_fills: 20
+  probation_min_days: 7
+  probation_max_drawdown_pct: 0.25
+  new_template_paper_days: 7
+  new_template_probation_allocation_usd: 10
+agent:
+  monthly_llm_budget_usd: 50
+  max_bots_created_per_day: 10
+  max_active_bots: 25
+approvals:
+  new_template_live: false           # set true to require approval
+binance:
+  enabled: true
+  max_order_usd: 25
+  allocation_usd: 100
+`;
+
+export const DEFAULT_MANDATE_YAML = `# BotLab agent mandate (spec §3.2). Human-owned: the agent can read but never write this file.
+# Copy to mandate.yaml (or start the app once and it is created with these defaults).
+budget_usd: 300                       # must be <= limits.global.max_total_exposure_usd
+categories:
+  allow: [weather-climate, economics, politics-non-us]
+  later: [geopolitics, science-tech]   # forecasts recorded (shadow), no bots
+  deny:  [sports, crypto-price, mentions, culture-entertainment, us-elections-headline]
+markets:
+  resolves_within_days: [0, 30]       # default horizon
+  long_horizon_days: [30, 90]         # allowed only within limits.global.max_long_horizon_pct
+  min_liquidity_usd: 5000
+  max_ambiguity_score: 1              # skip markets rated 2-3
+strategies:
+  allow: [forecast, consistency, resolution_rule]   # template keys
+  allow_custom_templates: true
+notes: |
+  Free-text guidance for the agent (themes of interest, things to avoid).
+`;

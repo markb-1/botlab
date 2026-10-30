@@ -254,7 +254,6 @@ export class BotManager extends EventEmitter {
 
     // Look up the script
     const script = this.scriptRepo.findById(bot.scriptId);
-    let instance: BaseBotRunner;
 
     if (!script?.compiled) {
       throw new Error(
@@ -264,7 +263,7 @@ export class BotManager extends EventEmitter {
     }
 
     const settings = this.getSettings();
-    instance = new ScriptBotRunner(bot, this.walletManager, clobClient, {
+    const instance: BaseBotRunner = new ScriptBotRunner(bot, this.walletManager, clobClient, {
       compiledCode: script.compiled,
       scriptName: script.name,
       storageRepo: this.storageRepo,

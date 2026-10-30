@@ -14,6 +14,14 @@ export interface BotRow {
   last_stopped_at: string | null;
   last_heartbeat: string | null;
   error_logs: string; // JSON array string
+  // v3 ramp + scoping columns
+  stage: string; // 'paper' | 'probation' | 'full' | 'retired'
+  allocation_usd: number | null;
+  created_by: string; // 'human' | 'agent'
+  market_ids: string | null; // JSON array of condition IDs; null = unscoped
+  strategy: string | null;
+  paused_by: string | null;
+  retire_reason: string | null;
   created_at: string;
   updated_at: string;
 }

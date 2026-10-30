@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Use vi.hoisted so mock variables are available inside vi.mock factories
 const { handlers, mockKeyManager, mockGenerateSalt, mockDeriveEncryptionKey, mockHashForVerification, mockVerifyPassword } = vi.hoisted(() => ({
-  handlers: new Map<string, Function>(),
+  handlers: new Map<string, (...args: any[]) => any>(),
   mockKeyManager: {
     isReady: vi.fn().mockReturnValue(false),
     setKey: vi.fn(),
@@ -15,7 +15,7 @@ const { handlers, mockKeyManager, mockGenerateSalt, mockDeriveEncryptionKey, moc
 
 vi.mock('electron', () => ({
   ipcMain: {
-    handle: vi.fn((channel: string, handler: Function) => {
+    handle: vi.fn((channel: string, handler: (...args: any[]) => any) => {
       handlers.set(channel, handler);
     }),
   },

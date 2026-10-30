@@ -18,3 +18,9 @@ export type { BotStorageRow } from './BotStorageRepository';
 
 export { BacktestRepository } from './BacktestRepository';
 export type { BacktestRunRow, BacktestTradeRow } from './BacktestRepository';
+
+export { OrderRepository, OPEN_ORDER_STATUSES } from './OrderRepository';
+export type { OrderRow, OrderStatus } from './OrderRepository';
+
+export { RiskStateRepository, GLOBAL_SCOPE } from './RiskStateRepository';
+export type { RiskStateRow } from './RiskStateRepository';

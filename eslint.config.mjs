@@ -7,7 +7,8 @@ import prettierPlugin from 'eslint-plugin-prettier';
 /** @type {import('eslint').Linter.Config[]} */
 export default [
     {
-        ignores: ['dist/**', 'node_modules/**', 'coverage/**', '*.js'], // Ignore build output and compiled files
+        // Ignore build output and compiled files. web/client has its own eslint config (React rules).
+        ignores: ['dist/**', 'dist-electron/**', 'release/**', 'web/client/**', 'node_modules/**', 'coverage/**', '*.js'],
     },
     { files: ['**/*.{js,mjs,cjs,ts}'] },
     { languageOptions: { globals: { ...globals.node, ...globals.jest } } }, // Add jest globals

@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture registered IPC handlers
-const handlers = new Map<string, Function>();
+const handlers = new Map<string, (...args: any[]) => any>();
 vi.mock('electron', () => ({
   ipcMain: {
-    handle: vi.fn((channel: string, handler: Function) => {
+    handle: vi.fn((channel: string, handler: (...args: any[]) => any) => {
       handlers.set(channel, handler);
     }),
   },

@@ -294,9 +294,8 @@ describe('ScriptRunner', () => {
     });
 
     it('should not send heartbeat when not running', () => {
-      runner.requestHeartbeat();
       // No worker, so nothing should happen (no error)
-      expect(mockWorkerInstance).toBeUndefined;
+      expect(() => runner.requestHeartbeat()).not.toThrow();
     });
   });
 

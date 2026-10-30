@@ -62,3 +62,7 @@ release/
 dist/
 *.dmg
 *.zip
+
+# Human-owned config (examples are committed)
+config/*.yaml
+!config/*.example.yaml

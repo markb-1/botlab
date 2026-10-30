@@ -47,7 +47,8 @@ interface Position {
   redeemable: boolean;
 }
 
-describe('Stage 1: Polymarket Data API Connectivity', () => {
+// Calls the live Polymarket API; skipped in CI (SKIP_NETWORK_TESTS=1)
+describe.skipIf(!!process.env.SKIP_NETWORK_TESTS)('Stage 1: Polymarket Data API Connectivity', () => {
   describe('Activity Endpoint', () => {
     it('should fetch trade activities for any address (may be empty)', async () => {
       const url = `${DATA_API_BASE}/activity?user=${EXAMPLE_TRADER}&type=TRADE`;
