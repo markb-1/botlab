@@ -12,6 +12,19 @@ import type { RpcHandlerDeps } from './RpcHandler';
 import { PaperTradingState } from './PaperTradingState';
 import type { BotStorageRepository } from '../database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
+import type { OrderService } from '../orders/OrderService';
+
+/** Builds the bot's OrderService (BotManager supplies it; throws if orders cannot be risk-checked). */
+export type OrderServiceFactory = (args: {
+  botId: string;
+  botName: string;
+  scriptName: string;
+  mode: 'live' | 'paper';
+  clobClient: ClobClient;
+  walletAddress: string;
+  proxyAddress?: string;
+  paperState?: PaperTradingState;
+}) => OrderService;
 
 export interface ScriptBotRunnerDeps {
   compiledCode: string;
@@ -24,6 +37,8 @@ export interface ScriptBotRunnerDeps {
   mode: 'live' | 'paper';
   binanceApiKey?: string;
   binanceApiSecret?: string;
+  /** Without it the bot runs but every order call fails (fail closed) */
+  createOrderService?: OrderServiceFactory;
 }
 
 const DEFAULT_PAPER_BALANCE = 10_000;
@@ -72,6 +87,17 @@ export class ScriptBotRunner extends BaseBotRunner {
       paperState = new PaperTradingState(this.botId, initialBalance, this.deps.storageRepo);
       paperState.load(); // Restore persisted state if any
     }
+
+    rpcHandlerDeps.orderService = this.deps.createOrderService?.({
+      botId: this.botId,
+      botName: this.botName,
+      scriptName: this.deps.scriptName,
+      mode: this.deps.mode,
+      clobClient: this.clobClient,
+      walletAddress: credentials.address,
+      proxyAddress: credentials.proxyAddress,
+      paperState,
+    });
 
     this.scriptRunner = new ScriptRunner({
       compiledCode: this.deps.compiledCode,

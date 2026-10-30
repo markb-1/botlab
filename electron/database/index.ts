@@ -272,6 +272,14 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )`,
     "INSERT OR IGNORE INTO risk_state (scope) VALUES ('global')",
+    // Chunk 1b: paper orders go through the risk engine too and are stored with simulated = 1
+    'ALTER TABLE orders ADD COLUMN simulated INTEGER NOT NULL DEFAULT 0',
+    // Link fills to the order that produced them (spec §2.1). Only trades with an order_id
+    // (written by OrderService) count toward risk exposure and positions.
+    'ALTER TABLE bot_trades ADD COLUMN order_id TEXT',
+    'ALTER TABLE bot_trades ADD COLUMN fee_usd REAL',
+    'ALTER TABLE bot_trades ADD COLUMN category TEXT',
+    'CREATE INDEX IF NOT EXISTS idx_trades_order ON bot_trades(order_id)',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

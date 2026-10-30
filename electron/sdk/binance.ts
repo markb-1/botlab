@@ -26,6 +26,24 @@ export interface BinanceTradeResult {
   cummulativeQuoteQty: number;
   avgPrice: number;
   error?: string;
+  /**
+   * Set on failure when Binance did not give a definite answer (network error or HTTP 5xx,
+   * which Binance documents as "execution status unknown"). The order may have executed.
+   */
+  outcomeUnknown?: boolean;
+}
+
+/** HTTP error from the Binance API; `status` is undefined for network failures. */
+export class BinanceHttpError extends Error {
+  constructor(message: string, public readonly status?: number) {
+    super(message);
+    this.name = 'BinanceHttpError';
+  }
+}
+
+/** True unless Binance answered with a 4xx (a definite rejection). */
+function isUnknownOutcome(err: unknown): boolean {
+  return !(err instanceof BinanceHttpError && err.status !== undefined && err.status >= 400 && err.status < 500);
 }
 
 export interface BinanceOrderBook {
@@ -133,13 +151,18 @@ async function signedPost<T>(
 ): Promise<T> {
   const query = buildSignedQuery(params, creds.apiSecret);
   const url = `${BASE_URL}${path}?${query}`;
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'X-MBX-APIKEY': creds.apiKey },
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'X-MBX-APIKEY': creds.apiKey },
+    });
+  } catch (err) {
+    throw new BinanceHttpError(err instanceof Error ? err.message : String(err));
+  }
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Binance API ${path}: HTTP ${resp.status} - ${body}`);
+    throw new BinanceHttpError(`Binance API ${path}: HTTP ${resp.status} - ${body}`, resp.status);
   }
   return resp.json() as Promise<T>;
 }
@@ -287,11 +310,14 @@ export async function getBinancePositions(creds: BinanceCredentials): Promise<Bi
 
 /**
  * Execute a market buy order (spend quoteAmount of USDT).
+ * Only electron/orders/ExchangeAdapter.ts may call this (OrderService choke point).
+ * `clientOrderId` (our orders.id) makes retries idempotent on Binance's side.
  */
 export async function executeBinanceBuy(
   creds: BinanceCredentials,
   symbol: string,
-  quoteAmount: number
+  quoteAmount: number,
+  clientOrderId?: string
 ): Promise<BinanceTradeResult> {
   try {
     const data = await signedPost<{
@@ -306,6 +332,7 @@ export async function executeBinanceBuy(
       side: 'BUY',
       type: 'MARKET',
       quoteOrderQty: quoteAmount.toFixed(2),
+      ...(clientOrderId ? { newClientOrderId: clientOrderId } : {}),
     });
 
     const executedQty = parseFloat(data.executedQty);
@@ -330,17 +357,20 @@ export async function executeBinanceBuy(
       cummulativeQuoteQty: 0,
       avgPrice: 0,
       error: err instanceof Error ? err.message : String(err),
+      outcomeUnknown: isUnknownOutcome(err),
     };
   }
 }
 
 /**
  * Execute a market sell order (sell quantity of base asset).
+ * Only electron/orders/ExchangeAdapter.ts may call this (OrderService choke point).
  */
 export async function executeBinanceSell(
   creds: BinanceCredentials,
   symbol: string,
-  quantity: number
+  quantity: number,
+  clientOrderId?: string
 ): Promise<BinanceTradeResult> {
   try {
     const data = await signedPost<{
@@ -355,6 +385,7 @@ export async function executeBinanceSell(
       side: 'SELL',
       type: 'MARKET',
       quantity: quantity.toString(),
+      ...(clientOrderId ? { newClientOrderId: clientOrderId } : {}),
     });
 
     const executedQty = parseFloat(data.executedQty);
@@ -379,6 +410,7 @@ export async function executeBinanceSell(
       cummulativeQuoteQty: 0,
       avgPrice: 0,
       error: err instanceof Error ? err.message : String(err),
+      outcomeUnknown: isUnknownOutcome(err),
     };
   }
 }

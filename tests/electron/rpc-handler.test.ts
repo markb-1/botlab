@@ -2,8 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock trading SDK before importing RpcHandler
 vi.mock('../../electron/sdk/trading', () => ({
-  executeBuy: vi.fn().mockResolvedValue({ success: true, executedAmount: 50, price: 0.5, tokenAmount: 100 }),
-  executeSell: vi.fn().mockResolvedValue({ success: true, executedAmount: 30, price: 0.6, tokenAmount: 50 }),
   getOrderBook: vi.fn().mockResolvedValue({ asks: [{ price: '0.60', size: '100' }], bids: [{ price: '0.55', size: '100' }] }),
   getMarketPrice: vi.fn().mockResolvedValue({ bid: 0.55, ask: 0.60, mid: 0.575, spread: 0.05 }),
   getPositions: vi.fn().mockResolvedValue([]),
@@ -19,8 +17,6 @@ import { RpcHandler, type RpcHandlerDeps } from '../../electron/runtime/RpcHandl
 import type { PaperTradingState } from '../../electron/runtime/PaperTradingState';
 import type { RpcRequest } from '../../electron/sdk/types';
 import {
-  executeBuy,
-  executeSell,
   getOrderBook,
   getMarketPrice,
   getPositions,
@@ -95,33 +91,75 @@ describe('RpcHandler', () => {
     });
   });
 
-  describe('buy', () => {
-    it('should delegate to executeBuy in live mode', async () => {
-      await liveHandler.handle(makeReq('polymarket:buy', ['token1', 50, { maxPrice: 0.7 }]));
-      expect(executeBuy).toHaveBeenCalledWith(deps.clobClient, 'token1', 50, { maxPrice: 0.7 });
-    });
+  describe('orders route through OrderService', () => {
+    const filled = {
+      ok: true, orderId: 'o1', status: 'filled', filledSize: 100, avgFillPrice: 0.5,
+      filledNotionalUsd: 50, feeUsd: 0, expiresAt: null,
+    };
+    function withOrderService() {
+      const orderService = {
+        placeMarketable: vi.fn().mockResolvedValue(filled),
+        placeLimit: vi.fn().mockResolvedValue(filled),
+        placeBinance: vi.fn().mockResolvedValue({ ...filled, filledSize: 0.001, avgFillPrice: 50_000 }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+        cancelAll: vi.fn().mockResolvedValue({ cancelled: 1, failed: 0 }),
+      };
+      return { orderService, handler: new RpcHandler({ ...deps, orderService: orderService as any }) };
+    }
 
-    it('should use paperState.simulateBuy in paper mode', async () => {
-      await paperHandler.handle(makeReq('polymarket:buy', ['token1', 50, { maxPrice: 0.7 }]));
-      expect(getOrderBook).toHaveBeenCalledWith(deps.clobClient, 'token1');
-      expect(paperState.simulateBuy).toHaveBeenCalledWith(
-        'token1', 50, expect.any(Object), { maxPrice: 0.7 }
+    it('buy places a marketable order and returns a TradeResult', async () => {
+      const { orderService, handler } = withOrderService();
+      const resp = await handler.handle(makeReq('polymarket:buy', ['token1', 50, { maxPrice: 0.7 }]));
+      expect(orderService.placeMarketable).toHaveBeenCalledWith(
+        expect.objectContaining({ tokenId: 'token1', side: 'buy', amount: 50, maxPrice: 0.7 })
       );
-      expect(executeBuy).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('sell', () => {
-    it('should delegate to executeSell in live mode', async () => {
-      await liveHandler.handle(makeReq('polymarket:sell', ['token1', 100, { maxPrice: 0.5 }]));
-      expect(executeSell).toHaveBeenCalledWith(deps.clobClient, 'token1', 100, { maxPrice: 0.5 });
+      expect(resp.result).toMatchObject({ success: true, executedAmount: 50, price: 0.5, tokenAmount: 100, orderId: 'o1' });
     });
 
-    it('should use paperState.simulateSell in paper mode', async () => {
-      await paperHandler.handle(makeReq('polymarket:sell', ['token1', 100]));
-      expect(getOrderBook).toHaveBeenCalledWith(deps.clobClient, 'token1');
-      expect(paperState.simulateSell).toHaveBeenCalled();
-      expect(executeSell).not.toHaveBeenCalled();
+    it('sell passes riskExit and minPrice', async () => {
+      const { orderService, handler } = withOrderService();
+      await handler.handle(makeReq('polymarket:sell', ['token1', 100, { minPrice: 0.4, riskExit: true }]));
+      expect(orderService.placeMarketable).toHaveBeenCalledWith(
+        expect.objectContaining({ tokenId: 'token1', side: 'sell', amount: 100, minPrice: 0.4, riskExit: true })
+      );
+    });
+
+    it('risk rejection is returned as a typed result, not an RPC error', async () => {
+      const { orderService, handler } = withOrderService();
+      orderService.placeMarketable.mockResolvedValue({
+        ok: false, orderId: 'o2', status: 'rejected_risk', filledSize: 0, avgFillPrice: null,
+        filledNotionalUsd: 0, feeUsd: 0, expiresAt: null, failedCheck: 'max_order', error: 'Risk check failed: too big',
+      });
+      const resp = await handler.handle(makeReq('polymarket:buy', ['token1', 500]));
+      expect(resp.error).toBeUndefined();
+      expect(resp.result).toMatchObject({ success: false, status: 'rejected_risk', failedCheck: 'max_order' });
+    });
+
+    it('binance buy goes through OrderService', async () => {
+      const { orderService, handler } = withOrderService();
+      const resp = await handler.handle(makeReq('binance:buy', ['btcusdt', 50]));
+      expect(orderService.placeBinance).toHaveBeenCalledWith({ symbol: 'btcusdt', side: 'buy', amount: 50 });
+      expect(resp.result).toMatchObject({ success: true, symbol: 'BTCUSDT', side: 'BUY', clientOrderId: 'o1' });
+    });
+
+    it('order methods fail closed without an OrderService', async () => {
+      for (const [method, args] of [
+        ['polymarket:buy', ['t', 1]],
+        ['polymarket:sell', ['t', 1]],
+        ['polymarket:placeLimit', ['t', 'buy', 0.5, 10]],
+        ['binance:buy', ['BTCUSDT', 10]],
+      ] as const) {
+        const resp = await liveHandler.handle(makeReq(method, [...args]));
+        expect(resp.error).toContain('Order service unavailable');
+      }
+      expect(paperState.simulateBuy).not.toHaveBeenCalled();
+    });
+
+    it('recordTrade strips order linkage so scripts cannot fabricate positions', async () => {
+      await liveHandler.handle(makeReq('recordTrade', [{ market: 'X', orderId: 'fake', order_id: 'fake', feeUsd: 1 }]));
+      const arg = mockTradeRepo.create.mock.calls[0][0];
+      expect(arg.orderId).toBeUndefined();
+      expect(arg.order_id).toBeUndefined();
     });
   });
 

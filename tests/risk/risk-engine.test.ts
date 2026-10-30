@@ -124,6 +124,8 @@ const cases: Case[] = [
   { name: 'unknown bot', state: { bot: null }, fails: 'bot_halt' },
   { name: 'paper stage never reaches live checks', state: { bot: { stage: 'paper' } }, fails: 'bot_stage' },
   { name: 'retired stage', state: { bot: { stage: 'retired' } }, fails: 'bot_stage' },
+  { name: 'forecast-strategy bot buy without forecast', state: { bot: { strategy: 'forecast' } }, fails: 'forecast_required' },
+  { name: 'forecast-strategy bot may sell without forecast', order: sell(), state: held({ bot: { strategy: 'forecast' } }), fails: null },
   { name: 'probation stage allowed', state: { bot: { stage: 'probation' } }, fails: null },
 
   // Step 2 — market allowed

@@ -92,8 +92,8 @@ export function parseConfigYaml<T extends z.ZodType>(schema: T, text: string, so
   return result.data;
 }
 
-/** Read a config file, creating it with default contents if it does not exist. */
-function readOrCreate(filePath: string, defaultText: string): string {
+/** Read a config file, creating it with default contents if it does not exist. Throws ConfigError. */
+export function readOrCreate(filePath: string, defaultText: string): string {
   try {
     if (!fs.existsSync(filePath)) {
       fs.mkdirSync(path.dirname(filePath), { recursive: true });

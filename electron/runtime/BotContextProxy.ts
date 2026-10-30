@@ -25,6 +25,13 @@ import type {
   BinancePosition,
   BinancePrice,
   KellyContext,
+  PolymarketContext,
+  RiskContext,
+  LimitOrderOpts,
+  OrderResult,
+  OpenOrder,
+  FeeRates,
+  RiskBudget,
   RpcRequest,
   RpcResponse,
 } from '../sdk/types';
@@ -192,6 +199,20 @@ export function createBotContext(params: {
       getPositions: () =>
         rpcCall('binance:getPositions') as Promise<BinancePosition[]>,
     } as BinanceContext,
+
+    // Polymarket orders v2: every call goes through OrderService + RiskEngine in the main process
+    polymarket: {
+      placeLimit: (tokenId: string, side: 'buy' | 'sell', price: number, size: number, opts?: LimitOrderOpts) =>
+        rpcCall('polymarket:placeLimit', tokenId, side, price, size, opts) as Promise<OrderResult>,
+      cancel: (orderId: string) => rpcCall('polymarket:cancel', orderId) as Promise<void>,
+      cancelAll: () => rpcCall('polymarket:cancelAll') as Promise<void>,
+      getOpenOrders: () => rpcCall('polymarket:getOpenOrders') as Promise<OpenOrder[]>,
+      getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
+    } as PolymarketContext,
+
+    risk: {
+      getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
+    } as RiskContext,
 
     // Kelly Criterion (pure math, runs locally in worker)
     kelly: {

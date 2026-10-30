@@ -34,6 +34,8 @@ export interface OrderRow {
   fee_usd: number;
   reason: string | null;
   forecast_id: string | null;
+  /** 1 = paper order (never sent to an exchange) */
+  simulated: number;
   created_at: string; // ISO
   updated_at: string; // ISO
 }
@@ -43,6 +45,10 @@ const OPEN_IN = `(${OPEN_ORDER_STATUSES.map((s) => `'${s}'`).join(',')})`;
 /**
  * Every order attempt, including risk rejections (spec §2.2).
  * Timestamps are ISO strings so range queries compare correctly.
+ *
+ * Paper orders are stored too (`simulated = 1`) so paper bots get the same rate limits.
+ * Every aggregate takes a `simulated` flag (default false = live only), so paper orders
+ * never count toward live limits and vice versa.
  */
 export class OrderRepository {
   private db: Database.Database;
@@ -68,15 +74,16 @@ export class OrderRepository {
   }
 
   /** Orders that may still fill, optionally for one bot. */
-  findOpen(botId?: string): OrderRow[] {
+  findOpen(botId?: string, simulated = false): OrderRow[] {
+    const sim = simulated ? 1 : 0;
     if (botId) {
       return this.db
-        .prepare(`SELECT * FROM orders WHERE status IN ${OPEN_IN} AND bot_id = ? ORDER BY created_at`)
-        .all(botId) as OrderRow[];
+        .prepare(`SELECT * FROM orders WHERE status IN ${OPEN_IN} AND bot_id = ? AND simulated = ? ORDER BY created_at`)
+        .all(botId, sim) as OrderRow[];
     }
     return this.db
-      .prepare(`SELECT * FROM orders WHERE status IN ${OPEN_IN} ORDER BY created_at`)
-      .all() as OrderRow[];
+      .prepare(`SELECT * FROM orders WHERE status IN ${OPEN_IN} AND simulated = ? ORDER BY created_at`)
+      .all(sim) as OrderRow[];
   }
 
   create(data: {
@@ -96,6 +103,7 @@ export class OrderRepository {
     exchangeOrderId?: string | null;
     reason?: string | null;
     forecastId?: string | null;
+    simulated?: boolean;
   }): OrderRow {
     const id = data.id || generateId();
     const now = new Date().toISOString();
@@ -104,8 +112,8 @@ export class OrderRepository {
       .prepare(
         `INSERT INTO orders (id, bot_id, exchange, market_id, token_id, side, order_type, price, size,
            notional_usd, expires_at, status, risk_decision, exchange_order_id, reason, forecast_id,
-           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           simulated, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -124,6 +132,7 @@ export class OrderRepository {
         data.exchangeOrderId ?? null,
         data.reason ?? null,
         data.forecastId ?? null,
+        data.simulated ? 1 : 0,
         now,
         now
       );
@@ -162,22 +171,43 @@ export class OrderRepository {
   }
 
   /** Orders a bot attempted since `sinceIso` (all statuses — rejections count toward the rate limit). */
-  countByBotSince(botId: string, sinceIso: string): number {
+  countByBotSince(botId: string, sinceIso: string, simulated = false): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM orders WHERE bot_id = ? AND created_at >= ?')
-      .get(botId, sinceIso) as { n: number };
+      .prepare('SELECT COUNT(*) AS n FROM orders WHERE bot_id = ? AND created_at >= ? AND simulated = ?')
+      .get(botId, sinceIso, simulated ? 1 : 0) as { n: number };
     return row.n;
   }
 
-  countOpen(): number {
-    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM orders WHERE status IN ${OPEN_IN}`).get() as { n: number };
+  /** Open orders across all bots (or one bot). */
+  countOpen(simulated = false, botId?: string): number {
+    const row = (botId
+      ? this.db
+          .prepare(`SELECT COUNT(*) AS n FROM orders WHERE status IN ${OPEN_IN} AND simulated = ? AND bot_id = ?`)
+          .get(simulated ? 1 : 0, botId)
+      : this.db
+          .prepare(`SELECT COUNT(*) AS n FROM orders WHERE status IN ${OPEN_IN} AND simulated = ?`)
+          .get(simulated ? 1 : 0)) as { n: number };
     return row.n;
   }
 
-  /** Unfilled notional of open buy orders, optionally filtered by bot and/or market. */
-  sumOpenBuyNotional(filter: { botId?: string; marketId?: string } = {}): number {
-    const conditions = [`status IN ${OPEN_IN}`, "side = 'buy'"];
-    const values: unknown[] = [];
+  /** Unfilled size of a bot's open sell orders in one token. */
+  sumOpenSellSize(botId: string, tokenId: string, simulated = false): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(MAX(size - filled_size, 0)), 0) AS total
+         FROM orders WHERE status IN ${OPEN_IN} AND side = 'sell' AND bot_id = ? AND token_id = ? AND simulated = ?`
+      )
+      .get(botId, tokenId, simulated ? 1 : 0) as { total: number };
+    return row.total;
+  }
+
+  /** Unfilled notional of open buy orders, optionally filtered by bot, market and/or exchange. */
+  sumOpenBuyNotional(
+    filter: { botId?: string; marketId?: string; exchange?: 'polymarket' | 'binance'; simulated?: boolean } = {}
+  ): number {
+    const conditions = [`status IN ${OPEN_IN}`, "side = 'buy'", 'simulated = ?'];
+    const values: unknown[] = [filter.simulated ? 1 : 0];
+    if (filter.exchange) { conditions.push('exchange = ?'); values.push(filter.exchange); }
     if (filter.botId) { conditions.push('bot_id = ?'); values.push(filter.botId); }
     if (filter.marketId) { conditions.push('market_id = ?'); values.push(filter.marketId); }
 

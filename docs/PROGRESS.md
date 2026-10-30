@@ -7,7 +7,7 @@ Implementation log for `docs/SPEC.md`. Each chunk is implemented, reviewed indep
 | chunk | scope | status |
 |---|---|---|
 | 1a | `.gitattributes`, 3-OS CI, config system (limits schema/loader), RiskEngine, `orders` + `risk_state` tables | done |
-| 1b | OrderService choke point, GTD limit orders, fee table, route all live orders through RiskEngine | pending |
+| 1b | OrderService choke point, GTD limit orders, fee table, route all live orders through RiskEngine | done |
 | 1c | Halts, daily loss, kill switch, start-halted-after-crash, ramp stages, audit log | pending |
 | 1d | Sandbox hardening, backtests in worker, AES-GCM migration, copy-trading sell fix | pending |
 | 1e | Telegram notifications, config hot reload | pending |
@@ -29,6 +29,17 @@ Judgement calls made during the overnight run. Each says how to reverse it.
 | R1 | 1a | Risk-exit sells are exempt from `max_order_usd`, `max_orders_per_hour`, `max_open_orders` and `max_spread` (still bound by scope, held position, price range, slippage). | Otherwise an exit from an ambiguous/rule-changed market can be impossible on a wide book or after the per-order cap. | Remove the exemptions in `RiskEngine` step 3/4. |
 | R2 | 1a | "Long horizon" is fixed at 30 days; mandate `resolves_within_days[1]` must be ≤ 30. | A mandate edit could otherwise switch off the long-horizon cap. | Change `LONG_HORIZON_DAYS` and the schema refinement. |
 | R3 | 1a | Market-quality gates (category, ambiguity, rules-changed, liquidity) apply to buys only. | Exits must remain possible from markets that became risky. | `RiskEngine` step 2. |
+| R4 | 1b | **Ambiguity and rules-change are placeholders**: `PlaceholderMarketQualityProvider` returns ambiguity 0 and no rules change for every market, so those two mandate checks are not enforced until chunk 2a. | No market cache / agent scoring exists yet. | Replace the provider in `BotManager.createOrderService` (TODO chunk 2a). |
+| R5 | 1b | **Mandate category = Gamma category/tag slug** compared directly with the mandate lists (no `categories.yaml` yet); if any label is denied (or "later") that wins, else an allowed label, else the first label (rejected). E.g. Polymarket "Weather" ≠ mandate `weather-climate`, so such buys are rejected until the mapping exists or the mandate lists `weather`. | Fail closed until the 2a mapping table. | `mandateCategory()` in `electron/orders/MarketDataService.ts`. |
+| R6 | 1b | **Binance counts toward global total exposure** (USDT/USDC/FDUSD = 1 USD) and toward the bot's Binance allocation; not toward per-market or long-horizon. Non-USD-quoted Binance symbols are rejected (`unsupported_symbol`). | Spec intent: global limits cover all live exposure. | `DbRiskStateProvider.computeExposure`, `OrderService.placeBinance`. |
+| R7 | 1b | **Equity** = cash (the bot's Polymarket wallet USDC + Binance USDT if credentials are set, cached 30 s) + cost basis of all open live positions. Read failure ⇒ NaN ⇒ every order rejected `state_invalid` (including sells). Multi-wallet setups under-count equity (conservative). | Cash alone would shrink the % limit as positions grow. | `BotManager.createOrderService` `getCashUsd`. |
+| R8 | 1b | **Only OrderService fills count as positions**: exposure and sellable size come from `bot_trades` rows with an `order_id`. Pre-v3 auto-recorded trades and `ctx.recordTrade` rows are ignored (`recordTrade` strips `orderId`), so existing live positions from before 1b are invisible to the risk engine and cannot be sold by bots (sell manually). | A script could otherwise fabricate positions or sells. | `BotTradeRepository.getRiskPositions`. |
+| R9 | 1b | **Post-only is emulated**: clob-client 4.22.8 has no `postOnly` flag, so a post-only order is rejected (`post_only`) if it would cross the book at check time; the book can still move before it lands. `placeLimit` defaults to `postOnly: true`. | Spec default is resting post-only. | `OrderService.placeLimit`; use the native flag after upgrading clob-client. |
+| R10 | 1b | **ctx.buy/sell are now one FOK order** at a risk-checked worst price (best ask/bid ± `maxSlippage`, or `maxPrice`/`minPrice`, on the tick grid) instead of the old loop of up to 3 retries walking the book. `retries` is ignored. Partial fills only happen in paper. | One exchange order per risk-checked order row; the old loop could walk the book unchecked. | `OrderService.placeMarketable`. |
+| R11 | 1b | **Unknown exchange outcome ⇒ row stays `submitted`** (counts toward exposure and open orders until reconciled in 2b); a GTD order the exchange no longer returns is likewise left open. Only a definite exchange answer marks `failed`/`cancelled`/`expired`. | Fail closed: the order may be live. | `OrderService.applyOutcome`/`applyExchangeState`. |
+| R12 | 1b | **Paper mode** uses the same limits with stage `paper` treated as `full`, scoped to the bot's own paper orders/fills (stored with `orders.simulated = 1`, `bot_trades.simulated = 1`); halts apply to paper too. Paper fills need the same market data as live (Gamma + book), so paper buys in non-mandate categories are rejected. Resting paper orders are not simulated: `placeLimit` in paper fills at the limit price if marketable (requires `postOnly: false`), else returns `paper mode: resting orders not simulated yet`. | Paper should behave like live. | `DbRiskStateProvider` `simulated`, `OrderService.placeLimit`. |
+| R13 | 1b | **Fees**: expected fee = taker rate × notional (unknown fee category ⇒ highest configured rate); maker 0. Default rates are unverified (comment in `FeeService.ts`). Binance fees are not modelled (`fee_usd` 0). | Conservative until verified. | `config/fees.yaml`, `FeeService`. |
+| R14 | 1b | **Invalid risk config disables bot start**: `BotManager.initialize` loads limits/mandate/fees once; on `ConfigError` no bot (live or paper) can start, rather than falling back to defaults. | Fail closed. | `BotManager.initialize`. |
 
 ## Log
 
@@ -85,4 +96,53 @@ Interpretations / deviations from spec:
   `BOTLAB_CONFIG_DIR`, else in production the OS app-data dir (§15.2) + `/config`, else `<cwd>/config`.
 - `risk_state` timestamps are ISO everywhere (including `updated_at`).
 - Deferred to 1b: requiring a forecast for forecast-strategy bots.
+
+### 2026-10-30 — chunk 1b
+Done: OrderService choke point for every bot order (live and paper, both exchanges), repository-backed risk state,
+Polymarket GTD limit orders + cancels, fee table, ctx API v2 additions, forecast-required rule, static choke-point test.
+
+Files:
+- `electron/orders/OrderService.ts` — per-bot service. Flow: validate → market context (Gamma metadata + CLOB book +
+  fee category + placeholder quality) → pre-checks (`post_only`, `forecast_unavailable`, `market_data_unavailable`,
+  `unsupported_symbol`, recorded as step-0 decisions) → **process-wide lock**: `DbRiskStateProvider.getSnapshot` →
+  `RiskEngine.check` → insert `orders` row (`rejected_risk` + decision, or `submitted`) → unlock → exchange adapter (live)
+  or `PaperTradingState` (paper) → in one transaction update the row (exchange id, status, fill size, avg price, fee) and
+  insert the `bot_trades` fill (`order_id`, `condition_id`, `fee_usd`, `category`). Rejections come back as
+  `{ ok: false, status: 'rejected_risk', failedCheck, error }`. Also `cancel`/`cancelAll`/`getOpenOrders` (own bot only;
+  another bot's order id reads as "not found"), `getFee`, `getBudget`, and a best-effort `syncOpenOrders` that pulls
+  resting-order fills/cancels from the CLOB before each placement and on `getOpenOrders`/cancel.
+- `electron/orders/DbRiskStateProvider.ts` — snapshot from SQLite: halts (`risk_state`), bot stage/allocation/market_ids/
+  strategy (`bots`; unparseable `market_ids` ⇒ `[]`), exposures (positions' average-cost basis + unfilled open buy
+  notional; long-horizon uses market end dates, unknown ⇒ long), orders in the last hour (incl. rejections), open orders,
+  position (net size, open sells, opened = first buy since last flat), equity (see R7). External lookups time out at 10 s.
+- `electron/orders/MarketDataService.ts` — Gamma `/markets?clob_token_ids=` lookup (5 min cache), mandate-category
+  placeholder (R5), `PlaceholderMarketQualityProvider` (R4).
+- `electron/orders/FeeService.ts` + `config/fees.example.yaml` — zod schema, defaults, `loadFees`, label → fee category.
+- `electron/orders/ExchangeAdapter.ts` — `PolymarketAdapter`/`BinanceAdapter` interfaces and the live implementations.
+- `electron/exchange/polymarket/orders.ts` — the only module calling `createOrder`/`createMarketOrder`/`postOrder`:
+  FOK market orders, GTD limit orders (`expiration = expiresAt + 60 s` security buffer per CLOB docs — verify),
+  `cancelOrders`, `getOrder`; distinguishes definite rejection from unknown outcome. Polymarket has no client order id,
+  so idempotency there rests on the row being written before the call.
+- `electron/sdk/binance.ts` — `newClientOrderId` = `orders.id`; HTTP 5xx / network errors flagged `outcomeUnknown`.
+- `electron/sdk/trading.ts` — `executeBuy`/`executeSell` removed (read-only helpers remain).
+- `electron/runtime/RpcHandler.ts` — all order methods go through OrderService (missing ⇒ error); new RPCs
+  `polymarket:placeLimit|cancel|cancelAll|getOpenOrders|getFee`, `risk:getBudget`; `recordTrade` strips order linkage.
+- `electron/runtime/BotContextProxy.ts`, `electron/sdk/types.ts` — `ctx.polymarket.{placeLimit,cancel,cancelAll,
+  getOpenOrders,getFee}`, `ctx.risk.getBudget()`, `OrderOpts.{minPrice,reason,forecastId,riskExit}`, `TradeResult`
+  gains `orderId`/`status`/`failedCheck`.
+- `src/core/BotManager.ts` — loads config + fees once in `initialize()`, builds each bot's OrderService
+  (`createOrderService` factory passed via `ScriptBotRunner`); `electron/main.ts` passes db + order/risk repos.
+- `electron/risk/` — `BotRiskInfo.strategy`; new step-1 check `forecast_required` (forecast-strategy bots cannot buy
+  without a forecast); new step-0 check names for OrderService pre-checks.
+- DB migrations: `orders.simulated`; `bot_trades.order_id`, `fee_usd`, `category` (+ index).
+- Tests: `tests/orders/order-service.test.ts` (fake adapters + in-memory SQLite), `db-risk-state-provider.test.ts`,
+  `choke-point.test.ts`, `fee-service.test.ts`, `market-data.test.ts`; RpcHandler tests rewritten for the new routing;
+  risk-engine table rows for `forecast_required`. DB tests skip with a warning if better-sqlite3 is built for Electron.
+
+Not done / stubbed (see Decisions R4–R14):
+- Ledger (`ForecastSource` = `NoForecastSource`), category rights (`categoryBucket: null`), ambiguity/rules-change,
+  `categories.yaml` mapping — chunk 2a. Ledger-driven orders are therefore always rejected.
+- Reconciler (fills of other bots' resting orders, unknown outcomes, resolved positions that still count as exposure,
+  orders the exchange no longer returns) — chunk 2b. `ctx.polymarket.getMarket` (§5.2) not added.
+- Rejection notifications (> 10/hour/bot) — chunk 1e. Halts/kill switch cancelling orders — chunk 1c.
 

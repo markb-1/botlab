@@ -96,7 +96,7 @@ web/client/src/            # React renderer
 3. `ScriptBotRunner` spawns a `ScriptRunner` which creates a worker thread
 4. Worker thread runs the script with a `ctx` object (built by `BotContextProxy`)
 5. Script calls like `ctx.binance.getPrice('BTCUSDT')` become RPC messages to the main thread
-6. `RpcHandler` dispatches RPC calls to the real API (live mode) or `PaperTradingState` (paper mode)
+6. `RpcHandler` dispatches RPC calls; every order goes through `electron/orders/OrderService` → `RiskEngine` → exchange adapter (live) or `PaperTradingState` (paper). Only `electron/exchange/polymarket/orders.ts` and `electron/sdk/binance.ts` may hit order endpoints (enforced by `tests/orders/choke-point.test.ts`)
 
 ### Key Patterns
 - **IPC Handlers** (`electron/ipc/handlers/`): Each module registers `ipcMain.handle()` handlers. Renderer calls via `window.electronAPI.*`

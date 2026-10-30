@@ -9,7 +9,10 @@ import {
   BotTradeRepository,
   BotStorageRepository,
   BacktestRepository,
+  OrderRepository,
+  RiskStateRepository,
 } from './database/repositories/index';
+import type { Database } from './database/index';
 import { keyManager } from './security/keyManager';
 import { WalletManager } from '../src/core/WalletManager';
 import { BotManager } from '../src/core/BotManager';
@@ -37,6 +40,9 @@ let settingsRepo: SettingsRepository;
 let tradeRepo: BotTradeRepository;
 let storageRepo: BotStorageRepository;
 let backtestRepo: BacktestRepository;
+let orderRepo: OrderRepository;
+let riskStateRepo: RiskStateRepository;
+let database: Database.Database;
 
 const isDev = !app.isPackaged;
 
@@ -95,6 +101,9 @@ async function initializePhaseA(): Promise<void> {
   tradeRepo = new BotTradeRepository(db);
   storageRepo = new BotStorageRepository(db);
   backtestRepo = new BacktestRepository(db);
+  orderRepo = new OrderRepository(db);
+  riskStateRepo = new RiskStateRepository(db);
+  database = db;
 
   // 3. Seed script templates (compiles with esbuild)
   const templates = getBuiltinTemplates();
@@ -153,7 +162,8 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     settingsRepo,
     scriptRepo,
     storageRepo,
-    tradeRepo
+    tradeRepo,
+    { db: database, orderRepo, riskStateRepo }
   );
   await botManager.initialize();
   console.log('[Main] BotManager initialized');

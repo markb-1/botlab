@@ -2,31 +2,30 @@
  * RpcHandler - runs in the main process.
  * Receives RPC requests from worker threads and dispatches to trading SDK,
  * storage repository, and logging.
- * In paper mode, buy/sell/getBalance/getPositions are intercepted by PaperTradingState.
+ * Every order (live and paper) goes through OrderService, which runs the RiskEngine;
+ * in paper mode OrderService fills against PaperTradingState instead of an exchange.
+ * In paper mode getBalance/getPositions read PaperTradingState.
  */
 
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult } from '../sdk/types';
 import type { PaperTradingState } from './PaperTradingState';
 import {
-  executeBuy,
-  executeSell,
   getOrderBook,
   getMarketPrice,
   getPositions,
   getBalance,
 } from '../sdk/trading';
 import {
-  executeBinanceBuy,
-  executeBinanceSell,
   getBinanceBalance,
   getBinanceOrderBook,
   getBinancePrice,
   getBinancePositions,
 } from '../sdk/binance';
 import type { BinanceCredentials } from '../sdk/binance';
+import { toTradeResult, type OrderResult, type OrderService } from '../orders/OrderService';
 import logger from '../../src/utils/logger';
 
 export interface RpcHandlerDeps {
@@ -43,58 +42,39 @@ export interface RpcHandlerDeps {
   clobHttpUrl: string;
   binanceApiKey?: string;
   binanceApiSecret?: string;
+  /**
+   * The only route to an exchange order (live) or a paper fill: every buy/sell/limit
+   * order goes through OrderService and the RiskEngine. Missing ⇒ order methods fail.
+   */
+  orderService?: OrderService;
+}
+
+/** Legacy ctx.binance.buy/sell result from an OrderService result. */
+function toBinanceTradeResult(symbol: string, side: 'BUY' | 'SELL', r: OrderResult): BinanceTradeResult {
+  return {
+    success: r.filledSize > 0,
+    symbol: symbol.toUpperCase(),
+    side,
+    executedQty: r.filledSize,
+    cummulativeQuoteQty: r.filledNotionalUsd,
+    avgPrice: r.avgFillPrice ?? 0,
+    clientOrderId: r.orderId,
+    status: r.status,
+    ...(r.error ? { error: r.error } : {}),
+    ...(r.failedCheck ? { failedCheck: r.failedCheck } : {}),
+  };
+}
+
+function orderOpts(v: unknown): OrderOpts {
+  return v && typeof v === 'object' ? (v as OrderOpts) : {};
 }
 
 export class RpcHandler {
   private deps: RpcHandlerDeps;
   private paperState: PaperTradingState | null;
-  private tokenInfoCache: Map<string, { market: string; outcome: string }> = new Map();
-
   constructor(deps: RpcHandlerDeps, paperState?: PaperTradingState) {
     this.deps = deps;
     this.paperState = paperState || null;
-  }
-
-  /**
-   * Resolve a Polymarket tokenId to its market title and outcome label.
-   * Results are cached to avoid repeated API calls.
-   */
-  private async resolveTokenInfo(tokenId: string): Promise<{ market: string; outcome: string } | null> {
-    const cached = this.tokenInfoCache.get(tokenId);
-    if (cached) return cached;
-
-    try {
-      const resp = await fetch(
-        `https://gamma-api.polymarket.com/markets?clob_token_ids=${tokenId}`
-      );
-      if (!resp.ok) return null;
-      const markets = await resp.json();
-      if (!Array.isArray(markets) || markets.length === 0) return null;
-
-      const mkt = markets[0];
-      // Find which outcome this token corresponds to
-      let outcomeLabel = '';
-      try {
-        const tokenIds: string[] = typeof mkt.clobTokenIds === 'string'
-          ? JSON.parse(mkt.clobTokenIds)
-          : (mkt.clobTokenIds || []);
-        const outcomes: string[] = typeof mkt.outcomes === 'string'
-          ? JSON.parse(mkt.outcomes)
-          : (mkt.outcomes || []);
-        const tokenIndex = tokenIds.indexOf(tokenId);
-        outcomeLabel = tokenIndex >= 0 && outcomes[tokenIndex] ? outcomes[tokenIndex] : outcomes[0] || '';
-      } catch {
-        outcomeLabel = '';
-      }
-
-      const info = { market: mkt.question || mkt.title || '', outcome: outcomeLabel };
-      if (info.market) {
-        this.tokenInfoCache.set(tokenId, info);
-      }
-      return info;
-    } catch {
-      return null;
-    }
   }
 
   private get isPaper(): boolean {
@@ -114,54 +94,9 @@ export class RpcHandler {
     return creds;
   }
 
-  /**
-   * Auto-record a successful trade to the bot_trades table.
-   * Wrapped in try/catch — recording failures must never break trade execution.
-   * For Polymarket trades, resolves the tokenId to a human-readable market title.
-   */
-  private async recordTradeIfSuccessful(
-    exchange: 'polymarket' | 'binance',
-    side: 'BUY' | 'SELL',
-    symbol: string,
-    result: any
-  ): Promise<void> {
-    try {
-      if (!result?.success) return;
-
-      if (exchange === 'polymarket') {
-        // Resolve tokenId to market title + outcome
-        const info = await this.resolveTokenInfo(symbol);
-        this.deps.tradeRepo.create({
-          botId: this.deps.botId,
-          botName: this.deps.botName,
-          scriptName: this.deps.scriptName,
-          exchange: 'polymarket',
-          side,
-          symbol,
-          market: info?.market,
-          outcome: info?.outcome,
-          price: result.price,
-          quantity: result.tokenAmount,
-          quoteAmount: result.executedAmount,
-          simulated: this.isPaper ? 1 : 0,
-        });
-      } else {
-        this.deps.tradeRepo.create({
-          botId: this.deps.botId,
-          botName: this.deps.botName,
-          scriptName: this.deps.scriptName,
-          exchange: 'binance',
-          side,
-          symbol: result.symbol || symbol,
-          price: result.avgPrice,
-          quantity: result.executedQty,
-          quoteAmount: result.cummulativeQuoteQty,
-          simulated: this.isPaper ? 1 : 0,
-        });
-      }
-    } catch (err) {
-      logger.error(`Failed to auto-record trade: ${err instanceof Error ? err.message : err}`);
-    }
+  private get orders(): OrderService {
+    if (!this.deps.orderService) throw new Error('Order service unavailable: orders are disabled');
+    return this.deps.orderService;
   }
 
   async handle(request: RpcRequest): Promise<RpcResponse> {
@@ -178,57 +113,69 @@ export class RpcHandler {
     switch (method) {
       // === Polymarket Trading ===
 
+      // All order methods go through OrderService (risk checks; paper fills in paper mode)
       case 'polymarket:buy': {
-        const tokenId = args[0] as string;
-        let result;
-        if (this.isPaper) {
-          const book = await getOrderBook(this.deps.clobClient, tokenId);
-          result = this.paperState!.simulateBuy(
-            tokenId,
-            args[1] as number,
-            book,
-            args[2] as any
-          );
-          // Enrich paper position with market metadata (fire-and-forget)
-          if (result.success) {
-            this.resolveTokenInfo(tokenId).then(info => {
-              if (info) this.paperState!.updatePositionMeta(tokenId, info.market, info.outcome);
-            }).catch(() => {});
-          }
-        } else {
-          result = await executeBuy(
-            this.deps.clobClient,
-            tokenId,
-            args[1] as number,
-            args[2] as any
-          );
-        }
-        this.recordTradeIfSuccessful('polymarket', 'BUY', tokenId, result);
-        return result;
+        const opts = orderOpts(args[2]);
+        const result = await this.orders.placeMarketable({
+          tokenId: args[0] as string,
+          side: 'buy',
+          amount: args[1] as number,
+          maxPrice: opts.maxPrice,
+          maxSlippage: opts.maxSlippage,
+          reason: opts.reason,
+          forecastId: opts.forecastId,
+        });
+        return toTradeResult(result);
       }
 
       case 'polymarket:sell': {
-        const tokenId = args[0] as string;
-        let result;
-        if (this.isPaper) {
-          const book = await getOrderBook(this.deps.clobClient, tokenId);
-          result = this.paperState!.simulateSell(
-            tokenId,
-            args[1] as number,
-            book,
-            args[2] as any
-          );
-        } else {
-          result = await executeSell(
-            this.deps.clobClient,
-            tokenId,
-            args[1] as number,
-            args[2] as any
-          );
-        }
-        this.recordTradeIfSuccessful('polymarket', 'SELL', tokenId, result);
-        return result;
+        const opts = orderOpts(args[2]);
+        const result = await this.orders.placeMarketable({
+          tokenId: args[0] as string,
+          side: 'sell',
+          amount: args[1] as number,
+          minPrice: opts.minPrice,
+          maxSlippage: opts.maxSlippage,
+          reason: opts.reason,
+          forecastId: opts.forecastId,
+          riskExit: opts.riskExit,
+        });
+        return toTradeResult(result);
       }
+
+      case 'polymarket:placeLimit': {
+        const opts = (args[4] && typeof args[4] === 'object' ? args[4] : {}) as LimitOrderOpts;
+        return this.orders.placeLimit({
+          tokenId: args[0] as string,
+          side: args[1] as 'buy' | 'sell',
+          price: args[2] as number,
+          size: args[3] as number,
+          postOnly: opts.postOnly,
+          ttlMinutes: opts.ttlMinutes,
+          reason: opts.reason,
+          forecastId: opts.forecastId,
+          riskExit: opts.riskExit,
+        });
+      }
+
+      case 'polymarket:cancel':
+        await this.orders.cancel(args[0] as string);
+        return;
+
+      case 'polymarket:cancelAll': {
+        const { failed } = await this.orders.cancelAll();
+        if (failed > 0) throw new Error(`${failed} order(s) could not be cancelled`);
+        return;
+      }
+
+      case 'polymarket:getOpenOrders':
+        return this.orders.getOpenOrders();
+
+      case 'polymarket:getFee':
+        return this.orders.getFee(args[0] as string);
+
+      case 'risk:getBudget':
+        return this.orders.getBudget();
 
       case 'polymarket:getOrderBook':
         return getOrderBook(
@@ -315,43 +262,31 @@ export class RpcHandler {
       case 'emit':
         return { type: args[0], data: args[1] };
 
-      case 'recordTrade':
+      case 'recordTrade': {
+        // Script-written trades are informational: strip fields that would make them count as
+        // OrderService fills (positions and exposure come only from rows with an order_id)
+        const { orderId: _o, order_id: _oid, feeUsd: _f, ...data } = (args[0] ?? {}) as Record<string, unknown>;
         return this.deps.tradeRepo.create({
+          ...data,
           botId: this.deps.botId,
           botName: this.deps.botName,
           scriptName: this.deps.scriptName,
-          ...(args[0] as Record<string, unknown>),
           ...(this.isPaper ? { simulated: 1 } : {}),
         });
+      }
 
       // === Binance Spot Trading ===
 
       case 'binance:buy': {
         const symbol = args[0] as string;
-        const quoteAmount = args[1] as number;
-        let result;
-        if (this.isPaper) {
-          const book = await getBinanceOrderBook(symbol);
-          result = this.paperState!.simulateBinanceBuy(symbol, quoteAmount, book);
-        } else {
-          result = await executeBinanceBuy(this.requireBinanceCreds(), symbol, quoteAmount);
-        }
-        this.recordTradeIfSuccessful('binance', 'BUY', symbol, result);
-        return result;
+        const result = await this.orders.placeBinance({ symbol, side: 'buy', amount: args[1] as number });
+        return toBinanceTradeResult(symbol, 'BUY', result);
       }
 
       case 'binance:sell': {
         const symbol = args[0] as string;
-        const quantity = args[1] as number;
-        let result;
-        if (this.isPaper) {
-          const book = await getBinanceOrderBook(symbol);
-          result = this.paperState!.simulateBinanceSell(symbol, quantity, book);
-        } else {
-          result = await executeBinanceSell(this.requireBinanceCreds(), symbol, quantity);
-        }
-        this.recordTradeIfSuccessful('binance', 'SELL', symbol, result);
-        return result;
+        const result = await this.orders.placeBinance({ symbol, side: 'sell', amount: args[1] as number });
+        return toBinanceTradeResult(symbol, 'SELL', result);
       }
 
       case 'binance:getBalance': {

@@ -34,6 +34,22 @@ export interface BotTradeRow {
   quantity: number | null;
   quote_amount: number | null;
   simulated: number | null;
+  /** Set only for fills recorded by OrderService; such trades are the risk engine's source of positions */
+  order_id: string | null;
+  fee_usd: number | null;
+  category: string | null;
+}
+
+/** Open position of one bot in one symbol, computed from OrderService fills. */
+export interface RiskPositionRow {
+  bot_id: string;
+  exchange: string;
+  symbol: string;
+  /** Polymarket condition id (null for Binance) */
+  condition_id: string | null;
+  net_quantity: number;
+  /** Average buy price × net quantity */
+  cost_basis: number;
 }
 
 export class BotTradeRepository {
@@ -73,6 +89,9 @@ export class BotTradeRepository {
     quantity?: number;
     quoteAmount?: number;
     simulated?: number;
+    orderId?: string;
+    feeUsd?: number;
+    category?: string | null;
   }): BotTradeRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -86,8 +105,8 @@ export class BotTradeRepository {
           trader_win_rate, trader_sample_size, kelly_fraction, kelly_edge, kelly_percentage,
           sizing_reason, current_position_value, max_position_size,
           executed_at, trader_trade_timestamp, metadata, created_at,
-          exchange, symbol, price, quantity, quote_amount, simulated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, category
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -120,7 +139,10 @@ export class BotTradeRepository {
         data.price ?? null,
         data.quantity ?? null,
         data.quoteAmount ?? null,
-        data.simulated ?? 0
+        data.simulated ?? 0,
+        data.orderId ?? null,
+        data.feeUsd ?? null,
+        data.category ?? null
       );
 
     return this.db.prepare('SELECT * FROM bot_trades WHERE id = ?').get(id) as BotTradeRow;
@@ -181,6 +203,44 @@ export class BotTradeRepository {
       HAVING netQuantity > 0.0001
       ORDER BY MAX(executed_at) DESC
     `).all(botId) as any[];
+  }
+
+  /**
+   * Open positions for the risk engine, from fills recorded by OrderService only
+   * (`order_id IS NOT NULL`). Trades written by scripts via ctx.recordTrade, and
+   * pre-v3 auto-recorded trades, are ignored so a bot cannot fabricate positions.
+   *
+   * Cost basis = average buy price × net quantity.
+   */
+  getRiskPositions(filter: { simulated: boolean; botId?: string; exchange?: 'polymarket' | 'binance' }): RiskPositionRow[] {
+    const conditions = ['order_id IS NOT NULL', 'simulated = ?'];
+    const values: unknown[] = [filter.simulated ? 1 : 0];
+    if (filter.botId) { conditions.push('bot_id = ?'); values.push(filter.botId); }
+    if (filter.exchange) { conditions.push('exchange = ?'); values.push(filter.exchange); }
+
+    return this.db.prepare(`
+      SELECT bot_id, exchange, symbol, condition_id, net_quantity,
+        CASE WHEN buy_qty > 0 THEN net_quantity * buy_cost / buy_qty ELSE 0 END AS cost_basis
+      FROM (
+        SELECT bot_id, exchange, symbol, MAX(condition_id) AS condition_id,
+          SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS net_quantity,
+          SUM(CASE WHEN side = 'BUY' THEN quantity ELSE 0 END) AS buy_qty,
+          SUM(CASE WHEN side = 'BUY' THEN quote_amount ELSE 0 END) AS buy_cost
+        FROM bot_trades
+        WHERE ${conditions.join(' AND ')}
+        GROUP BY bot_id, exchange, symbol
+      )
+      WHERE net_quantity > 1e-9
+    `).all(...values) as RiskPositionRow[];
+  }
+
+  /** OrderService fills of one bot in one symbol, oldest first (for position open time). */
+  findRiskFills(botId: string, symbol: string, simulated: boolean): Array<{ side: string; quantity: number; executed_at: string }> {
+    return this.db.prepare(`
+      SELECT side, quantity, executed_at FROM bot_trades
+      WHERE bot_id = ? AND symbol = ? AND simulated = ? AND order_id IS NOT NULL
+      ORDER BY executed_at, created_at
+    `).all(botId, symbol, simulated ? 1 : 0) as Array<{ side: string; quantity: number; executed_at: string }>;
   }
 
   /**

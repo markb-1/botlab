@@ -211,6 +211,11 @@ export class RiskEngine {
       { stage: bot.stage })) {
       return decide();
     }
+    // Forecast-strategy bots trade the ledger: a buy without a forecast is not that strategy
+    if (isBuy && bot.strategy === 'forecast' && !record(1, 'forecast_required', !!order.forecast,
+      order.forecast ? 'Forecast attached' : 'Forecast-strategy bot: buys require a forecast')) {
+      return decide();
+    }
 
     // ── Step 2: market allowed ───────────────────────────────────────
     if (!isPoly) {

@@ -72,6 +72,8 @@ export interface BotRiskInfo {
   haltReason?: string | null;
   /** Bot runs a template with trust=new (smaller probation allocation) */
   newTemplate?: boolean;
+  /** Strategy template key (bots.strategy); `forecast` bots may only buy with a forecast */
+  strategy?: string | null;
 }
 
 /**
@@ -127,6 +129,7 @@ export type RiskCheckName =
   | 'global_halt'
   | 'bot_halt'
   | 'bot_stage'
+  | 'forecast_required'
   | 'exchange_enabled'
   | 'market_data'
   | 'market_scope'
@@ -152,7 +155,12 @@ export type RiskCheckName =
   | 'long_horizon'
   | 'category_exposure'
   | 'hold_time'
-  | 'edge';
+  | 'edge'
+  // Rejections raised by OrderService before the engine runs (step 0)
+  | 'forecast_unavailable'
+  | 'post_only'
+  | 'unsupported_symbol'
+  | 'market_data_unavailable';
 
 export interface RiskCheckResult {
   /** Spec §4.1 step number (1–7); 0 = snapshot validation */

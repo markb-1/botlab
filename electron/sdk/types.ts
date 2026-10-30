@@ -59,6 +59,12 @@ export interface BotContext {
 
   // === Kelly Criterion position sizing ===
   kelly: KellyContext;
+
+  // === Polymarket orders v2 (spec §5.2): limit orders, cancels, fees ===
+  polymarket: PolymarketContext;
+
+  // === Risk budget (read-only) ===
+  risk: RiskContext;
 }
 
 // ============================================================================
@@ -66,12 +72,20 @@ export interface BotContext {
 // ============================================================================
 
 export interface OrderOpts {
-  /** Maximum price willing to pay/accept. If not set, uses best available. */
+  /** Buy: highest price willing to pay. If not set, best ask (+ maxSlippage). */
   maxPrice?: number;
-  /** Maximum slippage from current price (e.g., 0.05 = 5 cents) */
+  /** Sell: lowest price willing to accept. If not set, best bid (− maxSlippage). */
+  minPrice?: number;
+  /** Tolerance from the best price when maxPrice/minPrice is not set (e.g. 0.02 = 2 cents) */
   maxSlippage?: number;
-  /** Number of retries on transient failures (default: 3) */
+  /** @deprecated Ignored: orders are a single fill-or-kill attempt */
   retries?: number;
+  /** Free text stored with the order (e.g. why the bot traded) */
+  reason?: string;
+  /** Ledger forecast this order trades on */
+  forecastId?: string;
+  /** Sell is a risk exit (exempt from hold time and rate limits) */
+  riskExit?: boolean;
 }
 
 export interface TradeResult {
@@ -86,6 +100,83 @@ export interface TradeResult {
   error?: string;
   /** Sizing reasoning (for copy strategies) */
   reasoning?: string;
+  /** orders.id of the attempt (null if the input was invalid) */
+  orderId?: string | null;
+  /** Order status, e.g. 'filled', 'rejected_risk', 'failed' */
+  status?: string;
+  /** Risk check that rejected the order */
+  failedCheck?: string;
+}
+
+// ============================================================================
+// Orders v2 (spec §5.2)
+// ============================================================================
+
+export interface LimitOrderOpts {
+  /** Reject instead of crossing the book (default true). Checked against the book before posting. */
+  postOnly?: boolean;
+  /** Minutes until the order expires (GTD). Capped at limits.orders.resting_order_ttl_minutes. */
+  ttlMinutes?: number;
+  reason?: string;
+  forecastId?: string;
+  riskExit?: boolean;
+}
+
+/** Result of placing an order. Rejections are returned (ok: false), not thrown. */
+export interface OrderResult {
+  ok: boolean;
+  orderId: string | null;
+  /** 'submitted' | 'open' | 'partially_filled' | 'filled' | 'rejected_risk' | 'failed' | 'cancelled' | 'invalid' ... */
+  status: string;
+  filledSize: number;
+  avgFillPrice: number | null;
+  filledNotionalUsd: number;
+  feeUsd: number;
+  expiresAt: string | null;
+  failedCheck?: string;
+  error?: string;
+}
+
+export interface OpenOrder {
+  orderId: string;
+  exchange: 'polymarket' | 'binance';
+  marketId: string;
+  tokenId: string;
+  side: 'buy' | 'sell';
+  orderType: 'limit' | 'market';
+  price: number;
+  size: number;
+  filledSize: number;
+  status: string;
+  expiresAt: string | null;
+  createdAt: string;
+}
+
+export interface FeeRates {
+  /** Fraction of notional charged when taking liquidity */
+  takerRate: number;
+  makerRate: number;
+}
+
+export interface PolymarketContext {
+  placeLimit(tokenId: string, side: 'buy' | 'sell', price: number, size: number, opts?: LimitOrderOpts): Promise<OrderResult>;
+  /** Cancel one of this bot's orders; throws if not found or not cancellable */
+  cancel(orderId: string): Promise<void>;
+  /** Cancel all of this bot's open orders */
+  cancelAll(): Promise<void>;
+  /** This bot's open orders */
+  getOpenOrders(): Promise<OpenOrder[]>;
+  getFee(tokenId: string): Promise<FeeRates>;
+}
+
+export interface RiskBudget {
+  remainingAllocation: number;
+  remainingMarket: Record<string, number>;
+  halted: boolean;
+}
+
+export interface RiskContext {
+  getBudget(): Promise<RiskBudget>;
 }
 
 export interface OrderBook {
@@ -210,6 +301,11 @@ export interface BinanceTradeResult {
   cummulativeQuoteQty: number;
   avgPrice: number;
   error?: string;
+  /** BotLab orders.id (sent to Binance as the client order id) */
+  clientOrderId?: string | null;
+  status?: string;
+  /** Risk check that rejected the order */
+  failedCheck?: string;
 }
 
 export interface BinanceOrderBook {
@@ -357,6 +453,12 @@ export type RpcMethod =
   | 'polymarket:getMarkets'
   | 'polymarket:getMarketPrice'
   | 'polymarket:getEvent'
+  | 'polymarket:placeLimit'
+  | 'polymarket:cancel'
+  | 'polymarket:cancelAll'
+  | 'polymarket:getOpenOrders'
+  | 'polymarket:getFee'
+  | 'risk:getBudget'
   | 'storage:get'
   | 'storage:set'
   | 'storage:delete'

@@ -17,10 +17,29 @@ import type { SettingsRepository } from '../../electron/database/repositories/Se
 import type { ScriptRepository } from '../../electron/database/repositories/ScriptRepository';
 import type { BotStorageRepository } from '../../electron/database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../../electron/database/repositories/BotTradeRepository';
-import { ScriptBotRunner } from '../../electron/runtime/ScriptBotRunner';
+import { ScriptBotRunner, type OrderServiceFactory } from '../../electron/runtime/ScriptBotRunner';
+import type { Database } from '../../electron/database/index';
+import type { OrderRepository } from '../../electron/database/repositories/OrderRepository';
+import type { RiskStateRepository } from '../../electron/database/repositories/RiskStateRepository';
+import { loadConfig, resolveConfigDir } from '../../electron/config';
+import { RiskEngine } from '../../electron/risk/RiskEngine';
+import { FeeService, loadFees } from '../../electron/orders/FeeService';
+import { MarketDataService, PlaceholderMarketQualityProvider } from '../../electron/orders/MarketDataService';
+import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
+import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
+import { createBinanceAdapter, createPolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import { getBalance } from '../../electron/sdk/trading';
+import { getBinanceBalance, getBinanceOrderBook } from '../../electron/sdk/binance';
 import CryptoJS from 'crypto-js';
 import { keyManager } from '../../electron/security/keyManager';
 import logger from '../utils/logger';
+
+/** Order store for OrderService (orders + halts). */
+export interface BotManagerOrderDeps {
+  db: Database.Database;
+  orderRepo: OrderRepository;
+  riskStateRepo: RiskStateRepository;
+}
 
 /**
  * BotManager orchestrates all bot instances.
@@ -36,6 +55,12 @@ export class BotManager extends EventEmitter {
   private tradeRepo: BotTradeRepository;
   private instances: Map<string, BaseBotRunner> = new Map();
   private clobClients: Map<string, ClobClient> = new Map();
+  private orderDeps: BotManagerOrderDeps | null;
+  /** Loaded once in initialize() (hot reload: chunk 1e). null ⇒ every order fails. */
+  private riskEngine: RiskEngine | null = null;
+  private fees: FeeService | null = null;
+  private configError: string | null = 'not loaded';
+  private marketData = new MarketDataService();
 
   constructor(
     walletManager: WalletManager,
@@ -44,9 +69,11 @@ export class BotManager extends EventEmitter {
     settingsRepo: SettingsRepository,
     scriptRepo: ScriptRepository,
     storageRepo: BotStorageRepository,
-    tradeRepo: BotTradeRepository
+    tradeRepo: BotTradeRepository,
+    orderDeps?: BotManagerOrderDeps
   ) {
     super();
+    this.orderDeps = orderDeps ?? null;
     this.walletManager = walletManager;
     this.botRepo = botRepo;
     this.walletRepo = walletRepo;
@@ -60,8 +87,91 @@ export class BotManager extends EventEmitter {
    * Initialize the bot manager
    */
   async initialize(): Promise<void> {
+    // Risk config (limits/mandate) and fee table. A bad file disables all orders (fail closed)
+    // rather than falling back to defaults the human did not choose.
+    try {
+      const dir = resolveConfigDir();
+      this.riskEngine = new RiskEngine(loadConfig(dir));
+      this.fees = new FeeService(loadFees(dir));
+      this.configError = null;
+      logger.info(`Risk config loaded from ${dir}`);
+    } catch (err) {
+      this.riskEngine = null;
+      this.fees = null;
+      this.configError = err instanceof Error ? err.message : String(err);
+      logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
+    }
     logger.info('BotManager initialized');
   }
+
+  /**
+   * Builds a bot's OrderService: the risk-checked route for all its orders.
+   * Throws (so the bot does not start) when the risk config or order store is unavailable.
+   */
+  private createOrderService: OrderServiceFactory = (args) => {
+    if (!this.orderDeps) throw new Error('Order store not configured; orders are disabled');
+    if (!this.riskEngine || !this.fees) throw new Error(`Risk config not loaded: ${this.configError}`);
+
+    const { db, orderRepo, riskStateRepo } = this.orderDeps;
+    const settings = this.getSettings();
+    const binanceCreds =
+      settings.binanceApiKey && settings.binanceApiSecret
+        ? { apiKey: settings.binanceApiKey, apiSecret: settings.binanceApiSecret }
+        : null;
+    const paper = args.mode === 'paper';
+    const ps = args.paperState;
+    if (paper && !ps) throw new Error('Paper bot without paper trading state');
+
+    const provider = new DbRiskStateProvider({
+      botRepo: this.botRepo,
+      orderRepo,
+      tradeRepo: this.tradeRepo,
+      riskStateRepo,
+      simulated: paper,
+      // Equity cash: paper balance, or the bot's Polymarket wallet USDC + Binance USDT (if configured)
+      getCashUsd: paper
+        ? async (exchange) => (exchange === 'binance' ? ps!.getBinanceBalance('USDT') : ps!.getBalance())
+        : async () => {
+            let cash = await getBalance(args.proxyAddress || args.walletAddress, settings.rpcUrl, settings.usdcContractAddress);
+            if (binanceCreds) cash += await getBinanceBalance(binanceCreds, 'USDT');
+            return cash;
+          },
+      getEndDate: async (tokenId) => (await this.marketData.getMarketInfo(tokenId))?.endDate ?? null,
+      getPaperPositionSize: paper
+        ? (exchange, tokenId) => {
+            if (exchange === 'binance') {
+              const base = tokenId.toUpperCase().replace(/(USDT|USDC|FDUSD)$/, '');
+              return ps!.getBinanceBalance(base) || null;
+            }
+            return ps!.getPositions().find((p) => p.tokenId === tokenId)?.size ?? null;
+          }
+        : undefined,
+    });
+
+    return new OrderService(
+      {
+        db,
+        orderRepo,
+        tradeRepo: this.tradeRepo,
+        riskEngine: this.riskEngine,
+        provider,
+        fees: this.fees,
+        marketData: this.marketData,
+        quality: PlaceholderMarketQualityProvider,
+        getBook: (tokenId) => args.clobClient.getOrderBook(tokenId) as Promise<ClobBook>,
+        getBinanceBook: (symbol) => getBinanceOrderBook(symbol),
+      },
+      {
+        botId: args.botId,
+        botName: args.botName,
+        scriptName: args.scriptName,
+        mode: args.mode,
+        polymarket: paper ? null : createPolymarketAdapter(args.clobClient),
+        binance: paper || !binanceCreds ? null : createBinanceAdapter(binanceCreds),
+        paperState: ps ?? null,
+      }
+    );
+  };
 
   /**
    * Get current settings from database
@@ -274,6 +384,7 @@ export class BotManager extends EventEmitter {
       mode: bot.mode || 'live',
       binanceApiKey: settings.binanceApiKey,
       binanceApiSecret: settings.binanceApiSecret,
+      createOrderService: this.createOrderService,
     });
 
     // Forward events
