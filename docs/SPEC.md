@@ -1,6 +1,6 @@
 # BotLab v3 — Specification
 
-Status: **Draft for review** · Owner: Mark · Last updated: 2026-10-30
+Status: **Draft v2 — open questions resolved, not started** · Owner: Mark · Last updated: 2026-10-30
 
 ---
 
@@ -13,7 +13,7 @@ modify. The agent earns autonomy through a measured track record (**forecast led
 not through human approval of each action.
 
 ### Goals
-1. Run headless 24/7 on a VPS/home server; browser UI over a private network.
+1. Run headless 24/7 on a home server (Ireland); browser UI over a private network.
 2. Expose the platform to an AI agent via MCP so it can research, build, deploy and operate bots.
 3. Make it impossible for any bot or agent action to exceed human-set hard limits.
 4. Measure whether the agent has a real forecasting edge before letting it trade on its forecasts.
@@ -36,6 +36,12 @@ not through human approval of each action.
 | D6 | AI forecasts trade only in categories where the ledger shows skill vs market. |
 | D7 | Electron is retired; replaced by a Node server + browser UI. |
 | D8 | Bot code remains viewable in the UI (lower priority than safety features). |
+| D9 | All limits, mandate and notification settings are editable **either** in the config files **or** in the web UI (§3). |
+| D10 | Initial mandate categories chosen by design (§3.3). |
+| D11 | Notifications via **Telegram only**. |
+| D12 | Hosting: **home server in Ireland** (§15.1). |
+| D13 | Agent cadence chosen by design (§7.1). |
+| D14 | Copy trading kept as an optional strategy and reworked (§9.5). The in-app AI script assistant is **removed**; the MCP agent replaces it. |
 
 ---
 
@@ -70,7 +76,7 @@ packages/core/            # all domain logic, no transport code
   ledger/                 # forecasts, scoring, category rights
   services/               # BotService, ScriptService, MarketService, LedgerService, AuditService, ...
   agent/                  # mandate loader, cycle orchestration helpers
-  notify/                 # Telegram / ntfy
+  notify/                 # Telegram
   recorder/               # order-book snapshot recorder
   security/               # key handling, AES-GCM
 apps/server/              # Hono HTTP API, SSE, MCP server, schedulers, entrypoint
@@ -179,9 +185,28 @@ change ⇒ "rules changed" event.
 
 ## 3. Configuration (human-owned)
 
-Config files live in `config/`, are loaded at startup and on `SIGHUP` / UI "reload", and are
-**never writable via MCP**. Changes made through the UI are written to the file and recorded in
-`audit_log`.
+Config files live in `config/` and are the single source of truth. They can be changed **two ways**,
+and both end up in the same file:
+
+- **Edit the file** by hand. The server watches `config/*.yaml`; on change it validates and hot-reloads.
+  An invalid file is rejected (previous config stays active) and a Telegram alert names the error.
+- **Edit in the web UI** (Risk, Mandate and Settings pages). The UI shows a form generated from the
+  same zod schema, validates, then writes the YAML file atomically (write temp → rename), preserving
+  comments where possible.
+
+Rules for both paths:
+- One zod schema per file (`packages/core/config/schema.ts`) is used by the file loader, the API and
+  the UI form, so they can never disagree.
+- Every change is recorded in `audit_log` with a before/after diff; the UI shows config history and
+  can revert to a previous version.
+- Cross-file validation: e.g. `mandate.budget_usd ≤ limits.global.max_total_exposure_usd`,
+  `per_bot.max_order_usd ≤ per_bot.allocation_usd`.
+- Changes that **raise** risk (any limit increase, new category, enabling a strategy) take effect
+  immediately but trigger a Telegram confirmation message. Changes that lower risk apply silently.
+- Config is **never writable via MCP** (agent scope has no route to it).
+- Values in the examples below are starting defaults, sized for a wallet of roughly $300–500. There is
+  no "wallet size" setting: the wallet balance is whatever is funded on-chain, and limits can be set in
+  USD, as a fraction of equity, or both (the stricter applies).
 
 ### 3.1 `config/limits.yaml`
 ```yaml
@@ -230,8 +255,8 @@ binance:
 ```yaml
 budget_usd: 300                       # must be ≤ limits.global.max_total_exposure_usd
 categories:
-  allow: [economics, politics-non-us, geopolitics, science, tech, culture]
-  deny:  [sports, crypto-short-term]
+  allow: [economics, politics-non-us, geopolitics, science-tech, weather-climate]
+  deny:  [sports, crypto-price, mentions, culture-entertainment, us-elections-headline]
 markets:
   resolves_within_days: [1, 60]
   min_liquidity_usd: 5000
@@ -244,6 +269,29 @@ notes: |
 ```
 
 The agent reads both files via MCP resources. It cannot write them.
+
+### 3.3 Initial category choice (rationale)
+
+Chosen to favour markets where (a) resolution sources are objective, (b) attention and liquidity are
+moderate rather than dominated by professional money, and (c) research and reading carefully matter
+more than speed. Category names map to Polymarket tags in `market_cache.category` via a mapping table
+in `config/categories.yaml` (also UI-editable).
+
+| category | allowed? | why |
+|---|---|---|
+| economics (CPI, rates, jobs, GDP, central-bank decisions outside the headline Fed meeting) | ✅ | Objective sources, scheduled dates, plenty of public analyst information to research. |
+| politics-non-us (national/regional elections, leadership changes, legislation outside the US) | ✅ | Less heavily traded than US politics; local-language and specialist sources give research an edge. |
+| geopolitics | ✅ with `max_ambiguity_score: 1` | Currently free of taker fees, but historically the most dispute-prone category (e.g. Ukraine minerals deal). Only clearly-worded markets. |
+| science-tech (product launches, AI model releases, space launches, FDA decisions) | ✅ | Public schedules and announcements; the agent's domain knowledge is strongest here. |
+| weather-climate (temperature records, hurricane counts) | ✅ | Objective official sources (national weather services); forecasts are public. |
+| sports | ❌ | Priced by professional betting markets; no expected edge. |
+| crypto-price (incl. short-term up/down markets) | ❌ | Efficient, speed-driven, highest taker fees. |
+| mentions ("will X say Y") | ❌ | Noisy, often contentious resolution, easily moved by insiders. |
+| culture-entertainment (awards, box office, celebrities) | ❌ initially | Low research edge, insider risk; can be enabled later. |
+| us-elections-headline | ❌ | Most heavily traded markets on the platform. |
+
+All categories start in `shadow` (§6.3): the agent forecasts but forecast trades are disabled until
+the ledger shows skill. Consistency and resolution-rule bots can trade in any allowed category from day one.
 
 ---
 
@@ -408,8 +456,17 @@ forecasting on past markets" because models may have memorized outcomes.
 ## 7. Agent
 
 ### 7.1 Runtime
-- `apps/agent`: a Claude Agent SDK program, triggered by the server scheduler (default every 4h,
-  plus a daily review at 07:00 local) or manually from the UI.
+- `apps/agent`: a Claude Agent SDK program, triggered by the server scheduler or manually from the UI.
+- **Cadence (default, configurable in `server.yaml` / UI):** all times Europe/Dublin.
+  | run | when | purpose |
+  |---|---|---|
+  | daily review | 07:30 | performance, calibration, retire/adjust bots, prune notes |
+  | cycle | 11:30, 15:30, 19:30, 23:30 | scan → research → forecast → act |
+  | event-triggered | on `rules_changed` for a held market, bot halt, or reconciliation mismatch | maintenance only (step 2 of §7.2), no new bots |
+  Event-triggered runs are capped at 4/day and debounced (max one per 30 min). No scheduled runs
+  between 00:00 and 07:00 — bots keep running and the risk engine keeps enforcing; issues overnight
+  halt rather than wait for the agent. The 08:00 daily digest follows the review.
+- Anthropic API key provided to the agent process via `ANTHROPIC_API_KEY` env var (not stored in the DB).
 - Tools available to the agent: **BotLab MCP** + web search + web fetch. No shell, no file tools.
 - Model configurable in `config/server.yaml` (`agent.model`); default the latest Claude Opus/Sonnet.
 - Each run gets a token budget (`max_run_cost_usd`, default 1.50) and the server refuses to start
@@ -448,6 +505,7 @@ use with Claude Code. Tools are grouped; each tool's description states its risk
 | `list_templates` / `get_script` | source + version history |
 | `get_forecasts` / `get_ledger_stats` | incl. calibration and per-category skill |
 | `get_notes` | agent memory |
+| `get_leaderboard` | Polymarket trader leaderboard + a wallet's recent activity (for copy-trading leader proposals) |
 | `get_run_history` | past agent run summaries |
 
 **Build**
@@ -518,7 +576,8 @@ older than 15 min.
 - Master key from `BOTLAB_MASTER_KEY` env var or a file path (`BOTLAB_MASTER_KEY_FILE`), loaded at
   boot; the unlock screen and `FALLBACK_PASSWORD` are removed.
 - Replace CryptoJS (passphrase mode, MD5 KDF) with Node `crypto` **AES-256-GCM**; one-time migration
-  re-encrypts wallet keys and Binance/Claude credentials.
+  re-encrypts wallet keys and Binance credentials. The stored Claude API key and its settings are removed
+  with the AI assistant (§12).
 - Binance API key: trading only, **withdrawals disabled**, IP allowlist — documented in setup guide.
 - Polymarket: dedicated wallet funded only with risk capital.
 
@@ -557,11 +616,34 @@ All templates are TypeScript in `templates/`, `origin=builtin`, `trust=proven` o
 - Places resting bids up to target price; holds to resolution unless invalidated
   (rules change, dispute, ambiguity ≥ 2, agent withdraws).
 
-### 9.5 Existing templates
-- `copy-trading` and `binance-spot` kept; routed through the risk engine; copy-trading treated as
-  `trust=new` until it qualifies.
+### 9.5 Copy trading v2 (optional strategy)
 
-### 9.6 Scheduled-event template — deferred (post-v3).
+Kept as an optional template (`strategy: copy`), disabled in the default mandate
+(`strategies.allow`); enable it per mandate. Issues found in the current
+`electron/scripts/templates/copy-trading.ts` and the fixes:
+
+| current behaviour | problem | v2 |
+|---|---|---|
+| `ctx.sell(tokenId, copySize)` passes a **USD amount** where `sell()` expects a **token amount** | sells the wrong size; can try to sell tokens we don't hold | Sells mirror the leader's *fraction* of position reduced (leader sells 40% of their position ⇒ we sell 40% of ours), capped at our holdings |
+| Market (FOK) orders at whatever price is available | buys after the leader has already moved the price; pays taker fees | Resting limit at `leader_fill_price + max_chase` (default 1¢) with short TTL (default 10 min); skip if the book is already beyond it |
+| De-duplication by timestamp only, `limit=20`, no pagination | same-second trades dropped or doubled; bursts > 20 missed | De-duplicate by transaction hash + log index, persisted; paginate until the last seen hash |
+| Every activity type treated as a trade candidate | REDEEM/SPLIT/MERGE/REWARD rows mixed in | Only `type === 'TRADE'` |
+| "Small trade boost" copies 100% of leader trades under $10 | amplifies noise and market-making flow | Removed; size = `copy_fraction × leader_trade`, or fixed USD, capped by risk budget |
+| Module-level state, own daily volume cap | duplicates the risk engine; lost on restart | State in `ctx.storage`; limits enforced by the risk engine |
+| No leader filtering | copies market makers and high-frequency wallets whose individual trades carry no signal | Leader filters: min trade size, max trades/day, ignore trades both sides of the same market within N min |
+| Copies any market | may enter markets outside the mandate, near resolution, or ambiguous | Only markets that pass mandate filters (category, liquidity, time to resolution, ambiguity) |
+
+**Leader scoring** (new): a `copy_leaders` table records each leader's copied trades and our
+outcome. The daily agent review reports per-leader realised P&L and hit rate; a leader whose
+copies lose over 20 trades is dropped automatically (logged + Telegram). The agent can propose
+leaders (from Polymarket leaderboard data via MCP `get_leaderboard`) but adding a leader goes through
+`update_bot_config`, subject to the same ramp as any new bot.
+
+### 9.6 Binance spot
+`binance-spot` kept as is, routed through the risk engine with the `binance` limits block. No new
+Binance features in v3.
+
+### 9.7 Scheduled-event template — deferred (post-v3).
 
 ---
 
@@ -581,7 +663,9 @@ All templates are TypeScript in `templates/`, `origin=builtin`, `trust=proven` o
 
 ## 11. Notifications
 
-Channels: Telegram bot (primary, supports commands) and/or ntfy. `config/server.yaml: notify`.
+Channel: **Telegram** only. A private bot created with BotFather; token and the admin chat id in
+`config/server.yaml: notify.telegram` (token may instead come from `TELEGRAM_BOT_TOKEN`). Messages
+to any other chat id are ignored. Long-polling (no inbound port or webhook needed on the home server).
 
 | event | default |
 |---|---|
@@ -591,10 +675,12 @@ Channels: Telegram bot (primary, supports commands) and/or ntfy. `config/server.
 | category rights change | on |
 | rules_changed on a held market | immediate |
 | agent run summary | on |
-| daily digest (P&L, exposure, ledger stats) | 08:00 local |
+| daily digest (P&L, exposure, ledger stats) | 08:00 Europe/Dublin |
 | reconciliation mismatch | immediate |
 
-Telegram commands (admin chat id only): `/status`, `/pnl`, `/halt`, `/bots`, `/pause <bot>`.
+Telegram commands (admin chat id only): `/status`, `/pnl`, `/halt`, `/bots`, `/pause <bot>`,
+`/run` (trigger an agent cycle), `/code <bot>` (link to the bot's code view in the UI over Tailscale).
+Messages use inline buttons where useful (e.g. "Pause bot" on a fill notification).
 Clearing a halt is **not** possible from Telegram — UI only.
 
 ---
@@ -613,8 +699,15 @@ Keep the existing React app; switch transport to HTTP/SSE. Page changes:
 | Risk (new) | limits (edit → writes `limits.yaml`), mandate editor, halt history, clear halt |
 | Audit (new) | filterable audit log |
 | Approvals (new) | empty unless approvals enabled |
-| Scripts | version history + diff; origin badge (builtin/human/agent) |
+| Scripts | version history + diff; origin badge (builtin/human/agent); editor kept for manual edits, **AI assistant panel removed** |
+| Settings | Telegram, agent schedule, categories mapping (all writing `config/*.yaml`); Claude API key fields removed |
 | Unlock screen | removed |
+
+**AI assistant removal:** delete `electron/ipc/handlers/aiHandlers.ts`, `electron/sdk/claude.ts`,
+`web/client/src/components/ScriptAssistant.tsx`, `web/client/src/hooks/useAI.ts`, the `ai:*` and
+`settings:*Claude*` / `*AiSystemPrompt` channels, and the Claude columns in `settings` (migration).
+`electron/sdk/claudeSystemPrompt.ts` is **kept and moved** to `packages/core/sdk/guide.md` — it becomes
+the `botlab://sdk/guide.md` MCP resource the agent uses to write bots.
 
 Code view is required but lower priority than the Risk and Dashboard pages.
 
@@ -649,13 +742,28 @@ Every 60s:
 ## 15. Deployment & operations
 
 - `Dockerfile` (node:22-slim, better-sqlite3 prebuilt), `docker-compose.yml` with server + agent
-  + Tailscale sidecar; volume for `data/` and `config/`.
+  + Tailscale sidecar; volume for `data/` and `config/`. Build for both amd64 and arm64 so it runs on
+  a mini-PC or a Raspberry Pi 5.
 - Nightly SQLite backup (`.backup` API) to `data/backups/`, keep 14; optional rclone to remote.
 - Health endpoint `/healthz` (DB ok, reconciler fresh < 3 min, workers alive).
 - Logs: JSON to stdout + `data/logs/` rotated.
 - Clock: require NTP; refuse to place orders if exchange server time skew > 5s.
-- **Eligibility:** confirm Polymarket terms permit trading from the user's jurisdiction and the
-  server's location before enabling live mode.
+- **Eligibility:** confirm Polymarket's current terms permit trading from Ireland before enabling
+  live mode. Orders are sent from the home connection, so the server's IP is in the same jurisdiction
+  as the user.
+
+### 15.1 Home server (Ireland)
+
+| concern | handling |
+|---|---|
+| Hardware | Any always-on box: mini-PC (N100 class, 8 GB RAM, SSD) recommended over a Pi for SQLite + recorder writes. Expected load is small (< 1 CPU core, < 1 GB RAM). |
+| Power cuts | UPS recommended. Regardless: GTD order expiry (§4.3) means resting orders die on their own; server restarts **halted** after an unclean shutdown and notifies on Telegram when back. |
+| Internet outages | Reconciler detects stale data; if exchange APIs are unreachable for > 5 min, bots pause new orders (resting orders expire). Telegram message once connectivity returns. |
+| Remote access | Tailscale only — no port forwarding, no dynamic DNS, nothing exposed on the home router. Telegram uses outbound long-polling. |
+| Dead-man alert | Optional free external heartbeat (e.g. healthchecks.io) pinged every 5 min; it alerts by email/Telegram if the server goes silent. |
+| Backups | Nightly local backup + optional rclone to a cloud bucket so a dead disk doesn't lose the ledger. |
+| Timezone | `TZ=Europe/Dublin` for schedules and digests; all stored timestamps UTC. |
+| Moving later | Docker-compose + volume makes moving to a VPS a copy of `data/` + `config/`; check eligibility for the VPS region first. |
 
 ---
 
@@ -670,8 +778,9 @@ Each phase ends with tests green and a short demo checklist.
 - Ramp stages on bots.
 - Sandbox hardening (§5.1) incl. backtests in worker.
 - AES-GCM migration.
-- Notifications (Telegram/ntfy) for halts and fills.
+- Telegram notifications for halts and fills; config hot-reload + validation (file path of D9).
 - `audit_log`.
+- Hot-fix the copy-trading sell-size bug (§9.5, first row) — it affects the current live template.
 
 **Done when:** property tests show no limit can be exceeded; kill switch integration test passes;
 no code path to postOrder outside OrderService.
@@ -687,7 +796,8 @@ and rights transition automatically in tests.
 
 ### Phase 3 — Server & web
 - Extract `packages/core`, services; Hono API + SSE; web client on fetch; auth scopes; env-based key.
-- Remove Electron, unlock screen, `FALLBACK_PASSWORD`.
+- Remove Electron, unlock screen, `FALLBACK_PASSWORD`, and the AI script assistant (§12).
+- Config editing in the UI (Risk, Mandate, Settings pages) writing `config/*.yaml`, with history and revert.
 - Docker + Tailscale + backups + healthz.
 - New UI pages: Risk, Ledger, Audit; Dashboard updates.
 
@@ -704,6 +814,7 @@ and rights transition automatically in tests.
 
 ### Phase 5 — Strategies
 - Forecast executor, position manager, consistency, resolution-rule templates.
+- Copy trading v2 (§9.5) + leader scoring.
 - Polymarket snapshot backtester.
 - Code view + version diff in UI.
 - Go live: fund wallet, set limits, enable probation for proven templates.
@@ -734,15 +845,23 @@ Included in the spec above, called out here because they weren't previously agre
 12. **Exchange time-skew guard** (§15).
 
 Cleanups worth doing during Phase 3 (low priority): remove `moment` (use `Date`/`Intl`), unify
-on `fetch` instead of `axios`, make the Claude model id configurable (hard-coded in `electron/sdk/claude.ts`).
+on `fetch` instead of `axios`.
 
 ---
 
-## 18. Open questions
+## 18. Resolved decisions and remaining questions
 
-1. Starting wallet size and the concrete numbers in `limits.yaml` (defaults above are placeholders).
-2. Initial mandate categories — which Polymarket categories interest you most?
-3. Notification channel: Telegram, ntfy, or both?
-4. Hosting: VPS (which region — eligibility) or home server?
-5. Agent cadence: every 4h + daily review OK, and preferred local time for the daily digest?
-6. Keep copy-trading and the in-app AI script assistant, or drop them to reduce surface area?
+Resolved (2026-10-30):
+| question | answer |
+|---|---|
+| Wallet size / limit values | Configurable in `config/*.yaml` **or** the web UI (§3, D9). Defaults in §3.1 are a starting point. |
+| Mandate categories | Chosen in §3.3. |
+| Notifications | Telegram only (§11). |
+| Hosting | Home server in Ireland (§15.1). |
+| Agent cadence | 07:30 review + 4 cycles/day + capped event-triggered runs, Europe/Dublin (§7.1). |
+| Copy trading / AI assistant | Copy trading kept as optional and reworked (§9.5); AI assistant removed (§12). |
+
+Still to do before going live (not blocking Phase 1):
+1. Confirm Polymarket eligibility from Ireland under the current terms.
+2. Choose actual limit values in the UI once the wallet is funded.
+3. Pick home-server hardware (§15.1) and whether to add a UPS and cloud backup.
