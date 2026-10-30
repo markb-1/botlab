@@ -42,6 +42,7 @@ not through human approval of each action.
 | D12 | Hosting: **home server in Ireland** (§15.1). |
 | D13 | Agent cadence chosen by design (§7.1). |
 | D14 | Copy trading kept as an optional strategy and reworked (§9.5). The in-app AI script assistant is **removed**; the MCP agent replaces it. |
+| D15 | **Time to settlement is a first-class constraint**: short horizons by default, a capped long-horizon budget, edge ranked per day, ledger rights per category × horizon, and an early convergence signal (§3.4, §6.2–6.3). |
 
 ---
 
@@ -146,6 +147,8 @@ Existing tables kept: `wallets`, `scripts`, `bots`, `bot_trades`, `bot_storage`,
 | status | `active`, `superseded`, `withdrawn`, `resolved`, `void` |
 | superseded_by | FK |
 | tradeable | bool, computed at insert from category rights |
+| days_to_resolution_at_forecast, horizon_bucket | computed at insert from the market end date |
+| price_at_7d, convergence | market mid 7 days after the forecast (or at resolution if sooner) and the convergence score (§6.2) |
 | created_at, resolved_at, outcome (0/1/null), brier_agent, brier_market |
 
 Constraint: at most one `active` forecast per token. A new forecast supersedes the old one.
@@ -153,9 +156,10 @@ Constraint: at most one `active` forecast per token. A new forecast supersedes t
 **category_rights**
 | column | notes |
 |---|---|
-| category | PK |
-| state | `shadow` (record only) / `trading` / `suspended` |
+| category, horizon_bucket | composite PK; buckets `short` (≤ 7 days), `medium` (7–30), `long` (30–90) |
+| state | `shadow` (record only) / `trading` / `suspended` / `deprioritised` |
 | n_scored, skill_mean, skill_lower_bound, last_evaluated_at, changed_at, changed_reason | |
+| n_convergence, convergence_mean, convergence_lower_bound | early signal (§6.2), reporting/deprioritisation only |
 | max_allocation_usd | grows with track record (§6.3) |
 
 **risk_state** — singleton + per-bot rows: `halted` (bool), `halted_reason`, `halted_at`,
@@ -213,6 +217,7 @@ Rules for both paths:
 global:
   max_total_exposure_usd: 300        # open position cost + open buy order notional
   max_total_exposure_pct: 0.60       # of wallet equity; the lower of the two applies
+  max_long_horizon_pct: 0.25         # max share of total exposure in markets settling in > 30 days
   daily_loss_limit_usd: 100          # trips global halt
   max_open_orders: 50
 per_bot_defaults:
@@ -255,10 +260,12 @@ binance:
 ```yaml
 budget_usd: 300                       # must be ≤ limits.global.max_total_exposure_usd
 categories:
-  allow: [economics, politics-non-us, geopolitics, science-tech, weather-climate]
+  allow: [weather-climate, economics, politics-non-us]
+  later: [geopolitics, science-tech]   # forecasts recorded (shadow), no bots; enable after Phase 5 review
   deny:  [sports, crypto-price, mentions, culture-entertainment, us-elections-headline]
 markets:
-  resolves_within_days: [1, 60]
+  resolves_within_days: [0, 30]       # default horizon
+  long_horizon_days: [30, 90]         # allowed only within limits.global.max_long_horizon_pct
   min_liquidity_usd: 5000
   max_ambiguity_score: 1              # skip markets rated 2–3
 strategies:
@@ -277,21 +284,41 @@ moderate rather than dominated by professional money, and (c) research and readi
 more than speed. Category names map to Polymarket tags in `market_cache.category` via a mapping table
 in `config/categories.yaml` (also UI-editable).
 
-| category | allowed? | why |
-|---|---|---|
-| economics (CPI, rates, jobs, GDP, central-bank decisions outside the headline Fed meeting) | ✅ | Objective sources, scheduled dates, plenty of public analyst information to research. |
-| politics-non-us (national/regional elections, leadership changes, legislation outside the US) | ✅ | Less heavily traded than US politics; local-language and specialist sources give research an edge. |
-| geopolitics | ✅ with `max_ambiguity_score: 1` | Currently free of taker fees, but historically the most dispute-prone category (e.g. Ukraine minerals deal). Only clearly-worded markets. |
-| science-tech (product launches, AI model releases, space launches, FDA decisions) | ✅ | Public schedules and announcements; the agent's domain knowledge is strongest here. |
-| weather-climate (temperature records, hurricane counts) | ✅ | Objective official sources (national weather services); forecasts are public. |
-| sports | ❌ | Priced by professional betting markets; no expected edge. |
-| crypto-price (incl. short-term up/down markets) | ❌ | Efficient, speed-driven, highest taker fees. |
-| mentions ("will X say Y") | ❌ | Noisy, often contentious resolution, easily moved by insiders. |
-| culture-entertainment (awards, box office, celebrities) | ❌ initially | Low research edge, insider risk; can be enabled later. |
-| us-elections-headline | ❌ | Most heavily traded markets on the platform. |
+| category | status | typical settlement | why |
+|---|---|---|---|
+| weather-climate (daily temperature-type markets, monthly records, storm counts) | ✅ **primary ledger builder** | 1–2 days (daily) to ~1 month | Objective official sources; public forecasts to research; fast settlement fills the ledger in weeks. |
+| economics (CPI, jobs, GDP, central-bank decisions outside the headline Fed meeting) | ✅ **primary** | days to ~6 weeks | Objective sources, scheduled release dates, plenty of public analyst information. |
+| politics-non-us (national/regional elections, leadership changes, legislation outside the US) | ✅ mainly for consistency / resolution-rule bots | weeks to months, sparse | Less heavily traded than US politics, but too slow and sparse to qualify forecast rights quickly. |
+| geopolitics | ⏸ later (shadow only) | months; dispute-prone | Fee-free but slow and the most dispute-prone category; revisit once the faster categories have a track record. |
+| science-tech (launches, model releases, FDA decisions) | ⏸ later (shadow only) | often months | Agent knowledge is strong, but "by date X" markets settle slowly. |
+| sports | ❌ | — | Priced by professional betting markets; no expected edge. |
+| crypto-price | ❌ | — | Efficient, speed-driven, highest taker fees. |
+| mentions ("will X say Y") | ❌ | — | Noisy, often contentious resolution, easily moved by insiders. |
+| culture-entertainment | ❌ initially | — | Low research edge, insider risk. |
+| us-elections-headline | ❌ | — | Most heavily traded markets on the platform. |
+
+"Later" categories: the agent may record forecasts there (they are scored and build history at no
+cost), but no bots are created in them until they are moved to `allow`.
 
 All categories start in `shadow` (§6.3): the agent forecasts but forecast trades are disabled until
 the ledger shows skill. Consistency and resolution-rule bots can trade in any allowed category from day one.
+
+### 3.4 Time to settlement
+
+Settlement time affects three things: how fast the ledger can prove skill, how long capital is locked
+in a small wallet, and how fast the agent learns. Handling:
+
+1. **Horizon limits.** Default horizon 0–30 days. Markets settling in 30–90 days are allowed only up to
+   `limits.global.max_long_horizon_pct` (25%) of total exposure. Nothing beyond 90 days.
+2. **Edge per day.** Opportunities are ranked by `edge_per_day = (edge − fees) / max(days_to_settlement, 1)`.
+   The agent's scan, the forecast executor's allocation and consistency-bot selection all use it, so a
+   short market wins over a long one with the same edge.
+3. **Rights per category × horizon** (§6.3). Skill shown on 2-day weather markets does not unlock 60-day
+   markets in the same category.
+4. **Early convergence signal** (§6.2). Available within 7 days of a forecast, used to deprioritise
+   unpromising categories early. It never grants trading rights.
+5. **Exit on convergence by default** (§9.2). Edge is usually realised as the price moves toward the
+   forecast, not only at settlement; taking profit then frees capital for the next opportunity.
 
 ---
 
@@ -314,7 +341,9 @@ the CLOB `postOrder`/`createOrder` functions.
    bot exposure + notional ≤ effective allocation (stage-dependent);
    market exposure + notional ≤ `per_market.max_exposure_usd`;
    total exposure + notional ≤ min(global usd, pct × equity);
-   ledger-driven orders: category exposure + notional ≤ `category_rights.max_allocation_usd`.
+   markets settling in > 30 days: long-horizon exposure + notional ≤ `max_long_horizon_pct` × total limit;
+   markets settling in > 90 days (or outside the mandate's horizons): rejected;
+   ledger-driven orders: (category, horizon bucket) exposure + notional ≤ `category_rights.max_allocation_usd`.
 6. Hold time: sells blocked if position age < `min_hold_minutes` unless order flagged `risk_exit`
    by the position manager or a human.
 7. Edge (ledger-driven orders only): `|p − price| − expected_fee ≥ min_edge` (template config,
@@ -433,11 +462,24 @@ syntax errors.
 - Voided/50-50 resolved markets: status `void`, excluded.
 - Category stats: `n_scored` (events), `skill_mean`, `skill_lower_bound` = 10th percentile of
   1,000 bootstrap resamples over events.
+- **Convergence (early signal).** For each forecast, at 7 days (or at resolution, if sooner):
+  `convergence = sign(p − m) × (price_at_7d − m)`, positive when the market moved toward the agent's
+  estimate. Aggregated per (category, horizon) with one vote per event, like skill. Used for: the
+  daily review, and moving a bucket to `deprioritised` when `n_convergence ≥ 20` and
+  `convergence_lower_bound < 0` with mean < 0 (the agent stops spending research time there; a human
+  can reset it). It is **never** used to grant trading rights, because markets can move toward a
+  wrong estimate.
 - Also tracked (reporting only): calibration buckets (0–10%, …, 90–100%), log score, and realized
   P&L of ledger-driven trades per category.
 
 ### 6.3 Category rights
-- New categories start in `shadow`.
+- Rights are held per **(category, horizon bucket)**: `short` ≤ 7 days, `medium` 7–30, `long` 30–90.
+  Forecasts are counted in the bucket matching their days to settlement at the time of forecasting.
+- A bucket qualifies only on its own resolved forecasts. One exception: a `trading` short bucket lets
+  the medium bucket of the same category qualify at `n_scored ≥ 20` instead of 30.
+- The ledger page shows, per bucket, the expected date to reach the threshold based on the recent
+  rate of resolved forecasts.
+- New buckets start in `shadow`.
 - `shadow → trading` when `n_scored ≥ 30` **and** `skill_lower_bound > 0`.
   Initial `max_allocation_usd = 50`; +50 per additional 20 scored events while
   `skill_lower_bound > 0`, capped by mandate budget.
@@ -478,7 +520,8 @@ forecasting on past markets" because models may have memorized outcomes.
    bots + health, last run summary, relevant `agent_notes`.
 2. **Maintain:** handle alerts first — halted/erroring bots, `rules_changed` markets, positions
    near resolution, expired forecasts. Pause/retire/fix as needed.
-3. **Scan:** query markets via `search_markets` within mandate filters; shortlist.
+3. **Scan:** query markets via `search_markets` within mandate filters (including horizons); shortlist
+   ranked by expected edge per day, preferring short horizons and the primary categories.
 4. **Research:** read rules (`get_market`), order books, price history, web sources.
 5. **Forecast:** submit/update/withdraw forecasts with rationale and ambiguity score.
 6. **Build/Act:** create bots from templates for consistency/resolution-rule opportunities;
@@ -591,14 +634,18 @@ All templates are TypeScript in `templates/`, `origin=builtin`, `trust=proven` o
 - Input: `ctx.ledger.getActiveForecasts({ tradeableOnly: true })`.
 - For each forecast: fair = p; if `p − ask ≥ min_edge + fee` place post-only bid at
   `min(best_bid + tick, p − min_edge)`; symmetric for NO token when `price − p` is large.
-- Size: `kelly_fraction (0.25) × kelly(p, price) × category allocation`, capped by `ctx.risk.getBudget()`.
+- When the budget can't cover every opportunity, allocate in descending `edge_per_day` (§3.4).
+- Size: `kelly_fraction (0.25) × kelly(p, price) × bucket allocation`, capped by `ctx.risk.getBudget()`.
 - Re-quote every N minutes; cancel when forecast superseded/withdrawn or edge disappears.
 - Config: `min_edge` (≥ 0.03), `kelly_fraction`, `requote_minutes`, `max_per_market_usd`.
 
 ### 9.2 Position manager (standing, 1 instance)
 - Watches all positions across bots.
-- Exit triggers: forecast withdrawn or flipped; `rules_changed`; ambiguity ≥ 2; `flag_position_exit`;
-  take-profit (price ≥ p − small margin); stop (price moved > X against with no new forecast);
+- **Default exit: convergence take-profit.** Sell when the price reaches `p − take_profit_margin`
+  (default 0.02) for a YES position (mirror for NO). If remaining expected edge per day is below
+  `min_hold_edge_per_day` and a better use of capital is queued, exit early as well.
+- Other exit triggers: forecast withdrawn or flipped; `rules_changed`; ambiguity ≥ 2; `flag_position_exit`;
+  stop (price moved > X against with no new forecast);
   `exit_before_end_minutes` for ambiguous markets.
 - Exits are post-only first, escalate to marketable after `escalate_after_minutes`, flagged `risk_exit`.
 
@@ -855,7 +902,7 @@ Resolved (2026-10-30):
 | question | answer |
 |---|---|
 | Wallet size / limit values | Configurable in `config/*.yaml` **or** the web UI (§3, D9). Defaults in §3.1 are a starting point. |
-| Mandate categories | Chosen in §3.3. |
+| Mandate categories | Chosen in §3.3; revised for settlement time (§3.4): weather + economics first, geopolitics and science-tech later. |
 | Notifications | Telegram only (§11). |
 | Hosting | Home server in Ireland (§15.1). |
 | Agent cadence | 07:30 review + 4 cycles/day + capped event-triggered runs, Europe/Dublin (§7.1). |
