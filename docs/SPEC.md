@@ -813,6 +813,7 @@ Every 60s:
 | Dead-man alert | Optional free external heartbeat (e.g. healthchecks.io) pinged every 5 min; it alerts by email/Telegram if the server goes silent. |
 | Backups | Nightly local backup + optional rclone to a cloud bucket so a dead disk doesn't lose the ledger. |
 | Timezone | `TZ=Europe/Dublin` for schedules and digests; all stored timestamps UTC. |
+| Windows gaming PC option (user's Ryzen 7 5800X / RX 6700 XT) | Supported as the home server. Run natively (no Docker) as a Windows service (`npm run service:install` via NSSM or `node-windows`, auto-start at boot without login). Power plan: never sleep. Windows Update: set active hours / defer restarts; an update reboot is handled like a power cut (orders expire, restart halted, Telegram alert, human clears halt). Tailscale for Windows for remote access. Load is negligible alongside gaming. GPU not used (agent uses the Claude API). Idle power ~60–100 W vs ~10 W for a mini-PC. |
 | Moving later | Docker-compose + volume makes moving to a VPS a copy of `data/` + `config/`; check eligibility for the VPS region first. |
 
 ---
