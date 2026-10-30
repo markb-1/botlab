@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Direction (read first)
+
+The project is being rebuilt per `docs/SPEC.md` (BotLab v3): headless Node server + browser UI + MCP agent,
+replacing Electron. Follow the spec's phases and decisions. Hard requirements for all new code:
+- **Cross-platform:** must run natively on macOS, Windows and Linux (spec §15.2) — no POSIX-only npm
+  scripts, always `path.join`, no `SIGHUP` reliance, `better-sqlite3` as the only native dependency.
+- **Safety:** every live order goes through the risk engine (spec §4); the agent can never change limits,
+  wallets or credentials.
+
+The sections below describe the current (pre-v3) Electron codebase.
+
 ## Project Overview
 
 Electron desktop app for automated trading on Polymarket (prediction markets) and Binance (crypto spot). TypeScript throughout: Electron main process + React renderer. Users write or pick bot scripts that run in sandboxed worker threads with access to trading APIs via an RPC layer.

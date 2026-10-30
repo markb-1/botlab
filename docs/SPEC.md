@@ -42,6 +42,7 @@ not through human approval of each action.
 | D12 | Hosting: **home server in Ireland** (§15.1). |
 | D13 | Agent cadence chosen by design (§7.1). |
 | D14 | Copy trading kept as an optional strategy and reworked (§9.5). The in-app AI script assistant is **removed**; the MCP agent replaces it. |
+| D16 | **Cross-platform:** the server, agent and web UI run natively on **macOS, Windows and Linux** for local testing (no Docker required); Docker is the deployment option for the home server (§15.2). |
 | D15 | **Time to settlement is a first-class constraint**: short horizons by default, a capped long-horizon budget, edge ranked per day, ledger rights per category × horizon, and an early convergence signal (§3.4, §6.2–6.3). |
 
 ---
@@ -195,7 +196,8 @@ and both end up in the same file:
 - **Edit the file** by hand. The server watches `config/*.yaml`; on change it validates and hot-reloads.
   An invalid file is rejected (previous config stays active) and a Telegram alert names the error.
 - **Edit in the web UI** (Risk, Mandate and Settings pages). The UI shows a form generated from the
-  same zod schema, validates, then writes the YAML file atomically (write temp → rename), preserving
+  same zod schema, validates, then writes the YAML file atomically (`write-file-atomic`, which handles
+  Windows rename semantics), preserving
   comments where possible.
 
 Rules for both paths:
@@ -611,7 +613,8 @@ dispute is detected.
 | `agent` | static token in `config/server.yaml` (hashed) | MCP tools in §7.3 only |
 | `readonly` | optional token | GET endpoints |
 
-Network exposure: bind to the Tailscale interface (or 127.0.0.1 behind Tailscale serve). Never
+Network exposure: default bind `127.0.0.1` (local testing on a laptop). On the home server, bind to the
+Tailscale interface (or 127.0.0.1 behind Tailscale serve). Never
 public. Admin actions in §4.6 additionally require re-entering the password if the session is
 older than 15 min.
 
@@ -814,6 +817,26 @@ Every 60s:
 
 ---
 
+### 15.2 Cross-platform support (macOS, Windows, Linux)
+
+Everything must run natively on all three for local testing. Requirements:
+
+| area | rule |
+|---|---|
+| Install & run | `npm install` then `npm run dev` (server + agent scheduler + Vite UI with hot reload) and `npm start` (built server serving the built UI). No Docker, Tailscale, Telegram or exchange credentials needed to start. |
+| Local test mode | First start with no wallet/credentials runs in **paper mode** with a generated `config/` from defaults, so the UI, bots, ledger and MCP can be exercised safely. Live trading requires explicitly enabling it in config. |
+| npm scripts | No POSIX-only syntax (`VAR=x cmd`, `&&` chains relying on bash, `rm -rf`, `cp`). Use `cross-env`, `rimraf`, `concurrently`, or small Node scripts in `scripts/*.mjs`. |
+| Paths | Always `path.join`/`path.resolve`; never hard-code `/`. Data dir from `BOTLAB_DATA_DIR`, default `./data` in dev and the OS app-data dir in `npm start` (`~/Library/Application Support/BotLab`, `%APPDATA%\BotLab`, `~/.local/share/botlab`). |
+| Native modules | `better-sqlite3` only (prebuilt binaries for macOS x64/arm64, Windows x64, Linux x64/arm64). No other native deps; no `node-gyp` toolchain needed for a normal install. Electron rebuild steps removed. |
+| Signals | No reliance on `SIGHUP` (not on Windows): config reload via file watcher, API or UI. Graceful shutdown handles `SIGINT`, `SIGTERM` and Windows `SIGBREAK`/console close. |
+| File watching | `chokidar` (handles macOS/Windows editors' atomic-save behaviour) with debounce. |
+| Line endings | `.gitattributes` with `* text=auto eol=lf`; tests must not depend on CRLF/LF. |
+| Worker threads | Worker bootstrap path resolved via `fileURLToPath`/`path`, works from `tsx` in dev and compiled JS in prod on all OSes. |
+| Agent runner | `apps/agent` runs the same way locally (needs only `ANTHROPIC_API_KEY`), so the full loop can be tested on a laptop against paper mode. MCP also exposed over stdio for Claude Code / Claude Desktop on macOS and Windows. |
+| Secrets | Master key via env var or file path on all OSes; macOS Keychain / Windows Credential Manager **not** required (optional later). |
+| CI | GitHub Actions matrix: `ubuntu-latest`, `macos-latest`, `windows-latest` × Node 22 running lint, typecheck and the full test suite (network-dependent tests skipped via an env flag). |
+| Docs | `README.md` quick start for macOS and Windows (PowerShell) and for Docker on the home server. |
+
 ## 16. Delivery phases
 
 Each phase ends with tests green and a short demo checklist.
@@ -827,6 +850,7 @@ Each phase ends with tests green and a short demo checklist.
 - AES-GCM migration.
 - Telegram notifications for halts and fills; config hot-reload + validation (file path of D9).
 - `audit_log`.
+- `.gitattributes` and the 3-OS CI matrix (§15.2) set up first, so every later change is checked on macOS and Windows.
 - Hot-fix the copy-trading sell-size bug (§9.5, first row) — it affects the current live template.
 
 **Done when:** property tests show no limit can be exceeded; kill switch integration test passes;
@@ -845,6 +869,8 @@ and rights transition automatically in tests.
 - Extract `packages/core`, services; Hono API + SSE; web client on fetch; auth scopes; env-based key.
 - Remove Electron, unlock screen, `FALLBACK_PASSWORD`, and the AI script assistant (§12).
 - Config editing in the UI (Risk, Mandate, Settings pages) writing `config/*.yaml`, with history and revert.
+- Cross-platform requirements (§15.2): `npm run dev`/`npm start` on macOS/Windows/Linux, paper-mode
+  first run, CI matrix on all three OSes, README quick starts.
 - Docker + Tailscale + backups + healthz.
 - New UI pages: Risk, Ledger, Audit; Dashboard updates.
 
