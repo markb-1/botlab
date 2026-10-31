@@ -51,6 +51,8 @@ export interface NotificationDeps {
   getExposureUsd: () => number;
   stopBot: (botId: string, actor: 'human') => Promise<void>;
   isRunning: (botId: string) => boolean;
+  /** Agent lines of the daily digest (runs in the last 24 h, month-to-date budget); omitted when absent */
+  getAgentDigest?: () => string | null;
   /** Where the last digest date is kept so a restart does not repeat it */
   stateFile?: string;
   now?: () => number;
@@ -61,6 +63,25 @@ const usd = (n: number): string => `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)
 const signed = (n: number): string => `${n >= 0 ? '+' : '-'}$${Math.abs(n).toFixed(2)}`;
 const short = (s: string, n = 200): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
+/** `12m 05s`, `1h 02m`, `40s` */
+export function formatDuration(ms: number): string {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ${String(sec % 60).padStart(2, '0')}s`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, '0')}m`;
+}
+
+const compactNumber = (n: number): string => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+/** Cut a summary at a line break before `n` characters where possible, with a note on what was left out */
+export function truncateSummary(text: string, n: number): string {
+  if (text.length <= n) return text;
+  const cut = text.lastIndexOf('\n', n - 40);
+  const head = text.slice(0, cut > n / 2 ? cut : n - 40).trimEnd();
+  return `${head}\n… (${text.length - head.length} more characters on the Agent page)`;
+}
+
 export const HELP_TEXT = [
   'BotLab commands',
   '/status - halts, exposure, P&L',
@@ -68,6 +89,7 @@ export const HELP_TEXT = [
   '/bots - bots by stage',
   '/halt [reason] - kill switch: global halt, cancel all orders, stop all bots',
   '/pause <bot name or id> - stop a bot',
+  '/run [cycle|review] - start an agent run now (default cycle)',
   '/help',
   '',
   'Clearing a halt is only possible in the BotLab app.',
@@ -82,6 +104,8 @@ export class NotificationService implements OrderEventSink {
   private digestTimer: NodeJS.Timeout | null = null;
   private lastDigestDate: string | null = null;
   private readonly now: () => number;
+  /** `/run` handler, set by the server's agent scheduler (4b); null ⇒ the agent is not available */
+  private agentRun: ((kind: 'cycle' | 'review') => Promise<string>) | null = null;
 
   constructor(private deps: NotificationDeps) {
     this.now = deps.now ?? Date.now;
@@ -175,14 +199,49 @@ export class NotificationService implements OrderEventSink {
     this.guard(() => this.send(`[RECONCILIATION] Mismatch: ${short(summary, 1500)}`, { priority: 'high' }));
   }
 
-  /** Agent run report (spec §7.2 step 7, §11): sent when the agent calls finish_run */
-  agentRunFinished(run: { status: string; trigger: string; toolCalls: number; costUsd: number; summaryMd: string | null }, overBudget: boolean): void {
-    this.guard(() =>
-      this.send(
-        `[AGENT RUN] ${run.trigger} run ${run.status}: ${run.toolCalls} tool call(s), $${run.costUsd.toFixed(2)}${overBudget ? ' (over agent.max_run_cost_usd)' : ''}\n${short((run.summaryMd ?? '').trim(), 3000)}`,
-        { keepSeparate: true, priority: run.status === 'ok' && !overBudget ? 'normal' : 'high' }
-      )
-    );
+  /**
+   * Agent run report (spec §7.2 step 7, §11): when the agent calls finish_run (interactive runs), or when the
+   * server's runner process has exited (scheduled / manual / event runs, with cost and duration)
+   */
+  agentRunFinished(
+    run: {
+      status: string;
+      trigger: string;
+      kind?: string;
+      toolCalls: number;
+      costUsd: number;
+      tokensIn?: number;
+      tokensOut?: number;
+      durationMs?: number | null;
+      summaryMd: string | null;
+    },
+    overBudget: boolean
+  ): void {
+    this.guard(() => {
+      const head = [
+        `[AGENT RUN] ${run.kind ? `${run.kind} (${run.trigger})` : run.trigger} run ${run.status}`,
+        ...(run.durationMs !== undefined && run.durationMs !== null ? [formatDuration(run.durationMs)] : []),
+        `$${run.costUsd.toFixed(2)}${overBudget ? ' (over agent.max_run_cost_usd)' : ''}`,
+        ...(run.tokensIn !== undefined && run.tokensOut !== undefined && run.tokensIn + run.tokensOut > 0
+          ? [`${compactNumber(run.tokensIn)} in / ${compactNumber(run.tokensOut)} out tokens`]
+          : []),
+        `${run.toolCalls} tool call(s)`,
+      ].join(' · ');
+      this.send(`${head}\n${truncateSummary((run.summaryMd ?? '').trim(), 3000)}`, {
+        keepSeparate: true,
+        priority: run.status === 'ok' && !overBudget ? 'normal' : 'high',
+      });
+    });
+  }
+
+  /** Scheduler notices (skipped run: budget used, missing API key; run could not start) */
+  agentNotice(text: string, priority: 'high' | 'normal' = 'normal'): void {
+    this.guard(() => this.send(`[AGENT] ${short(text, 1000)}`, { priority }));
+  }
+
+  /** The server's agent scheduler registers the `/run` command (null to remove it) */
+  setAgentRunHandler(handler: ((kind: 'cycle' | 'review') => Promise<string>) | null): void {
+    this.agentRun = handler;
   }
 
   /** The agent (or a human) asked the position manager to exit a position (spec §7.3 flag_position_exit) */
@@ -362,7 +421,13 @@ export class NotificationService implements OrderEventSink {
   }
 
   buildDigest(date: string): string {
-    return [`Daily digest ${date}`, '', this.pnlText(), '', this.exposureText(), '', this.haltsText(), '', this.botsByStageText()].join('\n');
+    let agent: string | null = null;
+    try {
+      agent = this.deps.getAgentDigest?.() ?? null;
+    } catch (err) {
+      agent = `Agent: unavailable (${short(err instanceof Error ? err.message : String(err), 100)})`;
+    }
+    return [`Daily digest ${date}`, '', this.pnlText(), '', this.exposureText(), '', this.haltsText(), '', this.botsByStageText(), ...(agent ? ['', agent] : [])].join('\n');
   }
 
   private readDigestState(): string | null {
@@ -473,6 +538,19 @@ export class NotificationService implements OrderEventSink {
         }
         await this.pause(args);
         return;
+      case 'run': {
+        const kind = (args || 'cycle').toLowerCase();
+        if (kind !== 'cycle' && kind !== 'review') {
+          this.reply('Usage: /run [cycle|review]');
+          return;
+        }
+        if (!this.agentRun) {
+          this.reply('The agent is not available (agent.enabled is false in server.yaml, or the server is locked).');
+          return;
+        }
+        this.reply(await this.agentRun(kind));
+        return;
+      }
       case 'clear':
       case 'clearhalt':
       case 'clear_halt':

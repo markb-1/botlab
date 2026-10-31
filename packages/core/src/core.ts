@@ -82,6 +82,7 @@ import { MarketService } from './services/MarketService';
 import { OverviewService } from './services/OverviewService';
 import { AuditLogService } from './services/AuditLogService';
 import { AgentService } from './services/AgentService';
+import type { AgentTrigger } from './agent/schedule';
 import { PublicError, publicLookupError } from './services/redact';
 import { getBalance } from './exchange/polymarket/trading';
 import { getBinanceBalance } from './exchange/binance/client';
@@ -101,9 +102,16 @@ export interface CoreOptions {
 
 /**
  * Events transports forward to clients (IPC channel / SSE event name ⇒ payload):
- * `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`, `bot:event`, `bot:log`.
+ * `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`, `bot:event`, `bot:log`,
+ * `agent:run` (run started / usage / finished; emitted by the server's agent scheduler).
  */
-export const CORE_EVENTS = [RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, 'config:changed', MARKET_RULES_CHANGED_EVENT, 'bot:event', 'bot:log'] as const;
+export const AGENT_RUN_EVENT = 'agent:run';
+export const CORE_EVENTS = [RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, 'config:changed', MARKET_RULES_CHANGED_EVENT, 'bot:event', 'bot:log', AGENT_RUN_EVENT] as const;
+/**
+ * Internal (not forwarded to clients): an `AgentTrigger` for an event-triggered agent run (spec §7.1) —
+ * rules changed / UMA dispute on a held market, a bot halt, a reconciliation mismatch.
+ */
+export const AGENT_TRIGGER_EVENT = 'agent:trigger';
 export type CoreEventName = (typeof CORE_EVENTS)[number];
 
 export interface CoreRepositories {
@@ -305,8 +313,56 @@ export function createCore(options: CoreOptions): Core {
       await botManager.stopBot(id, actor);
     },
     isRunning: (id) => botManager?.isRunning(id) ?? false,
+    getAgentDigest: () => agentService.digestText(),
     stateFile: path.join(dataDir, 'notify-state.json'),
   });
+
+  // ── Agent runs, notes, budget (spec §7); created early: the services below ask it about event runs ──
+  const agentService: AgentService = new AgentService({
+    runRepo: new AgentRunRepository(db),
+    noteRepo: new AgentNoteRepository(db),
+    flagRepo: new PositionExitFlagRepository(db),
+    botRepo,
+    tradeRepo,
+    audit,
+    auditRepo: repos.auditRepo,
+    getLimits: () => configService.getConfig()?.limits ?? null,
+    notify: {
+      agentRunFinished: (run, overBudget) => notifications.agentRunFinished(run, overBudget),
+      positionExitFlagged: (flag) => notifications.positionExitFlagged(flag),
+    },
+  });
+  /** Event runs are maintenance only: agent creates / forecasts refused in the services (spec §7.1) */
+  const guardAgentRun = (by: unknown, action: string) => agentService.guardMaintenanceRun(by, action);
+
+  // ── Event triggers for agent runs (the server's scheduler decides whether to run) ──
+  const emitAgentTrigger = (t: Omit<AgentTrigger, 'at'>) => {
+    try {
+      events.emit(AGENT_TRIGGER_EVENT, { ...t, at: Date.now() } satisfies AgentTrigger);
+    } catch (err) {
+      console.error('[Core] agent trigger listener failed:', err);
+    }
+  };
+  halts.on(RISK_HALT_EVENT, (e: { kind: string; scope: string; reason: string }) => {
+    if (e.kind === 'bot') emitAgentTrigger({ kind: 'bot_halt', ref: e.scope, detail: `bot ${botRepo.findById(e.scope)?.name ?? e.scope} halted: ${e.reason.slice(0, 300)}` });
+  });
+  audit.onRecord((entry) => {
+    if (entry.action !== 'market.rules_changed' && entry.action !== 'market.disputed') return;
+    const p = (entry.payload ?? {}) as { heldBy?: unknown; question?: unknown };
+    if (!Array.isArray(p.heldBy) || p.heldBy.length === 0) return;
+    emitAgentTrigger({
+      kind: 'rules_changed',
+      ref: entry.target ?? null,
+      detail: `${entry.action === 'market.disputed' ? 'UMA dispute' : 'rules changed'} on held market ${entry.target ?? '?'}: ${String(p.question ?? '').slice(0, 200)}`,
+    });
+  });
+  const reconcileNotifier = {
+    reconciliationMismatch: (summary: string) => {
+      notifications.reconciliationMismatch(summary);
+      emitAgentTrigger({ kind: 'reconcile_mismatch', detail: `reconciliation mismatch: ${summary.slice(0, 500)}` });
+    },
+    reconcilerAlert: (text: string) => notifications.reconcilerAlert(text),
+  };
 
   // ── Market cache and forecast ledger (no wallet keys needed) ──────
   const feeLabels = new FeeService();
@@ -349,6 +405,7 @@ export function createCore(options: CoreOptions): Core {
     getMid: (tokenId) => fetchPolymarketMid(settingsRepo.get().clob_http_url, tokenId),
     getMandate: () => configService.getConfig()?.mandate ?? null,
     getLimits: () => configService.getConfig()?.limits ?? null,
+    guardAgentRun,
   });
 
   // ── Order-book recorder (spec §10): never affects trading ─────────
@@ -403,13 +460,14 @@ export function createCore(options: CoreOptions): Core {
       botManager: () => botManager,
       walletManager: () => walletManager,
       getLimits: () => configService.getConfig()?.limits ?? null,
+      guardAgentRun,
       describeToken: (tokenId) => {
         const m = marketCache.getCachedByToken(tokenId);
         return m ? { marketId: m.marketId, question: m.question, outcome: m.tokens.find((t) => t.tokenId === tokenId)?.outcome ?? null } : null;
       },
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),
-    scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null }),
+    scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null, guardAgentRun }),
     settings: new SettingsService({ settingsRepo }),
     backtests: new BacktestService({
       db,
@@ -480,19 +538,7 @@ export function createCore(options: CoreOptions): Core {
       },
     }),
     auditLog: new AuditLogService(repos.auditRepo),
-    agent: new AgentService({
-      runRepo: new AgentRunRepository(db),
-      noteRepo: new AgentNoteRepository(db),
-      flagRepo: new PositionExitFlagRepository(db),
-      botRepo,
-      tradeRepo,
-      audit,
-      getLimits: () => configService.getConfig()?.limits ?? null,
-      notify: {
-        agentRunFinished: (run, overBudget) => notifications.agentRunFinished(run, overBudget),
-        positionExitFlagged: (flag) => notifications.positionExitFlagged(flag),
-      },
-    }),
+    agent: agentService,
   };
 
   // ── Lifecycle ─────────────────────────────────────────────────────
@@ -694,7 +740,7 @@ export function createCore(options: CoreOptions): Core {
       audit,
       killSwitch,
       canceller,
-      notify: notifications,
+      notify: reconcileNotifier,
       events: notifications,
       marketCache,
       getFeeRates: feeRatesFor,

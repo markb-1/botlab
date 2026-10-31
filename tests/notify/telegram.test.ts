@@ -173,15 +173,28 @@ describe('Telegram commands', () => {
     expect(stopBot.mock.calls).toEqual([['w2', 'human'], ['a1', 'human']]); // 'weather': the one running bot; then explicit id
   });
 
-  it('/status, /bots and /help answer; /run and /code are unknown', async () => {
+  it('/status, /bots and /help answer; /code is unknown; /run needs the agent scheduler', async () => {
     const { tg, notifier } = setup();
-    tg.pushUpdates([msg('/status', ADMIN, 1), msg('/bots', ADMIN, 2), msg('/help', ADMIN, 3), msg('/run', ADMIN, 4)]);
+    tg.pushUpdates([msg('/status', ADMIN, 1), msg('/bots', ADMIN, 2), msg('/help', ADMIN, 3), msg('/code x', ADMIN, 4), msg('/run', ADMIN, 5)]);
     await notifier.pollOnce(0);
     await notifier.flush();
     const all = tg.messages();
-    expect(all).toHaveLength(4);
+    expect(all).toHaveLength(5);
     expect(all[1]).toMatch(/Weather Bot \[full\/live\] running/);
     expect(all[3]).toMatch(/Unknown command/);
+    expect(all[4]).toMatch(/agent is not available/);
+  });
+
+  it('/run [cycle|review] goes to the agent scheduler (admin chat only)', async () => {
+    const { tg, notifier, service } = setup();
+    const run = vi.fn(async (kind: string) => `started ${kind}`);
+    service.setAgentRunHandler(run);
+    tg.pushUpdates([msg('/run', ADMIN, 1), msg('/run review', ADMIN, 2), msg('/run event', ADMIN, 3), msg('/run', '999', 4)]);
+    await notifier.pollOnce(0);
+    await notifier.flush();
+    expect(run.mock.calls).toEqual([['cycle'], ['review']]);
+    const all = tg.messages();
+    expect(all).toEqual(['started cycle', 'started review', 'Usage: /run [cycle|review]']);
   });
 });
 

@@ -355,6 +355,8 @@ export interface BotServiceDeps {
   walletManager: () => Pick<WalletManager, 'createPaperWallet' | 'deletePaperWallet'> | null;
   /** Limits in force (agent bot caps); null = config unavailable ⇒ the agent may not create bots */
   getLimits?: () => LimitsConfig | null;
+  /** Refuses agent writes during an event-triggered (maintenance-only) run (AgentService.guardMaintenanceRun) */
+  guardAgentRun?: (by: unknown, action: string) => void;
   /** Cached market question / outcome of a token (positions and orders views) */
   describeToken?: (tokenId: string) => { marketId: string; question: string; outcome: string | null } | null;
   now?: () => number;
@@ -467,7 +469,10 @@ export class BotService {
       audit?.record(actor, 'bot.create', null, { name: data.name, mode: data.mode, walletId: data.walletId }, 'denied: agent bots are paper bots without a wallet choice');
       throw new ServiceError('forbidden', 'bots.create: the agent can only create paper bots (no walletId, mode paper)');
     }
-    if (who.kind === 'agent') this.checkAgentCreate(data);
+    if (who.kind === 'agent') {
+      this.deps.guardAgentRun?.(who, 'bot.create');
+      this.checkAgentCreate(data);
+    }
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
     const mode = data.mode ?? 'paper';

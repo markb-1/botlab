@@ -16,14 +16,22 @@
  *   (`recordRunUsage`), also on a run that already finished or timed out. The monthly budget counts that
  *   recorded cost only; interactive use through Claude Code / Desktop is not cost-tracked by BotLab (the
  *   LLM bill is the client's). `max_run_cost_usd` is reported to the runner, which stops a run above it.
+ * - Runs the server opens for its runner process (4b, `openManagedRun`, system actor) carry a kind
+ *   (review / cycle / event) and the runner token's principal: the agent's own `start_run` then attaches to
+ *   that run instead of opening another, so it cannot skip run accounting. Their Telegram report is sent by
+ *   `completeManagedRun` once the runner has exited and its usage is recorded (cost and duration included).
+ * - Event runs are maintenance only (spec §7.1): while one is open, `guardMaintenanceRun` refuses agent bot
+ *   creates, script / template writes and forecasts in the services themselves (MCP and /api alike).
  */
 
 import type {
   AgentNoteRepository,
   AgentNoteRow,
   AgentRunAction,
+  AgentRunKind,
   AgentRunRepository,
   AgentRunRow,
+  AgentRunStatus,
   AgentRunTrigger,
   PositionExitFlagRepository,
   PositionExitFlagRow,
@@ -31,6 +39,7 @@ import type {
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { AuditService } from '../audit/AuditService';
+import type { AuditRepository } from '../db/repositories/AuditRepository';
 import type { LimitsConfig } from '../config/schema';
 import { auditActorOf, requireActor, type Actor } from './actors';
 import { conflict, invalidInput, notFound, ServiceError } from './errors';
@@ -43,6 +52,9 @@ export const MAX_NOTES = 2000;
 export const MAX_NOTE_BODY_CHARS = 20_000;
 export const MAX_SUMMARY_CHARS = 20_000;
 
+/** Tools counted under "key actions" in the daily digest */
+const KEY_ACTIONS = new Set(['create_bot', 'create_template', 'update_template', 'submit_forecast', 'withdraw_forecast', 'retire_bot', 'pause_bot', 'start_bot', 'update_bot_config', 'flag_position_exit', 'kill_switch', 'assess_market']);
+
 const NOTE_SCOPE_RE = /^(general|market:[0-9A-Za-z_-]{1,100}|category:[a-z0-9_-]{1,60}|strategy:[a-z0-9_-]{1,60})$/;
 
 export interface AgentRunView {
@@ -50,6 +62,12 @@ export interface AgentRunView {
   startedAt: string;
   finishedAt: string | null;
   trigger: AgentRunTrigger;
+  kind: AgentRunKind;
+  /** Opened by the server for its runner process */
+  managed: boolean;
+  model: string | null;
+  /** finishedAt − startedAt; null while running */
+  durationMs: number | null;
   status: AgentRunRow['status'];
   tokensIn: number;
   tokensOut: number;
@@ -108,6 +126,8 @@ export interface AgentServiceDeps {
   botRepo: Pick<BotRepository, 'findById' | 'countCreatedSince' | 'countActiveCreatedBy'>;
   tradeRepo: Pick<BotTradeRepository, 'getRiskPositions'>;
   audit?: Pick<AuditService, 'record'>;
+  /** Audit rows of a run's tool calls (Agent page transcript) */
+  auditRepo?: Pick<AuditRepository, 'list'>;
   getLimits: () => LimitsConfig | null;
   /** Telegram: run summary (spec §7.2 step 7, §11) and exit flags */
   notify?: {
@@ -125,11 +145,16 @@ function runView(r: AgentRunRow): AgentRunView {
   } catch {
     /* empty */
   }
+  const duration = r.finished_at ? Date.parse(r.finished_at) - Date.parse(r.started_at) : NaN;
   return {
     id: r.id,
     startedAt: r.started_at,
     finishedAt: r.finished_at,
     trigger: r.trigger,
+    kind: r.kind ?? 'cycle',
+    managed: r.managed === 1,
+    model: r.model ?? null,
+    durationMs: Number.isFinite(duration) ? Math.max(0, duration) : null,
     status: r.status,
     tokensIn: r.tokens_in,
     tokensOut: r.tokens_out,
@@ -208,12 +233,8 @@ export class AgentService {
     };
   }
 
-  /** Start a run (agent, or the runner / UI in 4b). Refused over the monthly budget or while another run is open. */
-  startRun(input: { trigger?: unknown }, by: Actor): { run: AgentRunView; budget: AgentBudgetView; lastRun: AgentRunView | null } {
-    const who = requireActor(by, ['agent', 'human', 'system'], 'agent.startRun');
-    const actor = auditActorOf(who);
-    const trigger = input.trigger ?? 'manual';
-    if (trigger !== 'manual' && trigger !== 'schedule' && trigger !== 'event') throw invalidInput('trigger must be manual, schedule or event');
+  /** Refuses a new run when limits are unreadable or the month's budget is used (audited); returns the limits */
+  private checkCanStart(actor: ReturnType<typeof auditActorOf>, trigger: string): LimitsConfig {
     const limits = this.deps.getLimits();
     if (!limits) {
       this.deps.audit?.record(actor, 'agent.run_start', null, { trigger }, 'denied: limits unavailable');
@@ -228,12 +249,184 @@ export class AgentService {
         `Monthly LLM budget used: $${spent.toFixed(2)} of $${limits.agent.monthly_llm_budget_usd.toFixed(2)} (agent.monthly_llm_budget_usd); no runs until next month`
       );
     }
+    return limits;
+  }
+
+  /**
+   * Start a run (agent, or a human / system). Refused over the monthly budget or while another run is open,
+   * except that the agent whose token the server opened a managed run for attaches to that run (4b).
+   */
+  startRun(input: { trigger?: unknown }, by: Actor): { run: AgentRunView; budget: AgentBudgetView; lastRun: AgentRunView | null } {
+    const who = requireActor(by, ['agent', 'human', 'system'], 'agent.startRun');
+    const actor = auditActorOf(who);
+    const trigger = input.trigger ?? 'manual';
+    if (trigger !== 'manual' && trigger !== 'schedule' && trigger !== 'event') throw invalidInput('trigger must be manual, schedule or event');
     const open = this.currentRun();
+    if (open && who.kind === 'agent') {
+      const row = this.deps.runRepo.findById(open.id);
+      if (row && row.managed === 1 && row.principal === who.principal) {
+        const previous = this.deps.runRepo.list(1, row.started_at)[0];
+        this.deps.audit?.record(actor, 'agent.run_attach', row.id, { kind: row.kind });
+        return { run: runView(row), budget: this.budget(), lastRun: previous ? runView(previous) : null };
+      }
+    }
+    this.checkCanStart(actor, trigger);
     if (open) throw conflict(`Run ${open.id} is in progress (started ${open.startedAt}); finish it first`);
     const lastRow = this.deps.runRepo.list(1)[0];
-    const row = this.deps.runRepo.create({ trigger, principal: who.principal, startedAt: this.iso() });
-    this.deps.audit?.record(actor, 'agent.run_start', row.id, { trigger });
+    const row = this.deps.runRepo.create({ trigger, principal: who.principal, startedAt: this.iso(), kind: trigger === 'event' ? 'event' : 'cycle' });
+    this.deps.audit?.record(actor, 'agent.run_start', row.id, { trigger, kind: row.kind });
     return { run: runView(row), budget: this.budget(), lastRun: lastRow ? runView(lastRow) : null };
+  }
+
+  /**
+   * Open a run for the server's runner process (4b, system actor only): same budget / one-at-a-time rules as
+   * `startRun`; `principal` is the runner token's principal (`token:<id>`), so the agent's `start_run` attaches
+   * to this run. Returns the run and the per-run cost cap the runner must enforce.
+   */
+  openManagedRun(
+    input: { kind: AgentRunKind; trigger: AgentRunTrigger; principal: string; model?: string | null },
+    by: Actor
+  ): { run: AgentRunView; maxRunCostUsd: number; maxToolCallsPerRun: number } {
+    const actor = auditActorOf(requireActor(by, ['system'], 'agent.openManagedRun'));
+    if (!['review', 'cycle', 'event'].includes(input.kind)) throw invalidInput('kind must be review, cycle or event');
+    if (!['manual', 'schedule', 'event'].includes(input.trigger)) throw invalidInput('trigger must be manual, schedule or event');
+    if (typeof input.principal !== 'string' || !input.principal.startsWith('token:')) throw invalidInput('principal must be a token principal');
+    const limits = this.checkCanStart(actor, input.trigger);
+    const open = this.currentRun();
+    if (open) throw conflict(`Run ${open.id} is in progress (started ${open.startedAt})`);
+    const row = this.deps.runRepo.create({
+      trigger: input.trigger,
+      principal: input.principal,
+      startedAt: this.iso(),
+      kind: input.kind,
+      managed: true,
+      model: input.model ?? null,
+    });
+    this.deps.audit?.record(actor, 'agent.run_start', row.id, { trigger: input.trigger, kind: input.kind, managed: true, model: input.model ?? null });
+    return { run: runView(row), maxRunCostUsd: limits.agent.max_run_cost_usd, maxToolCallsPerRun: limits.agent.max_tool_calls_per_run };
+  }
+
+  /**
+   * The runner process of a managed run has exited (system actor only): record its usage, close the run if
+   * the agent did not (status / summary from the server: crash, timeout, cost cap), then send the run report
+   * with cost and duration. Usage is recorded on any status, as in `recordRunUsage`.
+   */
+  completeManagedRun(
+    runId: string,
+    outcome: {
+      usage?: { tokensIn?: unknown; tokensOut?: unknown; costUsd?: unknown } | null;
+      status: Exclude<AgentRunStatus, 'running'>;
+      summary: string;
+    },
+    by: Actor
+  ): AgentRunView {
+    const actor = auditActorOf(requireActor(by, ['system'], 'agent.completeManagedRun'));
+    const row = this.deps.runRepo.findById(runId);
+    if (!row) throw notFound('Run not found');
+    if (outcome.usage) this.recordRunUsage(runId, outcome.usage, by);
+    let closedByServer = false;
+    if (this.deps.runRepo.findById(runId)!.status === 'running') {
+      this.deps.runRepo.finish(runId, { status: outcome.status, finishedAt: this.iso(), summaryMd: outcome.summary.slice(0, MAX_SUMMARY_CHARS) });
+      closedByServer = true;
+    }
+    const view = runView(this.deps.runRepo.findById(runId)!);
+    const overBudget = this.overRunBudget(view);
+    this.deps.audit?.record(actor, 'agent.run_complete', runId, {
+      status: view.status,
+      closedByServer,
+      ...(closedByServer ? { reason: outcome.summary.slice(0, 500) } : {}),
+      costUsd: view.costUsd,
+      durationMs: view.durationMs,
+      ...(overBudget ? { overRunBudget: true } : {}),
+    });
+    try {
+      this.deps.notify?.agentRunFinished(view, overBudget);
+    } catch {
+      /* notifications never fail the call */
+    }
+    return view;
+  }
+
+  /** Managed runs still open from a previous server process (it stopped while a runner ran): closed as error */
+  closeOrphanedManagedRuns(by: Actor): number {
+    const actor = auditActorOf(requireActor(by, ['system'], 'agent.closeOrphanedManagedRuns'));
+    const rows = this.deps.runRepo.findOpenManaged();
+    for (const r of rows) {
+      this.deps.runRepo.finish(r.id, { status: 'error', finishedAt: this.iso(), summaryMd: r.summary_md ?? '(the server stopped while this run was in progress)' });
+      this.deps.audit?.record(actor, 'agent.run_complete', r.id, { status: 'error', closedByServer: true, reason: 'server restarted' });
+    }
+    return rows.length;
+  }
+
+  /** A non-MCP tool call of the runner (web search / fetch) kept on the run's action list (system actor only) */
+  recordRunnerAction(runId: string, action: { tool: string; target?: string | null; ok?: boolean }, by: Actor): void {
+    requireActor(by, ['system'], 'agent.recordRunnerAction');
+    if (typeof action.tool !== 'string' || !/^[A-Za-z0-9_:-]{1,80}$/.test(action.tool)) return;
+    const target = typeof action.target === 'string' ? action.target.slice(0, 200) : null;
+    this.deps.runRepo.recordAction(runId, { tool: action.tool, at: this.iso(), ok: action.ok !== false, ...(target ? { target } : {}) });
+  }
+
+  /**
+   * Event runs are maintenance only (spec §7.1: step 2 of §7.2, no new bots). Called by the services before an
+   * agent creates a bot, writes a script / template or submits a forecast; refuses (audited) while the open
+   * run is an event run. Not the agent ⇒ no-op.
+   */
+  guardMaintenanceRun(by: unknown, action: string): void {
+    if (auditActorOf(by) !== 'agent') return;
+    const run = this.currentRun();
+    if (!run || run.kind !== 'event') return;
+    this.deps.audit?.record('agent', action, null, { runId: run.id }, 'denied: event run (maintenance only)');
+    throw new ServiceError(
+      'forbidden',
+      `${action}: not allowed during an event-triggered run (maintenance only: pause / retire / fix config of your bots, notes, exit flags; no new bots, templates or forecasts)`
+    );
+  }
+
+  /** Runs with this trigger started since `sinceIso`, and the newest one's start (scheduler: event cap, slots) */
+  triggerStats(trigger: AgentRunTrigger, sinceIso: string): { count: number; lastStartedAt: string | null } {
+    const count = this.deps.runRepo.countTriggerSince(trigger, sinceIso);
+    const last = count > 0 ? this.deps.runRepo.listSince(sinceIso).filter((r) => r.trigger === trigger).pop() : undefined;
+    return { count, lastStartedAt: last?.started_at ?? null };
+  }
+
+  /** The MCP calls of a run from the audit log (Agent page transcript), oldest first */
+  runCalls(id: string): Array<{ id: number; ts: string; tool: string; target: string | null; result: string | null; ms: number | null }> {
+    const run = this.getRun(id);
+    if (!this.deps.auditRepo) return [];
+    const until = run.finishedAt ? new Date(Date.parse(run.finishedAt) + 60_000).toISOString() : undefined;
+    return this.deps.auditRepo
+      .list({ actionPrefix: 'mcp.', actor: 'agent', sinceIso: run.startedAt, ...(until ? { untilIso: until } : {}), limit: 1000 })
+      .flatMap((r) => {
+        let p: Record<string, unknown> = {};
+        try {
+          p = r.payload ? (JSON.parse(r.payload) as Record<string, unknown>) : {};
+        } catch {
+          /* empty */
+        }
+        if (p.runId !== id) return [];
+        return [{ id: r.id, ts: r.ts, tool: r.action.slice(4), target: r.target, result: r.result, ms: typeof p.ms === 'number' ? p.ms : null }];
+      })
+      .reverse();
+  }
+
+  /** Digest lines (spec §11, 08:00): agent runs in the last 24 h and the month-to-date budget */
+  digestText(): string {
+    const since = this.iso(this.now() - 86_400_000);
+    const runs = this.deps.runRepo.listSince(since).map(runView);
+    const b = this.budget();
+    const budgetLine = `Agent budget ${b.month}: $${b.monthSpentUsd.toFixed(2)}${b.monthlyBudgetUsd !== null ? ` of $${b.monthlyBudgetUsd.toFixed(2)}` : ''}`;
+    if (runs.length === 0) return `Agent runs (24 h): none\n${budgetLine}`;
+    const cost = runs.reduce((n, r) => n + r.costUsd, 0);
+    const byStatus = new Map<string, number>();
+    for (const r of runs) byStatus.set(r.status, (byStatus.get(r.status) ?? 0) + 1);
+    const counts = new Map<string, number>();
+    for (const r of runs) for (const a of r.actions) if (a.ok && KEY_ACTIONS.has(a.tool)) counts.set(a.tool, (counts.get(a.tool) ?? 0) + 1);
+    const key = [...counts].map(([t, n]) => `${t} ${n}`).join(', ');
+    return [
+      `Agent runs (24 h): ${runs.length} (${[...byStatus].map(([s, n]) => `${s} ${n}`).join(', ')}), $${cost.toFixed(2)}`,
+      ...(key ? [`Key actions: ${key}`] : []),
+      budgetLine,
+    ].join('\n');
   }
 
   /**
@@ -260,10 +453,13 @@ export class AgentService {
       toolCalls: view.toolCalls,
       ...(overBudget ? { overRunBudget: true } : {}),
     });
-    try {
-      this.deps.notify?.agentRunFinished(view, overBudget);
-    } catch {
-      /* notifications never fail the call */
+    // A managed run is reported by completeManagedRun once its usage is known (cost and duration)
+    if (row.managed !== 1) {
+      try {
+        this.deps.notify?.agentRunFinished(view, overBudget);
+      } catch {
+        /* notifications never fail the call */
+      }
     }
     return view;
   }

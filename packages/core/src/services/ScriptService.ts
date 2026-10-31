@@ -88,6 +88,8 @@ export interface ScriptServiceDeps {
   getMandate?: () => MandateConfig | null;
   /** Typecheck (default: a worker thread with time and memory limits, R144) */
   typecheck?: (source: string) => Promise<TypecheckResult>;
+  /** Refuses agent writes during an event-triggered (maintenance-only) run (AgentService.guardMaintenanceRun) */
+  guardAgentRun?: (by: unknown, action: string) => void;
 }
 
 const originOf = (actor: Actor): 'human' | 'agent' => (actor.kind === 'agent' ? 'agent' : 'human');
@@ -152,6 +154,7 @@ export class ScriptService {
 
   async create(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.create');
+    this.deps.guardAgentRun?.(who, 'script.create');
     // Agent code must compile and typecheck (R135 amended)
     if (who.kind === 'agent') this.requireValid(await this.validate(data.source), actor, 'script.create', null);
     // Compile TypeScript to JavaScript
@@ -230,6 +233,7 @@ export class ScriptService {
    */
   async createTemplate(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.createTemplate');
+    this.deps.guardAgentRun?.(who, 'script.create');
     const { scriptRepo } = this.deps;
     if (who.kind === 'agent') {
       const mandate = this.deps.getMandate?.() ?? null;
@@ -277,6 +281,7 @@ export class ScriptService {
   /** `validate`: the new source must compile and typecheck — always for the agent (R135), and for templates */
   async update(id: string, input: ScriptUpdateInput, actor: Actor, opts: { validate?: boolean } = {}): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.update');
+    this.deps.guardAgentRun?.(who, 'script.update');
     const { scriptRepo } = this.deps;
     const data = { ...input };
     // Don't allow editing templates directly
@@ -347,6 +352,7 @@ export class ScriptService {
   /** Copy a script (typically a template) into a new, editable custom script */
   async fork(id: string, newName: string | undefined, actor: Actor): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.fork');
+    this.deps.guardAgentRun?.(who, 'script.create');
     const { scriptRepo } = this.deps;
     const original = scriptRepo.findById(id);
     if (!original) throw notFound('Script not found');
@@ -398,6 +404,7 @@ export class ScriptService {
   /** Import `.botlab` files; a bad file is reported in `errors` and does not stop the others */
   async importScripts(files: ScriptImportFile[], actor: Actor): Promise<ScriptImportResult> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.import');
+    this.deps.guardAgentRun?.(who, 'script.create');
     const imported: IpcScript[] = [];
     const errors: string[] = [];
 

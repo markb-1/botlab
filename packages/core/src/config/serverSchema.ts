@@ -18,6 +18,20 @@ function isValidTimeZone(tz: string): boolean {
 
 export const DEFAULT_TIMEZONE = 'Europe/Dublin';
 
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+const minutesOf = (t: string): number => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+/** Spec §7.1: no scheduled agent runs between 00:00 and 07:00 local time */
+export const AGENT_QUIET_START_MIN = 0;
+export const AGENT_QUIET_END_MIN = 7 * 60;
+const outsideQuietHours = (t: string): boolean => minutesOf(t) >= AGENT_QUIET_END_MIN;
+const runTime = z
+  .string()
+  .regex(HHMM, 'must be HH:MM (24 h)')
+  .refine(outsideQuietHours, { message: 'no scheduled agent runs between 00:00 and 07:00 (spec §7.1)' });
+
+/** Models the runner may use (spec §7.1); the default is the cheaper one */
+export const AGENT_MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5'] as const;
+
 export const ServerSchema = z.strictObject({
   /** IANA time zone for the daily digest */
   timezone: z.string().min(1).refine(isValidTimeZone, { message: 'must be a valid IANA time zone (e.g. Europe/Dublin)' }).default(DEFAULT_TIMEZONE),
@@ -52,6 +66,34 @@ export const ServerSchema = z.strictObject({
       max_tokens: z.number().int().min(1).max(2000).default(200),
     })
     .prefault({}),
+  /**
+   * The scheduled agent (spec §7.1, chunk 4b). Off by default. Needs ANTHROPIC_API_KEY in the server's
+   * environment (never in a file or the database). Times are in `timezone`.
+   */
+  agent: z
+    .strictObject({
+      enabled: z.boolean().default(false),
+      model: z.enum(AGENT_MODELS).default('claude-sonnet-5-5'),
+      /** Model turns per run (the runner stops the run beyond this) */
+      max_turns: z.number().int().min(5).max(500).default(80),
+      schedule: z
+        .strictObject({
+          /** Daily review */
+          review: runTime.default('07:30'),
+          /** Cycles (scan → research → forecast → act) */
+          cycles: z.array(runTime).max(12).default(['11:30', '15:30', '19:30', '23:30']),
+        })
+        .prefault({}),
+      /** Event-triggered maintenance runs: rules_changed on a held market, bot halt, reconciliation mismatch */
+      events: z
+        .strictObject({
+          enabled: z.boolean().default(true),
+          max_per_day: z.number().int().min(0).max(4).default(4),
+          debounce_minutes: z.number().int().min(30).max(24 * 60).default(30),
+        })
+        .prefault({}),
+    })
+    .prefault({}),
   notify: z
     .strictObject({
       telegram: z
@@ -84,6 +126,17 @@ recorder:                            # order-book snapshots for backtests (top 1
   enabled: true
   interval_seconds: 60
   max_tokens: 200                    # tokens per cycle: bot scopes, active forecasts, held, watchlist
+agent:                               # scheduled AI agent (spec §7.1); needs ANTHROPIC_API_KEY in the environment
+  enabled: false                     # off until you switch it on (paper bots only; see README "Running the agent")
+  model: claude-sonnet-5-5           # or claude-opus-5-5 (about 2x the cost)
+  max_turns: 80                      # model turns per run; cost per run: limits.yaml agent.max_run_cost_usd
+  schedule:                          # local times in \`timezone\`; nothing between 00:00 and 07:00
+    review: "07:30"
+    cycles: ["11:30", "15:30", "19:30", "23:30"]
+  events:                            # maintenance runs on rules changes (held market), bot halts, reconciliation mismatches
+    enabled: true
+    max_per_day: 4                   # at most 4 (spec)
+    debounce_minutes: 30             # at most one per 30 minutes
 notify:
   telegram:
     enabled: false

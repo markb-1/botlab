@@ -4,6 +4,9 @@ import { generateId } from '../index';
 /** agent_runs (spec §2.2) */
 export type AgentRunTrigger = 'schedule' | 'manual' | 'event';
 export type AgentRunStatus = 'running' | 'ok' | 'error' | 'aborted' | 'timeout';
+/** review (daily), cycle (scan → act), event (maintenance only: no new bots / templates / forecasts) */
+export type AgentRunKind = 'review' | 'cycle' | 'event';
+export const AGENT_RUN_KINDS: readonly AgentRunKind[] = ['review', 'cycle', 'event'];
 
 export interface AgentRunRow {
   id: string;
@@ -19,6 +22,10 @@ export interface AgentRunRow {
   actions: string;
   tool_calls: number;
   principal: string | null;
+  kind: AgentRunKind;
+  /** 1 = opened by the server for its runner process (spec §7.1) */
+  managed: number;
+  model: string | null;
 }
 
 /** One tool call recorded on a run */
@@ -51,12 +58,27 @@ export class AgentRunRepository {
       : (this.db.prepare('SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT ?').all(n) as AgentRunRow[]);
   }
 
-  create(data: { trigger: AgentRunTrigger; principal: string | null; startedAt: string }): AgentRunRow {
+  create(data: { trigger: AgentRunTrigger; principal: string | null; startedAt: string; kind?: AgentRunKind; managed?: boolean; model?: string | null }): AgentRunRow {
     const id = generateId();
     this.db
-      .prepare("INSERT INTO agent_runs (id, started_at, trigger, status, principal) VALUES (?, ?, ?, 'running', ?)")
-      .run(id, data.startedAt, data.trigger, data.principal);
+      .prepare("INSERT INTO agent_runs (id, started_at, trigger, status, principal, kind, managed, model) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)")
+      .run(id, data.startedAt, data.trigger, data.principal, data.kind ?? 'cycle', data.managed ? 1 : 0, data.model ?? null);
     return this.findById(id)!;
+  }
+
+  /** Runs started in [fromIso, now), oldest first (digest) */
+  listSince(fromIso: string): AgentRunRow[] {
+    return this.db.prepare('SELECT * FROM agent_runs WHERE started_at >= ? ORDER BY started_at').all(fromIso) as AgentRunRow[];
+  }
+
+  /** Runs with this trigger started at or after `fromIso` (event-run cap, scheduled-slot dedupe) */
+  countTriggerSince(trigger: AgentRunTrigger, fromIso: string): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM agent_runs WHERE trigger = ? AND started_at >= ?').get(trigger, fromIso) as { n: number }).n;
+  }
+
+  /** Open runs the server opened for a runner (closed when the server starts again) */
+  findOpenManaged(): AgentRunRow[] {
+    return this.db.prepare("SELECT * FROM agent_runs WHERE status = 'running' AND managed = 1").all() as AgentRunRow[];
   }
 
   /** Reserve one tool call on a running run, synchronously (R146); false when the run is not running */

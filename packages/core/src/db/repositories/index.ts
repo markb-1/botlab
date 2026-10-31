@@ -41,4 +41,5 @@ export { OrderbookSnapshotRepository, rowToSnapshot } from './OrderbookSnapshotR
 export type { OrderbookSnapshotRow, WatchlistRow } from './OrderbookSnapshotRepository';
 
 export { AgentRunRepository, AgentNoteRepository, PositionExitFlagRepository, MAX_RUN_ACTIONS } from './AgentRepository';
-export type { AgentRunRow, AgentRunTrigger, AgentRunStatus, AgentRunAction, AgentNoteRow, PositionExitFlagRow } from './AgentRepository';
+export type { AgentRunRow, AgentRunTrigger, AgentRunStatus, AgentRunKind, AgentRunAction, AgentNoteRow, PositionExitFlagRow } from './AgentRepository';
+export { AGENT_RUN_KINDS } from './AgentRepository';

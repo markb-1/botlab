@@ -596,6 +596,11 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       handled_note TEXT
     )`,
     'CREATE INDEX IF NOT EXISTS idx_position_exit_flags_status ON position_exit_flags(status)',
+    // 4b: run kind (review / cycle / event: event runs are maintenance only, enforced in the services), runs the
+    // server opened for its runner process (`managed`: usage and the run report come from the server), model
+    "ALTER TABLE agent_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'cycle'",
+    'ALTER TABLE agent_runs ADD COLUMN managed INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE agent_runs ADD COLUMN model TEXT',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

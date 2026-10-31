@@ -213,6 +213,8 @@ export interface LedgerDeps {
   getMandate: () => MandateConfig | null;
   /** Limits in force (max_spread, min_liquidity_usd for the forecast gate); null = use the mandate / fixed caps only */
   getLimits?: () => LimitsConfig | null;
+  /** Refuses agent forecasts during an event-triggered (maintenance-only) run */
+  guardAgentRun?: (by: unknown, action: string) => void;
   /** Called after a forecast is written/withdrawn (bots' ctx.events later) */
   onForecastChanged?: (f: ForecastView) => void;
   now?: () => number;
@@ -271,6 +273,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
   /** Validate and record a forecast (spec §6.1). Throws LedgerValidationError on bad input or market state. */
   async submitForecast(input: unknown, by: AuditActor | Actor): Promise<ForecastView> {
     const actor = auditActorOf(by);
+    // Event runs are maintenance only (ServiceError, user-facing on MCP and /api)
+    this.deps.guardAgentRun?.(by, 'forecast.submit');
     const parsed = SubmitForecastSchema.safeParse(input);
     if (!parsed.success) {
       const issues = parsed.error.issues.map((i) => `${i.path.length ? i.path.join('.') : '(input)'}: ${i.message}`);
