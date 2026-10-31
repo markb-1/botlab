@@ -100,6 +100,14 @@ describe('config loader', () => {
       expect(resolveConfigDir({ BOTLAB_CONFIG_DIR: dir, NODE_ENV: 'production' }, 'linux', home)).toBe(dir);
     });
 
+    it('follows BOTLAB_DATA_DIR in production (<data dir>/config) unless BOTLAB_CONFIG_DIR is set', () => {
+      const data = path.join(dir, 'data');
+      expect(resolveConfigDir({ BOTLAB_DATA_DIR: data, NODE_ENV: 'production' }, 'darwin', home)).toBe(path.join(data, 'config'));
+      expect(resolveConfigDir({ BOTLAB_DATA_DIR: data, BOTLAB_CONFIG_DIR: dir, NODE_ENV: 'production' }, 'darwin', home)).toBe(dir);
+      // Dev keeps the repo's config/ (BOTLAB_DATA_DIR only moves the data)
+      expect(resolveConfigDir({ BOTLAB_DATA_DIR: data }, 'darwin', home)).toBe(path.join(process.cwd(), 'config'));
+    });
+
     it('defaults to <cwd>/config outside production', () => {
       expect(resolveConfigDir({}, 'darwin', home)).toBe(path.join(process.cwd(), 'config'));
     });

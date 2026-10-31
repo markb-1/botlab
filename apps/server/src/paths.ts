@@ -5,7 +5,8 @@
  * Windows service) the OS app-data dir, else `<cwd>/data`. The OS dirs match the Electron app's
  * `userData`, so `npm start` finds an existing Electron database on macOS and Windows:
  * `~/Library/Application Support/BotLab`, `%APPDATA%\BotLab`, `~/.local/share/botlab`.
- * The config dir follows the same rule (`resolveConfigDir` in core: `<data dir>/config` in production).
+ * The config dir: `BOTLAB_CONFIG_DIR`, else in production `<data dir>/config` when `BOTLAB_DATA_DIR` is set, else the
+ * OS app-data dir + `config`; `<cwd>/config` in dev (`resolveConfigDir` in core).
  */
 
 import fs from 'fs';

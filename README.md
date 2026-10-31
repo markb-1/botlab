@@ -51,6 +51,8 @@ npm start                       # http://127.0.0.1:3780
 | `npm start` on Linux | `~/.local/share/botlab` | `~/.local/share/botlab/config` |
 | Docker | `/data` (volume `./data`) | `/config` (volume `./config`) |
 
+With `npm start`, setting only `BOTLAB_DATA_DIR` moves the config dir with it (`<data dir>/config`).
+
 The data dir holds `botlab.db`, `backups/` (nightly, 14 kept), `logs/`, `config-history/` and, unless
 you set the variables below, `master.key`.
 

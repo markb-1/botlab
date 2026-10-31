@@ -43,6 +43,7 @@ export class ConfigError extends Error {
 /**
  * Config directory (spec §15.2):
  * - BOTLAB_CONFIG_DIR if set
+ * - production with BOTLAB_DATA_DIR set: `<data dir>/config` (the config follows a custom data dir)
  * - production (NODE_ENV=production): the OS app-data dir —
  *   macOS ~/Library/Application Support/BotLab/config, Windows %APPDATA%\BotLab\config,
  *   Linux ~/.local/share/botlab/config
@@ -55,6 +56,7 @@ export function resolveConfigDir(
 ): string {
   if (env.BOTLAB_CONFIG_DIR) return env.BOTLAB_CONFIG_DIR;
   if (env.NODE_ENV !== 'production') return path.join(process.cwd(), 'config');
+  if (env.BOTLAB_DATA_DIR) return path.join(path.resolve(env.BOTLAB_DATA_DIR), 'config');
 
   switch (platform) {
     case 'darwin':
