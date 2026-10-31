@@ -415,7 +415,7 @@ export function BotCreate() {
               <label className="block text-sm font-medium text-gray-300">Starting Balance (USDC)</label>
               <input type="number" value={paperBalance}
                 onChange={(e) => setPaperBalance(Math.max(1, parseFloat(e.target.value) || 0))}
-                min={1} step={100}
+                min={1} step="any"
                 className="mt-1 block w-full rounded-md border-[#2a2a2a] bg-[#111] text-white shadow-sm focus:border-amber-500 focus:ring-amber-500 sm:text-sm" />
               <p className="text-xs text-gray-500 mt-1">Virtual USDC balance for paper trading.</p>
             </div>
