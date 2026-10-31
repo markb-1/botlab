@@ -16,7 +16,9 @@ import { sqliteAvailable } from '../orders/db';
 import { createCore, type Core } from '../../packages/core/src';
 import { AGENT_TRIGGER_EVENT } from '../../packages/core/src/core';
 import { asAgent, asSystem } from '../../packages/core/src/services/actors';
-import { AgentScheduler, RUNNER_TOKEN_NAME, type SpawnRunnerOptions } from '../../apps/server/src/agent/AgentScheduler';
+import { AgentScheduler, RUNNER_TOKEN_NAME, createForkRunner, type SpawnRunnerOptions } from '../../apps/server/src/agent/AgentScheduler';
+import { createApp } from '../../apps/server/src/app';
+import { LoginLimiter } from '../../apps/server/src/routes/auth';
 import { callTool } from '../../apps/server/src/mcp/server';
 import type { RunnerMessage, ServerMessage } from '../../apps/agent/src/protocol';
 
@@ -280,6 +282,109 @@ describe.skipIf(!sqliteAvailable)('AgentScheduler', () => {
     children[0].exit(0);
     expect(core.services.agent.currentRun()).toBeNull();
     expect(() => core.services.agent.guardMaintenanceRun(asAgent('token:x'), 'bot.create')).not.toThrow();
+  });
+
+  it('review fix: an event run cannot escape maintenance mode through finish_run; the runner token dies with its run', async () => {
+    setNow('2026-11-03T13:00:00Z');
+    core.events.emit(AGENT_TRIGGER_EVENT, { kind: 'bot_halt', at: Date.now(), detail: 'halt', ref: 'b' });
+    const token = children[0].opts.env.BOTLAB_AGENT_TOKEN;
+    const tokenView = core.auth.findToken(token)!;
+    const opts = { services: core.services, actor: asAgent(`token:${tokenView.id}`), tokenId: tokenView.id };
+    const template = core.services.scripts.templates().find((t) => t.builtin)!;
+    expect((await callTool(opts, 'start_run', {})).isError).toBeFalsy();
+    // Another agent token cannot finish the runner's run
+    expect(() => core.services.agent.finishRun({ summaryMd: 'x' }, asAgent('token:other'))).toThrow(/runner/);
+    expect((await callTool(opts, 'finish_run', { summary_md: 'done' })).isError).toBeFalsy();
+    // Token revoked at once: /mcp answers 401
+    expect(core.auth.isTokenActive(tokenView.id)).toBe(false);
+    const { app } = createApp({ core, webDir: null, limiter: new LoginLimiter(), loopbackOnly: true });
+    const res = await app.request('/mcp', {
+      method: 'POST',
+      headers: { host: '127.0.0.1:3780', authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'create_bot', arguments: { name: 'x', templateId: template.id } } }),
+    });
+    expect(res.status).toBe(401);
+    // ...and the services refuse that principal anyway (no new run, no writes)
+    const createBot = await callTool(opts, 'create_bot', { name: 'x', templateId: template.id, config: {} });
+    expect(createBot.isError).toBe(true);
+    expect((createBot.content[0] as { text: string }).text).toMatch(/has ended/);
+    const startAgain = await callTool(opts, 'start_run', {});
+    expect(startAgain.isError).toBe(true);
+    expect(() => core.services.agent.startRun({}, opts.actor)).toThrow(/has ended/);
+    await expect(core.services.bots.create({ name: 'y', scriptId: template.id } as never, opts.actor)).rejects.toThrow(/has ended/);
+    expect(core.services.agent.currentRun()).toBeNull();
+    // The runner exits; runs start normally afterwards (nothing blocked for 30 minutes)
+    children[0].exit(0);
+    const next = (await scheduler.runNow('cycle')) as { id: string; status: string };
+    expect(next.status).toBe('running');
+  });
+
+  it('review fix: usage is written while the run goes, so a server crash keeps the cost', async () => {
+    const run = (await scheduler.runNow('cycle')) as { id: string };
+    children[0].emit({ type: 'usage', tokensIn: 1000, tokensOut: 100, costUsd: 0.12, estimated: true });
+    expect(core.services.agent.getRun(run.id).costUsd).toBeCloseTo(0.12);
+    // Within 5 s: not written yet; after 5 s: written (only the difference is added)
+    children[0].emit({ type: 'usage', tokensIn: 2000, tokensOut: 200, costUsd: 0.2, estimated: true });
+    expect(core.services.agent.getRun(run.id).costUsd).toBeCloseTo(0.12);
+    advance(6_000);
+    children[0].emit({ type: 'usage', tokensIn: 3000, tokensOut: 300, costUsd: 0.3, estimated: true });
+    expect(core.services.agent.getRun(run.id)).toMatchObject({ tokensIn: 3000, tokensOut: 300 });
+    expect(core.services.agent.getRun(run.id).costUsd).toBeCloseTo(0.3);
+    // The server dies here (no exit, no completion); the next server closes the run and keeps the cost
+    const restarted = makeScheduler();
+    restarted.start();
+    expect(core.services.agent.getRun(run.id)).toMatchObject({ status: 'error', tokensIn: 3000 });
+    expect(core.services.agent.getRun(run.id).costUsd).toBeCloseTo(0.3);
+    expect(core.services.agent.budget().monthSpentUsd).toBeCloseTo(0.3);
+    await restarted.stop(10);
+  });
+
+  it('review fix: a runner that ignores SIGTERM is killed with its child process; the run is closed', async () => {
+    await scheduler.stop(100);
+    const logs: string[] = [];
+    scheduler = makeScheduler({
+      spawnRunner: createForkRunner(path.join(__dirname, 'fixtures', 'stubborn-runner.js')),
+      runTimeoutMs: 100,
+      stopGraceMs: 50,
+      killGraceMs: 400,
+      log: (m) => logs.push(m),
+    });
+    scheduler.start();
+    const run = (await scheduler.runNow('cycle')) as { id: string };
+    const pid = scheduler.status().activeRun!.pid!;
+    await scheduler.waitForIdle();
+    const run2 = core.services.agent.getRun(run.id);
+    expect(run2.status).toBe('timeout');
+    expect(run2.costUsd).toBeCloseTo(0.02);
+    expect(runnerTokens().every((t) => t.revoked_at)).toBe(true);
+    const alive = (p: number) => {
+      try {
+        process.kill(p, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const grandchild = Number(/grandchild (\d+)/.exec(logs.join('\n'))?.[1]);
+    // Date is faked: wait on real timers
+    for (let i = 0; i < 60 && (alive(pid) || (process.platform !== 'win32' && alive(grandchild))); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(alive(pid)).toBe(false);
+    if (process.platform !== 'win32') expect(alive(grandchild)).toBe(false);
+  }, 20_000);
+
+  it('review fix: a late slot is not run in the quiet hours', () => {
+    setNow('2026-11-04T00:10:00Z'); // the 23:30 slot is still within its grace window
+    scheduler.tick();
+    expect(children).toHaveLength(0);
+    expect(audit('agent.run_skipped')[0].payload).toMatchObject({ reason: 'quiet hours' });
+  });
+
+  it('review fix: the run cost cap is the smaller of max_run_cost_usd and what is left of the month', async () => {
+    const t = core.auth.createToken('x', 'agent');
+    const r = core.services.agent.openManagedRun({ kind: 'cycle', trigger: 'manual', principal: `token:${t.view.id}` }, asSystem('test'));
+    core.services.agent.completeManagedRun(r.run.id, { usage: { costUsd: 4.6 }, status: 'ok', summary: 's' }, asSystem('test'));
+    await scheduler.runNow('cycle');
+    expect(Number(children[0].opts.env.BOTLAB_AGENT_MAX_COST_USD)).toBeCloseTo(0.4);
   });
 
   it('closes runs left open by a previous server process and revokes leftover runner tokens at start', () => {

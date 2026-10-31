@@ -173,7 +173,9 @@ export function buildQueryOptions(cfg: RunnerConfig, abortController: AbortContr
     permissionMode: 'dontAsk',
     hooks: { PreToolUse: [{ hooks: [denyOtherTools] }] },
     mcpServers: {
-      [MCP_SERVER_KEY]: { type: 'http', url: cfg.mcpUrl, headers: { Authorization: `Bearer ${cfg.agentToken}` }, alwaysLoad: true },
+      // The SDK passes this as `--mcp-config` JSON on the command line: the token must not be in it. Claude
+      // Code expands ${VAR} in MCP header values from its environment (checked against the bundled CLI 2.1.316).
+      [MCP_SERVER_KEY]: { type: 'http', url: cfg.mcpUrl, headers: { Authorization: `Bearer \${${TOKEN_ENV}}` }, alwaysLoad: true },
     },
     strictMcpConfig: true,
     settingSources: [],
@@ -181,8 +183,30 @@ export function buildQueryOptions(cfg: RunnerConfig, abortController: AbortContr
     maxTurns: cfg.maxTurns,
     maxBudgetUsd: cfg.maxCostUsd,
     cwd: cfg.cwd,
-    env: cfg.env,
+    env: runnerEnv(cfg),
   };
+}
+
+/** Name of the variable that carries the token to the Claude Code process (environment, not argv) */
+export const TOKEN_ENV = 'BOTLAB_AGENT_TOKEN';
+
+/**
+ * Environment of the Claude Code process: the minimal env from main.ts, the token, and NO_PROXY for the MCP
+ * host (a proxy in HTTPS_PROXY / HTTP_PROXY would otherwise swallow the loopback connection to /mcp).
+ */
+export function runnerEnv(cfg: Pick<RunnerConfig, 'env' | 'agentToken' | 'mcpUrl'>): Record<string, string> {
+  let host = '127.0.0.1';
+  try {
+    host = new URL(cfg.mcpUrl).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    /* keep loopback */
+  }
+  const existing = (cfg.env.NO_PROXY ?? cfg.env.no_proxy ?? '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean);
+  const noProxy = [...new Set([...existing, '127.0.0.1', 'localhost', '::1', host])].join(',');
+  return { ...cfg.env, [TOKEN_ENV]: cfg.agentToken, NO_PROXY: noProxy, no_proxy: noProxy };
 }
 
 // ── The run ──────────────────────────────────────────────────────────

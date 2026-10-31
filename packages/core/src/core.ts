@@ -327,6 +327,10 @@ export function createCore(options: CoreOptions): Core {
     audit,
     auditRepo: repos.auditRepo,
     getLimits: () => configService.getConfig()?.limits ?? null,
+    // Runner tokens die with their run (finish_run, server close, timeout, orphan cleanup)
+    onManagedRunClosed: (run) => {
+      if (run.principal?.startsWith('token:')) auth.revokeToken(run.principal.slice('token:'.length));
+    },
     notify: {
       agentRunFinished: (run, overBudget) => notifications.agentRunFinished(run, overBudget),
       positionExitFlagged: (flag) => notifications.positionExitFlagged(flag),

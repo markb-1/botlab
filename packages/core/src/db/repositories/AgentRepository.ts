@@ -76,6 +76,11 @@ export class AgentRunRepository {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM agent_runs WHERE trigger = ? AND started_at >= ?').get(trigger, fromIso) as { n: number }).n;
   }
 
+  /** The managed run of a runner-token principal (each runner token belongs to one run) */
+  findManagedByPrincipal(principal: string): AgentRunRow | undefined {
+    return this.db.prepare('SELECT * FROM agent_runs WHERE managed = 1 AND principal = ? ORDER BY started_at DESC LIMIT 1').get(principal) as AgentRunRow | undefined;
+  }
+
   /** Open runs the server opened for a runner (closed when the server starts again) */
   findOpenManaged(): AgentRunRow[] {
     return this.db.prepare("SELECT * FROM agent_runs WHERE status = 'running' AND managed = 1").all() as AgentRunRow[];

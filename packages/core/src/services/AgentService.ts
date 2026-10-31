@@ -20,8 +20,12 @@
  *   (review / cycle / event) and the runner token's principal: the agent's own `start_run` then attaches to
  *   that run instead of opening another, so it cannot skip run accounting. Their Telegram report is sent by
  *   `completeManagedRun` once the runner has exited and its usage is recorded (cost and duration included).
- * - Event runs are maintenance only (spec §7.1): while one is open, `guardMaintenanceRun` refuses agent bot
- *   creates, script / template writes and forecasts in the services themselves (MCP and /api alike).
+ * - Event runs are maintenance only (spec §7.1): `guardMaintenanceRun` refuses agent bot creates, script /
+ *   template writes and forecasts in the services themselves (MCP and /api alike). The kind is bound to the
+ *   runner token's principal (its managed run), not to whatever run happens to be open (review finding).
+ * - A runner token belongs to exactly one managed run: it can only attach to that run while it is open, never
+ *   start another; once the run is closed (by the agent's finish_run, the server, or the 30-minute timeout)
+ *   every call from that principal is refused and `onManagedRunClosed` revokes the token.
  */
 
 import type {
@@ -41,7 +45,7 @@ import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { AuditService } from '../audit/AuditService';
 import type { AuditRepository } from '../db/repositories/AuditRepository';
 import type { LimitsConfig } from '../config/schema';
-import { auditActorOf, requireActor, type Actor } from './actors';
+import { auditActorOf, isActor, requireActor, type Actor } from './actors';
 import { conflict, invalidInput, notFound, ServiceError } from './errors';
 
 /** A run open longer than this is closed as `timeout` (spec §7.1: runs over 30 min are cancelled) */
@@ -129,6 +133,8 @@ export interface AgentServiceDeps {
   /** Audit rows of a run's tool calls (Agent page transcript) */
   auditRepo?: Pick<AuditRepository, 'list'>;
   getLimits: () => LimitsConfig | null;
+  /** A managed run was closed (any path): the transport revokes its runner token at once */
+  onManagedRunClosed?: (run: { id: string; principal: string | null }) => void;
   /** Telegram: run summary (spec §7.2 step 7, §11) and exit flags */
   notify?: {
     agentRunFinished(run: AgentRunView, overBudget: boolean): void;
@@ -194,6 +200,30 @@ export class AgentService {
 
   // ── Runs ─────────────────────────────────────────────────────────
 
+  /** After a managed run was closed: revoke its runner token (never fails the caller) */
+  private managedClosed(row: Pick<AgentRunRow, 'id' | 'principal' | 'managed'>): void {
+    if (row.managed !== 1) return;
+    try {
+      this.deps.onManagedRunClosed?.({ id: row.id, principal: row.principal });
+    } catch (err) {
+      console.error('[Agent] could not revoke the runner token:', err);
+    }
+  }
+
+  /** The managed run a runner-token principal belongs to (null for other principals) */
+  private managedRunOf(principal: string | null | undefined): AgentRunRow | null {
+    if (!principal) return null;
+    return this.deps.runRepo.findManagedByPrincipal(principal) ?? null;
+  }
+
+  /** Refuses (audited) any call from a runner token whose managed run is no longer open */
+  private refuseClosedRunnerToken(principal: string, what: string): void {
+    const managed = this.managedRunOf(principal);
+    if (!managed || managed.status === 'running') return;
+    this.deps.audit?.record('agent', what, managed.id, { principal }, `denied: runner run ${managed.status}`);
+    throw new ServiceError('forbidden', `${what}: this runner token's run ${managed.id} has ended (${managed.status}); the token is no longer valid`);
+  }
+
   /** The open run; one older than RUN_TIMEOUT_MS is closed as `timeout` first */
   currentRun(): AgentRunView | null {
     const row = this.deps.runRepo.findRunning();
@@ -205,6 +235,7 @@ export class AgentService {
         summaryMd: row.summary_md ?? '(run exceeded 30 minutes; closed by the server)',
       });
       this.deps.audit?.record('system', 'agent.run_timeout', row.id, { startedAt: row.started_at, toolCalls: row.tool_calls });
+      this.managedClosed(row);
       return null;
     }
     return runView(row);
@@ -262,13 +293,16 @@ export class AgentService {
     const trigger = input.trigger ?? 'manual';
     if (trigger !== 'manual' && trigger !== 'schedule' && trigger !== 'event') throw invalidInput('trigger must be manual, schedule or event');
     const open = this.currentRun();
-    if (open && who.kind === 'agent') {
-      const row = this.deps.runRepo.findById(open.id);
-      if (row && row.managed === 1 && row.principal === who.principal) {
-        const previous = this.deps.runRepo.list(1, row.started_at)[0];
-        this.deps.audit?.record(actor, 'agent.run_attach', row.id, { kind: row.kind });
-        return { run: runView(row), budget: this.budget(), lastRun: previous ? runView(previous) : null };
+    // A runner token only ever attaches to its own managed run, while it is open; it never starts another
+    const managed = who.kind === 'agent' ? this.managedRunOf(who.principal) : null;
+    if (managed) {
+      if (managed.status !== 'running') {
+        this.deps.audit?.record(actor, 'agent.run_start', managed.id, { trigger }, `denied: runner run ${managed.status}`);
+        throw new ServiceError('forbidden', `This runner token's run ${managed.id} has ended (${managed.status}); it cannot start another run`);
       }
+      const previous = this.deps.runRepo.list(1, managed.started_at)[0];
+      this.deps.audit?.record(actor, 'agent.run_attach', managed.id, { kind: managed.kind });
+      return { run: runView(managed), budget: this.budget(), lastRun: previous ? runView(previous) : null };
     }
     this.checkCanStart(actor, trigger);
     if (open) throw conflict(`Run ${open.id} is in progress (started ${open.startedAt}); finish it first`);
@@ -303,7 +337,10 @@ export class AgentService {
       model: input.model ?? null,
     });
     this.deps.audit?.record(actor, 'agent.run_start', row.id, { trigger: input.trigger, kind: input.kind, managed: true, model: input.model ?? null });
-    return { run: runView(row), maxRunCostUsd: limits.agent.max_run_cost_usd, maxToolCallsPerRun: limits.agent.max_tool_calls_per_run };
+    // The run's cost cap never exceeds what is left of the month's budget
+    const remaining = Math.max(0, limits.agent.monthly_llm_budget_usd - this.deps.runRepo.costSince(this.monthStart().startIso));
+    const maxRunCostUsd = Math.round(Math.min(limits.agent.max_run_cost_usd, remaining) * 10_000) / 10_000;
+    return { run: runView(row), maxRunCostUsd, maxToolCallsPerRun: limits.agent.max_tool_calls_per_run };
   }
 
   /**
@@ -329,6 +366,7 @@ export class AgentService {
       this.deps.runRepo.finish(runId, { status: outcome.status, finishedAt: this.iso(), summaryMd: outcome.summary.slice(0, MAX_SUMMARY_CHARS) });
       closedByServer = true;
     }
+    this.managedClosed(row);
     const view = runView(this.deps.runRepo.findById(runId)!);
     const overBudget = this.overRunBudget(view);
     this.deps.audit?.record(actor, 'agent.run_complete', runId, {
@@ -353,7 +391,8 @@ export class AgentService {
     const rows = this.deps.runRepo.findOpenManaged();
     for (const r of rows) {
       this.deps.runRepo.finish(r.id, { status: 'error', finishedAt: this.iso(), summaryMd: r.summary_md ?? '(the server stopped while this run was in progress)' });
-      this.deps.audit?.record(actor, 'agent.run_complete', r.id, { status: 'error', closedByServer: true, reason: 'server restarted' });
+      this.deps.audit?.record(actor, 'agent.run_complete', r.id, { status: 'error', closedByServer: true, reason: 'server restarted', costUsd: r.cost_usd });
+      this.managedClosed(r);
     }
     return rows.length;
   }
@@ -373,7 +412,12 @@ export class AgentService {
    */
   guardMaintenanceRun(by: unknown, action: string): void {
     if (auditActorOf(by) !== 'agent') return;
-    const run = this.currentRun();
+    const principal = isActor(by) ? by.principal : null;
+    // A runner token: its own managed run decides (closed ⇒ refused; event ⇒ maintenance only)
+    const managed = this.managedRunOf(principal);
+    if (principal && managed) this.refuseClosedRunnerToken(principal, action);
+    // Any other agent principal: refused while an event run is open (runs are global)
+    const run = managed ? runView(managed) : this.currentRun();
     if (!run || run.kind !== 'event') return;
     this.deps.audit?.record('agent', action, null, { runId: run.id }, 'denied: event run (maintenance only)');
     throw new ServiceError(
@@ -444,6 +488,11 @@ export class AgentService {
     const row = typeof input.runId === 'string' && input.runId ? this.deps.runRepo.findById(input.runId) : this.deps.runRepo.findRunning();
     if (!row) throw notFound(typeof input.runId === 'string' && input.runId ? 'Run not found' : 'No run in progress (call start_run first)');
     if (row.status !== 'running') throw conflict(`Run ${row.id} is already ${row.status}`);
+    // A managed run is finished by its own runner token (or a human / the system), never by another agent token
+    if (who.kind === 'agent' && row.managed === 1 && row.principal !== who.principal) {
+      this.deps.audit?.record(actor, 'agent.run_finish', row.id, undefined, 'denied: managed run of another token');
+      throw new ServiceError('forbidden', `Run ${row.id} was started by BotLab's runner; only that run's token can finish it`);
+    }
     const done = this.deps.runRepo.finish(row.id, { status, finishedAt: this.iso(), summaryMd: summary })!;
     const view = runView(done);
     const overBudget = this.overRunBudget(view);
@@ -453,7 +502,9 @@ export class AgentService {
       toolCalls: view.toolCalls,
       ...(overBudget ? { overRunBudget: true } : {}),
     });
-    // A managed run is reported by completeManagedRun once its usage is known (cost and duration)
+    // A managed run is reported by completeManagedRun once its usage is known (cost and duration); its runner
+    // token is revoked now, so nothing more can be done with it after finish_run (review finding)
+    this.managedClosed(row);
     if (row.managed !== 1) {
       try {
         this.deps.notify?.agentRunFinished(view, overBudget);
@@ -501,6 +552,7 @@ export class AgentService {
    */
   beforeToolCall(tool: string, by: Actor): string | null {
     const who = requireActor(by, ['agent'], 'agent.toolCall');
+    this.refuseClosedRunnerToken(who.principal, `mcp.${tool}`);
     const limits = this.deps.getLimits()?.agent ?? null;
     const exempt = TOOLS_EXEMPT_FROM_CAP.has(tool);
     const now = this.now();

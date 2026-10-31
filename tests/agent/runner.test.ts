@@ -91,9 +91,16 @@ describe('agent runner', () => {
     expect(DISALLOWED_TOOLS).toContain('Bash');
     expect(opts.permissionMode).toBe('dontAsk');
     expect(opts.allowDangerouslySkipPermissions).toBeUndefined();
+    // The token goes through the environment, never into the --mcp-config command-line JSON
     expect(opts.mcpServers).toEqual({
-      botlab: { type: 'http', url: 'http://127.0.0.1:3780/mcp', headers: { Authorization: 'Bearer blt_secret' }, alwaysLoad: true },
+      botlab: { type: 'http', url: 'http://127.0.0.1:3780/mcp', headers: { Authorization: 'Bearer ${BOTLAB_AGENT_TOKEN}' }, alwaysLoad: true },
     });
+    const { env, abortController: _a, hooks: _h, ...rest } = opts;
+    void _a;
+    void _h;
+    expect(JSON.stringify(rest)).not.toContain('blt_secret');
+    expect(env?.BOTLAB_AGENT_TOKEN).toBe('blt_secret');
+    expect(env?.NO_PROXY?.split(',')).toEqual(expect.arrayContaining(['127.0.0.1', 'localhost']));
     expect(opts).toMatchObject({
       strictMcpConfig: true,
       settingSources: [],

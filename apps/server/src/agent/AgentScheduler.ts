@@ -16,7 +16,7 @@
  * the agent is disabled, `ANTHROPIC_API_KEY` is missing, or the monthly budget is used (notified once a month).
  */
 
-import { fork, type ChildProcess } from 'child_process';
+import { execFile, fork, type ChildProcess } from 'child_process';
 import path from 'path';
 import type { Core } from '../../../../packages/core/src/core';
 import { AGENT_RUN_EVENT, AGENT_TRIGGER_EVENT } from '../../../../packages/core/src/core';
@@ -28,6 +28,7 @@ import type { ServerConfig } from '../../../../packages/core/src/config/serverSc
 import { resolveWorkerEntry } from '../../../../packages/core/src/runtime/workerPath';
 import {
   acceptTrigger,
+  isQuietHours,
   decideEventRun,
   dueScheduledRun,
   nextScheduledRuns,
@@ -45,6 +46,12 @@ const KILL_GRACE_MS = 60_000;
 /** Name of the per-run agent tokens (revoked at startup if a previous server left one active) */
 export const RUNNER_TOKEN_NAME = 'botlab-runner (automatic)';
 const TICK_MS = 30_000;
+/** After the hard kill: close the run even if no exit event ever arrives */
+const FINALIZE_AFTER_KILL_MS = 5_000;
+/** Usage reported by the runner is written to the run at most this often (plus once at the end) */
+const USAGE_PERSIST_MS = 5_000;
+/** After an event run failed to start, retry the queued triggers no sooner than this */
+const EVENT_RETRY_MS = 5 * 60_000;
 const MAX_PENDING_TRIGGERS = 20;
 
 export interface RunnerHandle {
@@ -86,6 +93,9 @@ interface ActiveRun {
   startedAt: number;
   handle: RunnerHandle;
   usage: RunnerUsage | null;
+  /** Usage already written to the run (recordRunUsage adds; only the difference is written) */
+  recorded: { tokensIn: number; tokensOut: number; costUsd: number };
+  lastPersistAt: number;
   done: Extract<RunnerMessage, { type: 'done' }> | null;
   timedOut: boolean;
   stopReason: 'timeout' | 'shutdown' | 'cancelled' | null;
@@ -109,55 +119,87 @@ export interface AgentScheduleStatus {
   activeRun: { runId: string; kind: string; trigger: string; startedAt: string; pid: number | null } | null;
 }
 
-/** The default runner: `node <entry>` with an IPC channel, no shell (Windows-safe); tsx in dev */
-export const forkRunner: SpawnRunner = ({ env, onMessage, onExit, log }) => {
-  const entry = resolveWorkerEntry(path.join(__dirname, '..', '..', '..', 'agent', 'src'), 'main');
-  const child: ChildProcess = fork(entry, [], {
-    execArgv: entry.endsWith('.ts') ? ['--import', 'tsx'] : [],
-    env,
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    serialization: 'json',
-  });
-  const pipe = (stream: NodeJS.ReadableStream | null) => {
-    let buf = '';
-    stream?.setEncoding('utf8');
-    stream?.on('data', (chunk: string) => {
-      buf += chunk;
-      let i: number;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trimEnd();
-        buf = buf.slice(i + 1);
-        if (line) log(line.slice(0, 500));
-      }
-      if (buf.length > 10_000) buf = buf.slice(-10_000);
+/**
+ * Kill a process and everything it started (the SDK's Claude Code child): `taskkill /T /F` on Windows;
+ * elsewhere SIGKILL to the process group (the runner is forked detached, i.e. as a group leader), falling
+ * back to the process itself. SIGKILL because the runner handles SIGTERM (graceful abort).
+ */
+export function killProcessTree(pid: number | undefined, platform: NodeJS.Platform = process.platform): void {
+  if (!pid) return;
+  if (platform === 'win32') {
+    execFile('taskkill', ['/T', '/F', '/PID', String(pid)], { windowsHide: true }, () => undefined);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/**
+ * The runner as a child process: `node <entry>` with an IPC channel, no shell (Windows-safe); tsx in dev.
+ * On macOS / Linux it is its own process group (`detached`), so a hard kill reaches the SDK's Claude Code
+ * child too; on Windows `taskkill /T` kills the tree. `entry` is for tests.
+ */
+export function createForkRunner(entry = resolveWorkerEntry(path.join(__dirname, '..', '..', '..', 'agent', 'src'), 'main')): SpawnRunner {
+  return ({ env, onMessage, onExit, log }) => {
+    const child: ChildProcess = fork(entry, [], {
+      execArgv: entry.endsWith('.ts') ? ['--import', 'tsx'] : [],
+      env,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      serialization: 'json',
+      detached: process.platform !== 'win32',
     });
+    const pipe = (stream: NodeJS.ReadableStream | null) => {
+      let buf = '';
+      stream?.setEncoding('utf8');
+      stream?.on('data', (chunk: string) => {
+        buf += chunk;
+        let i: number;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trimEnd();
+          buf = buf.slice(i + 1);
+          if (line) log(line.slice(0, 500));
+        }
+        if (buf.length > 10_000) buf = buf.slice(-10_000);
+      });
+    };
+    pipe(child.stdout);
+    pipe(child.stderr);
+    child.on('message', (m) => {
+      if (isRunnerMessage(m)) onMessage(m);
+    });
+    let exited = false;
+    const exit = (code: number | null, signal: string | null) => {
+      if (exited) return;
+      exited = true;
+      // Leftovers of the group (a Claude Code child that outlived the runner) go with it
+      if (process.platform !== 'win32') killProcessTree(child.pid);
+      onExit(code, signal);
+    };
+    child.on('exit', (code, signal) => exit(code, signal));
+    child.on('error', (err) => {
+      log(`runner process error: ${err.message}`);
+      if (child.exitCode === null && child.pid === undefined) exit(null, null);
+    });
+    return {
+      pid: child.pid,
+      send: (msg) => {
+        if (child.connected) child.send(msg, () => undefined);
+      },
+      kill: () => {
+        if (!exited) killProcessTree(child.pid);
+      },
+    };
   };
-  pipe(child.stdout);
-  pipe(child.stderr);
-  child.on('message', (m) => {
-    if (isRunnerMessage(m)) onMessage(m);
-  });
-  let exited = false;
-  const exit = (code: number | null, signal: string | null) => {
-    if (exited) return;
-    exited = true;
-    onExit(code, signal);
-  };
-  child.on('exit', (code, signal) => exit(code, signal));
-  child.on('error', (err) => {
-    log(`runner process error: ${err.message}`);
-    if (child.exitCode === null && child.pid === undefined) exit(null, null);
-  });
-  return {
-    pid: child.pid,
-    send: (msg) => {
-      if (child.connected) child.send(msg, () => undefined);
-    },
-    kill: () => {
-      if (child.exitCode === null) child.kill();
-    },
-  };
-};
+}
+
+export const forkRunner: SpawnRunner = (opts) => createForkRunner()(opts);
 
 const SYSTEM = asSystem('agent-scheduler');
 
@@ -215,7 +257,7 @@ export class AgentScheduler {
     const run = this.active;
     if (!run) return;
     this.requestStop(run, 'shutdown');
-    const killTimer = setTimeout(() => run.handle.kill(), Math.max(0, timeoutMs - 2000));
+    const killTimer = setTimeout(() => run.handle?.kill(), Math.max(0, timeoutMs - 2000));
     await Promise.race([run.exited, new Promise((r) => setTimeout(r, timeoutMs))]);
     clearTimeout(killTimer);
     if (this.active === run) this.finalize(run, null, 'shutdown');
@@ -335,6 +377,12 @@ export class AgentScheduler {
   }
 
   private startScheduled(slot: ScheduledSlot): void {
+    // A late slot (e.g. 23:30 still due at 00:10) must not run in the quiet hours
+    if (isQuietHours(this.now(), this.server()?.timezone ?? 'Europe/Dublin')) {
+      this.log(`[Agent] Skipped the ${slot.time} ${slot.kind} run: quiet hours (00:00–07:00)`);
+      this.deps.core.services.audit.record('system', 'agent.run_skipped', null, { slot: slot.key, reason: 'quiet hours' });
+      return;
+    }
     const why = this.unavailableReason();
     if (why) {
       this.log(`[Agent] Skipped the ${slot.time} ${slot.kind} run: ${why}`);
@@ -377,10 +425,21 @@ export class AgentScheduler {
     }
   }
 
+  private eventRetryAfter = 0;
+
   private processPending(): void {
-    if (this.pending.length === 0 || this.stopped) return;
+    if (this.pending.length === 0 || this.stopped || this.now() < this.eventRetryAfter) return;
     const server = this.server();
     if (!server) return;
+    // Queued non-halt triggers do not start a run in the quiet hours (checked again when it would fire)
+    if (isQuietHours(this.now(), server.timezone)) {
+      const late = this.pending.filter((t) => t.kind !== 'bot_halt');
+      if (late.length > 0) {
+        this.pending = this.pending.filter((t) => t.kind === 'bot_halt');
+        this.deps.core.services.audit.record('system', 'agent.event_dropped', null, { triggers: late.map((t) => t.kind), reason: 'quiet hours (00:00–07:00)' });
+      }
+      if (this.pending.length === 0) return;
+    }
     const stats = this.eventStats();
     const decision = decideEventRun({
       nowMs: this.now(),
@@ -399,12 +458,19 @@ export class AgentScheduler {
       this.deps.core.services.audit.record('system', 'agent.event_dropped', null, { triggers: triggers.map((t) => t.kind), reason: decision.why });
       return;
     }
+    const requeue = (why: string) => {
+      // Kept (still subject to the cap and debounce), retried after a pause; the failure is audited
+      this.pending = [...triggers, ...this.pending].slice(-MAX_PENDING_TRIGGERS);
+      this.eventRetryAfter = this.now() + EVENT_RETRY_MS;
+      this.log(`[Agent] Event run not started (${triggers.length} trigger(s) kept): ${why}`);
+      this.deps.core.services.audit.record('system', 'agent.event_failed', null, { triggers: triggers.map((t) => t.kind), reason: why.slice(0, 300) });
+    };
     const why = this.unavailableReason();
-    if (why) {
-      this.log(`[Agent] Event run not started: ${why}`);
-      return;
-    }
-    this.launch('event', 'event', triggers).catch((err) => this.onLaunchError(err, 'event run'));
+    if (why) return requeue(why);
+    this.launch('event', 'event', triggers).catch((err) => {
+      this.onLaunchError(err, 'event run');
+      requeue(err instanceof Error ? err.message : String(err));
+    });
   }
 
   // ── Manual runs ────────────────────────────────────────────────────
@@ -473,6 +539,8 @@ export class AgentScheduler {
       startedAt: this.now(),
       handle: null as unknown as RunnerHandle,
       usage: null,
+      recorded: { tokensIn: 0, tokensOut: 0, costUsd: 0 },
+      lastPersistAt: 0,
       done: null,
       timedOut: false,
       stopReason: null,
@@ -503,6 +571,10 @@ export class AgentScheduler {
         () => {
           run.timedOut = true;
           run.handle.kill();
+          // No exit event (e.g. the kill failed): close the run and revoke the token anyway
+          const fallback = setTimeout(() => resolveExit(this.finalize(run, null, 'SIGKILL')), FINALIZE_AFTER_KILL_MS);
+          fallback.unref?.();
+          run.timers.push(fallback);
         },
         timeoutMs + (this.deps.killGraceMs ?? KILL_GRACE_MS)
       )
@@ -520,6 +592,33 @@ export class AgentScheduler {
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(this.env)) if (v !== undefined && keep.test(k)) env[k] = v;
     return { ...env, ...vars };
+  }
+
+  /** Write the usage not yet recorded on the run (system actor; recordRunUsage adds) */
+  private persistUsage(run: ActiveRun): void {
+    run.lastPersistAt = this.now();
+    const delta = this.usageDelta(run);
+    if (!delta) return;
+    try {
+      this.deps.core.services.agent.recordRunUsage(run.runId, delta, SYSTEM);
+      run.recorded = {
+        tokensIn: run.recorded.tokensIn + delta.tokensIn,
+        tokensOut: run.recorded.tokensOut + delta.tokensOut,
+        costUsd: run.recorded.costUsd + delta.costUsd,
+      };
+    } catch (err) {
+      console.error(`[Agent] could not record usage of run ${run.runId}:`, err);
+    }
+  }
+
+  private usageDelta(run: ActiveRun): { tokensIn: number; tokensOut: number; costUsd: number } | null {
+    if (!run.usage) return null;
+    const d = {
+      tokensIn: Math.max(0, run.usage.tokensIn - run.recorded.tokensIn),
+      tokensOut: Math.max(0, run.usage.tokensOut - run.recorded.tokensOut),
+      costUsd: Math.max(0, run.usage.costUsd - run.recorded.costUsd),
+    };
+    return d.tokensIn > 0 || d.tokensOut > 0 || d.costUsd > 0 ? d : null;
   }
 
   private requestStop(run: ActiveRun, reason: 'timeout' | 'shutdown' | 'cancelled'): void {
@@ -545,6 +644,8 @@ export class AgentScheduler {
               estimated: u.estimated,
             }
           : u;
+        // Written to the run as it goes, so a server crash mid-run keeps the cost reported so far
+        if (this.now() - run.lastPersistAt >= USAGE_PERSIST_MS) this.persistUsage(run);
         this.deps.core.events.emit(AGENT_RUN_EVENT, { phase: 'usage', runId: run.runId, costUsd: run.usage.costUsd });
         break;
       }
@@ -602,7 +703,7 @@ export class AgentScheduler {
       view = core.services.agent.completeManagedRun(
         run.runId,
         {
-          usage: run.usage ? { tokensIn: run.usage.tokensIn, tokensOut: run.usage.tokensOut, costUsd: run.usage.costUsd } : null,
+          usage: this.usageDelta(run),
           status,
           summary: `Run ended without finish_run: ${reason}.`,
         },
