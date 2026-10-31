@@ -33,6 +33,7 @@ import {
   deepEqual,
   isSecretPath,
   redactChange,
+  redactSecrets,
   describeChange,
   type AppConfig,
   type ClassifiedChange,
@@ -62,6 +63,15 @@ const DEFAULT_TEXT: Record<ConfigFileName, string> = {
   server: DEFAULT_SERVER_YAML,
 };
 
+/** Sections that must be present in a reloaded file (a truncated file must not fall back to defaults). */
+const shapeKeys = (schema: unknown): string[] => Object.keys((schema as { shape: Record<string, unknown> }).shape);
+const REQUIRED_SECTIONS: Record<ConfigFileName, readonly string[]> = {
+  limits: shapeKeys(LimitsSchema),
+  mandate: shapeKeys(MandateSchema).filter((k) => k !== 'notes'),
+  fees: shapeKeys(FeesSchema),
+  server: [],
+};
+
 export type ConfigSource = 'initial' | 'file' | 'write' | 'restore';
 
 export interface ConfigChangedEvent {
@@ -74,6 +84,11 @@ export interface ConfigChangedEvent {
   raises: ClassifiedChange[];
   actor: AuditActor;
   source: ConfigSource;
+  /**
+   * The first valid config after an invalid start: `before` is the built-in defaults and `changes`
+   * the differences from them (informational, not classified as a raise).
+   */
+  firstValid?: boolean;
 }
 
 export interface ConfigInvalidEvent {
@@ -87,6 +102,10 @@ export interface ConfigServiceOptions {
   /** Where snapshots are kept; without it history/restore are unavailable */
   historyDir?: string;
   debounceMs?: number;
+}
+
+function defaultConfig(): AppConfig {
+  return { limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}), fees: FeesSchema.parse({}), server: ServerSchema.parse({}) };
 }
 
 export type Unsubscribe = () => void;
@@ -207,8 +226,9 @@ export class ConfigService {
       this.snapshot(texts, 'system', 'initial', CONFIG_FILE_NAMES);
       return config;
     } catch (err) {
-      this.lastError = { error: err instanceof Error ? err.message : String(err), issues: err instanceof ConfigError ? err.issues : [] };
-      throw err;
+      const scrubbed = this.scrubError(err);
+      this.lastError = { error: scrubbed.message, issues: scrubbed instanceof ConfigError ? scrubbed.issues : [] };
+      throw scrubbed;
     }
   }
 
@@ -222,6 +242,8 @@ export class ConfigService {
         depth: 0,
         persistent: true,
         // Only the config files we own; editor temp/swap files are noise
+        // Wait for editors that write in several steps (partial/truncated content is never read)
+        awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 50 },
         ignored: (p, stats) => !!stats?.isFile() && !Object.values(FILE_NAMES).includes(path.basename(p)),
       });
       const schedule = () => this.scheduleReload();
@@ -260,16 +282,18 @@ export class ConfigService {
    * Re-read all files. Returns the applied event, or null when nothing changed or the files are
    * invalid (previous config kept).
    */
-  reload(source: ConfigSource = 'file', actor: AuditActor = 'human'): Promise<ConfigChangedEvent | null> {
+  reload(source: ConfigSource = 'file', actor: AuditActor = 'system'): Promise<ConfigChangedEvent | null> {
     return this.exclusive(async () => this.reloadLocked(source, actor));
   }
 
-  private reloadLocked(source: ConfigSource, actor: AuditActor, extra: Record<string, unknown> = {}): ConfigChangedEvent | null {
+  /** `strict`: a rejected reload throws (write/restore must not report success for a config that was not applied). */
+  private reloadLocked(source: ConfigSource, actor: AuditActor, extra: Record<string, unknown> = {}, strict = false): ConfigChangedEvent | null {
     let read: ReturnType<ConfigService['readAll']>;
     try {
       read = this.readAll(false);
     } catch (err) {
-      this.reportInvalid(err);
+      const scrubbed = this.reportInvalid(err);
+      if (strict) throw scrubbed;
       return null;
     }
     this.lastError = null;
@@ -283,9 +307,10 @@ export class ConfigService {
     this.snapshot(texts, actor, source, changed);
 
     if (!before) {
-      // First valid config after an invalid start
-      this.audit?.record('system', 'config.load', this.configDir, { files: Object.values(FILE_NAMES), source }, 'ok');
-      return this.notifyChanged({ before: config, after: config, changes: [], raises: [], actor, source }, extra, true);
+      // First valid config after an invalid start: report the differences from the defaults
+      const defaults = defaultConfig();
+      const changes = classifyChange(defaults, config).map(redactChange);
+      return this.notifyChanged({ before: defaults, after: config, changes, raises: [], actor, source, firstValid: true }, { ...extra, firstValidAfterInvalidStart: true, vsDefaults: true }, false);
     }
     const changes = classifyChange(before, config).map(redactChange);
     if (changes.length === 0) return null; // comment/whitespace edit, or our own write seen again
@@ -317,11 +342,13 @@ export class ConfigService {
     return event;
   }
 
-  private reportInvalid(err: unknown): void {
-    const error = err instanceof Error ? err.message : String(err);
-    const issues = err instanceof ConfigError ? err.issues : [];
+  /** Records and publishes a rejected config; returns the scrubbed error. */
+  private reportInvalid(err: unknown): Error {
+    const scrubbed = this.scrubError(err);
+    const error = scrubbed.message;
+    const issues = scrubbed instanceof ConfigError ? scrubbed.issues : [];
     this.lastError = { error, issues };
-    if (error === this.lastReportedError) return; // same broken state seen again (editor re-saves)
+    if (error === this.lastReportedError) return scrubbed; // same broken state seen again (editor re-saves)
     this.lastReportedError = error;
     logger.error(`[Config] Edit rejected, previous config stays active: ${error}`);
     this.audit?.record('system', 'config.invalid', this.configDir, { error, issues }, 'rejected');
@@ -332,10 +359,27 @@ export class ConfigService {
         logger.error(`[Config] Subscriber failed: ${e instanceof Error ? e.message : e}`);
       }
     }
+    return scrubbed;
+  }
+
+  private secrets(): string[] {
+    return [this.current?.server.notify.telegram.bot_token ?? '', process.env.TELEGRAM_BOT_TOKEN ?? ''];
+  }
+
+  /** Remove bot tokens from text that may be logged, audited, sent over IPC or to Telegram. */
+  private scrub(text: string): string {
+    return redactSecrets(text, this.secrets());
+  }
+
+  private scrubError(err: unknown): Error {
+    if (err instanceof ConfigError) {
+      return new ConfigError(this.scrub(err.message), err.file, err.issues.map((i) => this.scrub(i)));
+    }
+    return new Error(this.scrub(err instanceof Error ? err.message : String(err)));
   }
 
   /** Read, parse and validate every file plus cross-file rules. Throws one ConfigError listing all problems. */
-  private readAll(create: boolean): { config: AppConfig; texts: Record<ConfigFileName, string> } {
+  private readAll(create: boolean, override?: { file: ConfigFileName; text: string }): { config: AppConfig; texts: Record<ConfigFileName, string> } {
     const texts = {} as Record<ConfigFileName, string>;
     const parsed: Partial<Record<ConfigFileName, unknown>> = {};
     const issues: string[] = [];
@@ -348,8 +392,8 @@ export class ConfigService {
           fs.writeFileSync(file, DEFAULT_TEXT[f], 'utf8');
           logger.info(`[Config] Created ${file} with defaults`);
         }
-        texts[f] = fs.readFileSync(file, 'utf8');
-        parsed[f] = parseConfigYaml(SCHEMAS[f], texts[f], file);
+        texts[f] = override && override.file === f ? override.text : fs.readFileSync(file, 'utf8');
+        parsed[f] = parseConfigYaml(SCHEMAS[f], texts[f], file, create ? {} : { strict: true, requiredSections: REQUIRED_SECTIONS[f] });
       } catch (err) {
         if (err instanceof ConfigError) issues.push(...err.issues.map((i) => `${FILE_NAMES[f]}: ${i}`));
         else issues.push(`${FILE_NAMES[f]}: ${err instanceof Error ? err.message : String(err)}`);
@@ -358,7 +402,10 @@ export class ConfigService {
     if (issues.length === 0) {
       issues.push(...validateCrossFile(parsed.limits as AppConfig['limits'], parsed.mandate as AppConfig['mandate']));
     }
-    if (issues.length > 0) throw new ConfigError(`Invalid config in ${this.configDir}:\n  ${issues.join('\n  ')}`, null, issues);
+    if (issues.length > 0) {
+      const clean = issues.map((i) => this.scrub(i));
+      throw new ConfigError(`Invalid config in ${this.configDir}:\n  ${clean.join('\n  ')}`, null, clean);
+    }
     return { config: parsed as unknown as AppConfig, texts };
   }
 
@@ -380,11 +427,23 @@ export class ConfigService {
    * atomically (comments kept where possible) and apply it. Throws ConfigError when invalid.
    * Only a human may write config (it is never writable by the agent).
    */
-  write(file: ConfigFileName, newValue: unknown, actor: AuditActor): Promise<ConfigChangedEvent | null> {
+  write(file: ConfigFileName, newValue: unknown, actor: AuditActor, expectedSha256?: string): Promise<ConfigChangedEvent | null> {
     return this.exclusive(async () => {
       this.assertHuman(actor, 'config.write', file);
       if (!CONFIG_FILE_NAMES.includes(file)) throw new Error(`Unknown config file: ${String(file)}`);
       const current = this.requireConfig();
+
+      if (expectedSha256 !== undefined) {
+        let onDisk = '';
+        try {
+          onDisk = fs.readFileSync(this.filePath(file), 'utf8');
+        } catch {
+          /* missing file: hash mismatch below */
+        }
+        if (sha256(onDisk) !== expectedSha256) {
+          throw new Error(`${FILE_NAMES[file]} changed on disk since it was loaded; reload it and apply your edit again`);
+        }
+      }
 
       const unmasked = this.unmask(file, newValue, current);
       const result = SCHEMAS[file].safeParse(unmasked);
@@ -407,8 +466,13 @@ export class ConfigService {
       const reparsed = parseConfigYaml(SCHEMAS[file], text, FILE_NAMES[file]);
       if (!deepEqual(reparsed, result.data)) throw new Error(`Internal error: rendered ${FILE_NAMES[file]} does not match the validated value`);
 
+      // Everything on disk (the other files too) plus this text must be valid before anything is written
+      this.readAll(false, { file, text });
+
       await writeFileAtomic(this.filePath(file), text);
-      return this.reloadLocked('write', actor);
+      return this.reloadLocked('write', actor, {}, true);
+    }).catch((err) => {
+      throw this.scrubError(err);
     });
   }
 
@@ -427,14 +491,23 @@ export class ConfigService {
       if (text === null) throw new Error(`Unknown version ${versionId} of ${FILE_NAMES[file]}`);
 
       const current = this.requireConfig();
-      const value = parseConfigYaml(SCHEMAS[file], text, `${FILE_NAMES[file]}@${versionId}`);
+      const value = parseConfigYaml(SCHEMAS[file], text, `${FILE_NAMES[file]}@${versionId}`, { strict: true, requiredSections: REQUIRED_SECTIONS[file] });
       const candidate = { ...current, [file]: value } as AppConfig;
       const cross = validateCrossFile(candidate.limits, candidate.mandate);
       if (cross.length > 0) throw new ConfigError(`Version ${versionId} is inconsistent with the other files:\n  ${cross.join('\n  ')}`, null, cross);
 
+      this.readAll(false, { file, text });
+
       await writeFileAtomic(this.filePath(file), text);
-      return this.reloadLocked('restore', actor, { restoredFrom: versionId });
+      return this.reloadLocked('restore', actor, { restoredFrom: versionId }, true);
+    }).catch((err) => {
+      throw this.scrubError(err);
     });
+  }
+
+  /** sha256 of each file's text as last loaded (the UI sends it back to `write` to detect concurrent edits). */
+  getFileHashes(): Partial<Record<ConfigFileName, string>> {
+    return { ...this.hashes };
   }
 
   private assertHuman(actor: AuditActor, action: string, file: string): void {

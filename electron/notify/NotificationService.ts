@@ -29,7 +29,7 @@ import { describeChange } from '../config/changes';
 import type { LimitsConfig } from '../config/schema';
 import type { ServerConfig } from '../config/serverSchema';
 import type { OrderEventSink, OrderFillEvent, OrderRejectedEvent } from './events';
-import type { IncomingUpdate, TelegramNotifier } from './TelegramNotifier';
+import { telegramSettingsFrom, type IncomingUpdate, type TelegramNotifier, type TelegramSettings } from './TelegramNotifier';
 import logger from '../../src/utils/logger';
 
 export const FILL_BATCH_MS = 5 * 60_000;
@@ -135,7 +135,7 @@ export class NotificationService implements OrderEventSink {
     }
   }
 
-  private send(text: string, opts: { priority?: 'high' | 'normal'; keepSeparate?: boolean; buttons?: Array<Array<{ text: string; callbackData: string }>> } = {}): void {
+  private send(text: string, opts: { priority?: 'high' | 'normal'; keepSeparate?: boolean; via?: TelegramSettings; buttons?: Array<Array<{ text: string; callbackData: string }>> } = {}): void {
     this.deps.notifier.send({ text, ...opts });
   }
 
@@ -175,10 +175,24 @@ export class NotificationService implements OrderEventSink {
   }
 
   private onConfigChanged(e: ConfigChangedEvent): void {
+    if (e.firstValid) {
+      const lines = e.changes.slice(0, MAX_LINES).map(describeChange);
+      if (e.changes.length > MAX_LINES) lines.push(`…and ${e.changes.length - MAX_LINES} more`);
+      this.send(
+        `Config is now valid and loaded (after an invalid start). ${e.changes.length === 0 ? 'It equals the defaults.' : `Differences from the defaults:\n${lines.join('\n')}`}`,
+        { priority: 'high' }
+      );
+      return;
+    }
     if (e.raises.length === 0) return; // lowering / neutral changes are silent (spec §3)
     const lines = e.raises.slice(0, MAX_LINES).map(describeChange);
     if (e.raises.length > MAX_LINES) lines.push(`…and ${e.raises.length - MAX_LINES} more`);
-    this.send(`Risk limits raised (in effect now, by ${e.actor}, via ${e.source}):\n${lines.join('\n')}`, { priority: 'high' });
+    // Use the Telegram settings from before the edit: the same edit may disable Telegram or move the chat,
+    // and the old chat must still hear about it
+    this.send(`Risk limits raised (in effect now, by ${e.actor}, via ${e.source}):\n${lines.join('\n')}`, {
+      priority: 'high',
+      via: telegramSettingsFrom(e.before.server),
+    });
   }
 
   private onConfigInvalid(e: ConfigInvalidEvent): void {
@@ -435,15 +449,31 @@ export class NotificationService implements OrderEventSink {
     await this.deps.notifier.answerCallback(callbackId);
   }
 
-  /** Resolve a bot by id, exact name or unique name fragment. */
+  /**
+   * Resolve a bot: exact id; else exact name (non-retired; several ⇒ ask for the id); else a unique
+   * name fragment among non-retired bots (several ⇒ the single running one, else ask for the id).
+   */
   private findBot(query: string): { bot?: { id: string; name: string }; error?: string } {
     const bots = this.deps.botRepo.findAll();
     const q = query.trim().toLowerCase();
-    const exact = bots.find((b) => b.id === query.trim()) ?? bots.find((b) => b.name.toLowerCase() === q);
-    if (exact) return { bot: exact };
-    const partial = bots.filter((b) => b.name.toLowerCase().includes(q));
+    const byId = bots.find((b) => b.id === query.trim());
+    if (byId) return { bot: byId };
+
+    const live = bots.filter((b) => b.stage !== 'retired');
+    const describe = (list: typeof bots) =>
+      list.slice(0, 8).map((b) => `${b.name} [${b.stage}] ${this.deps.isRunning(b.id) ? 'running' : 'stopped'} id ${b.id}`).join('\n');
+
+    const exact = live.filter((b) => b.name.toLowerCase() === q);
+    if (exact.length === 1) return { bot: exact[0] };
+    if (exact.length > 1) return { error: `Several bots are named "${query}". Use the id:\n${describe(exact)}` };
+
+    const partial = live.filter((b) => b.name.toLowerCase().includes(q));
     if (partial.length === 1) return { bot: partial[0] };
-    if (partial.length > 1) return { error: `Several bots match "${query}": ${partial.slice(0, 8).map((b) => b.name).join(', ')}. Be more specific.` };
+    if (partial.length > 1) {
+      const running = partial.filter((b) => this.deps.isRunning(b.id));
+      if (running.length === 1) return { bot: running[0] };
+      return { error: `Several bots match "${query}". Use the id:\n${describe(partial)}` };
+    }
     return { error: `No bot matches "${query}".` };
   }
 

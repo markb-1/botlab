@@ -47,7 +47,9 @@ describe('classifyChange', () => {
     ['notes only', (c) => (c.mandate.notes = 'hello'), 'neutral'],
     ['lower assumed fee', (c) => (c.fees.taker_rates.weather = 0.01), 'raises'],
     ['higher assumed fee', (c) => (c.fees.taker_rates.weather = 0.09), 'lowers'],
-    ['server.yaml changes', (c) => ((c.server.timezone = 'UTC'), (c.server.notify.telegram.enabled = true)), 'neutral'],
+    ['server.yaml timezone and enabling Telegram', (c) => ((c.server.timezone = 'UTC'), (c.server.notify.telegram.enabled = true)), 'neutral'],
+    ['changing the Telegram chat id', (c) => (c.server.notify.telegram.chat_id = '9'), 'raises'],
+    ['changing the Telegram token', (c) => (c.server.notify.telegram.bot_token = 'x'), 'raises'],
   ];
 
   it.each(table)('%s', (_name, fn, expected) => {
@@ -80,6 +82,11 @@ describe('classifyChange', () => {
     expect(diffConfig(base(), base())).toEqual([]);
     const [c] = classifyChange(base(), edit((x) => (x.limits.global.max_open_orders = 80)));
     expect(c).toMatchObject({ file: 'limits', path: 'global.max_open_orders', old: 50, new: 80, effect: 'raises' });
+  });
+
+  it('disabling Telegram (from enabled) raises', () => {
+    const on = edit((c) => (c.server.notify.telegram.enabled = true));
+    expect(overallEffect(classifyChange(on, base()))).toBe('raises');
   });
 
   it('redacts the Telegram token', () => {

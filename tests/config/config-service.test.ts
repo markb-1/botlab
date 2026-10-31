@@ -11,6 +11,7 @@ vi.mock('../../src/utils/logger', () => ({
 import { ConfigService, renderYaml, type ConfigChangedEvent } from '../../electron/config/ConfigService';
 import { RiskEngine } from '../../electron/risk/RiskEngine';
 import { DEFAULT_LIMITS_YAML, ConfigError } from '../../electron/config';
+import { sha256 } from '../../electron/config/history';
 
 interface AuditCall {
   actor: string;
@@ -105,7 +106,7 @@ describe('ConfigService reload', () => {
     expect(events[0].raises.map((c) => c.path)).toEqual(['global.max_open_orders']);
 
     const audited = calls.find((c) => c.action === 'config.changed')!;
-    expect(audited.actor).toBe('human');
+    expect(audited.actor).toBe('system'); // detected from the file, not an authenticated write
     expect(audited.target).toBe('limits');
     expect(audited.payload.files.limits).toEqual([{ path: 'global.max_open_orders', old: 50, new: 80, effect: 'raises' }]);
     expect(audited.result).toBe('raises risk');
@@ -238,6 +239,115 @@ describe('ConfigService write / history / restore', () => {
     await s.write('server', fromUi, 'human');
     expect(s.getConfig()!.server.notify.telegram.bot_token).toBe('123:SECRET');
     expect(s.getConfig()!.server.timezone).toBe('UTC');
+  });
+});
+
+describe('ConfigService hot-reload hardening', () => {
+  const serverPath = () => path.join(dir, 'config', 'server.yaml');
+
+  it('an empty, whitespace-only, comment-only or truncated file never resets settings to defaults', async () => {
+    const s = service();
+    const cfg = s.load();
+    const tight = structuredClone(cfg.limits);
+    tight.global.max_open_orders = 20;
+    await s.write('limits', tight, 'human');
+    expect(s.getConfig()!.limits.global.max_open_orders).toBe(20);
+
+    for (const bad of ['', '   \n\n', '# just a comment\n', 'global:\n  max_open_orders: 20\n']) {
+      fs.writeFileSync(limitsPath(), bad);
+      expect(await s.reload()).toBeNull();
+      expect(s.getConfig()!.limits.global.max_open_orders).toBe(20);
+      expect(s.getLastError()).toMatch(/empty|missing section/);
+    }
+    // the same for mandate (sections required) and fees
+    fs.writeFileSync(limitsPath(), fs.readFileSync(path.join(dir, 'history', 'limits', s.history('limits')[0].versionId + '.yaml'), 'utf8'));
+    fs.writeFileSync(path.join(dir, 'config', 'mandate.yaml'), 'budget_usd: 10\n');
+    expect(await s.reload()).toBeNull();
+    expect(s.getConfig()!.mandate.budget_usd).toBe(300);
+    fs.writeFileSync(path.join(dir, 'config', 'fees.yaml'), '');
+    expect(await s.reload()).toBeNull();
+    expect(s.getConfig()!.fees.taker_rates.weather).toBe(0.05);
+  });
+
+  it('YAML and validation errors never carry the bot token (message, issues, audit, last error, subscribers)', async () => {
+    const s = service();
+    const cfg = s.load();
+    const server = structuredClone(cfg.server);
+    server.notify.telegram.bot_token = 'plainSecretTok';
+    await s.write('server', server, 'human');
+    const seen: string[] = [];
+    s.onInvalid((e) => seen.push(e.error, ...e.issues));
+
+    // syntax error on a line after the token, and a token-shaped value in a bad field
+    fs.writeFileSync(
+      serverPath(),
+      'timezone: Mars/Base\nnotify:\n  telegram:\n    bot_token: plainSecretTok\n    chat_id: [unclosed\n'
+    );
+    await s.reload();
+    fs.writeFileSync(
+      serverPath(),
+      'timezone: 123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nnotify:\n  telegram:\n    bot_token: plainSecretTok\n    enabled: nope\n'
+    );
+    await s.reload();
+
+    const all = JSON.stringify([calls, seen, s.getLastError()]);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(all).not.toContain('plainSecretTok');
+    expect(all).not.toContain('AAAAAAAAAAAA');
+    // writes throw scrubbed errors as well
+    const bad = structuredClone(s.getConfig()!.server);
+    bad.timezone = 'plainSecretTok';
+    await expect(s.write('server', bad, 'human')).rejects.not.toThrow(/plainSecretTok/);
+  });
+
+  it('write refuses when the file changed on disk since the UI loaded it', async () => {
+    const s = service();
+    const cfg = s.load();
+    const hash = s.getFileHashes().limits!;
+    const next = structuredClone(cfg.limits);
+    next.global.max_open_orders = 40;
+
+    edit('max_open_orders: 50', 'max_open_orders: 55'); // someone edits the file by hand
+    await expect(s.write('limits', next, 'human', hash)).rejects.toThrow(/changed on disk/);
+    expect(fs.readFileSync(limitsPath(), 'utf8')).toContain('max_open_orders: 55');
+
+    await s.reload();
+    await s.write('limits', next, 'human', s.getFileHashes().limits);
+    expect(s.getConfig()!.limits.global.max_open_orders).toBe(40);
+    expect(sha256(fs.readFileSync(limitsPath(), 'utf8'))).toBe(s.getFileHashes().limits);
+  });
+
+  it('write and restore report an error (and write nothing) when another file on disk is invalid', async () => {
+    const s = service();
+    const cfg = s.load();
+    const oldVersion = s.history('limits')[0].versionId;
+    fs.writeFileSync(path.join(dir, 'config', 'mandate.yaml'), 'budget_usd: -1\n');
+    const before = fs.readFileSync(limitsPath(), 'utf8');
+
+    const next = structuredClone(cfg.limits);
+    next.global.max_open_orders = 40;
+    await expect(s.write('limits', next, 'human')).rejects.toThrow(/mandate/);
+    await expect(s.restore('limits', oldVersion, 'human')).rejects.toThrow(/mandate/);
+    expect(fs.readFileSync(limitsPath(), 'utf8')).toBe(before);
+    expect(s.getConfig()!.limits.global.max_open_orders).toBe(50);
+  });
+
+  it('the first valid config after an invalid start is published with its differences from the defaults', async () => {
+    fs.mkdirSync(path.join(dir, 'config'));
+    fs.writeFileSync(limitsPath(), 'nonsense: [');
+    const s = service();
+    expect(() => s.load()).toThrow();
+    const events: ConfigChangedEvent[] = [];
+    s.onChange((e) => events.push(e));
+    const tight = DEFAULT_LIMITS_YAML.replace('max_open_orders: 50', 'max_open_orders: 7');
+    fs.writeFileSync(limitsPath(), tight);
+    await s.reload();
+    expect(events).toHaveLength(1);
+    expect(events[0].firstValid).toBe(true);
+    expect(events[0].changes.filter((c) => c.file === 'limits').map((c) => [c.path, c.new])).toEqual([['global.max_open_orders', 7]]);
+    const audited = calls.find((c) => c.action === 'config.changed')!;
+    expect(audited.payload.vsDefaults).toBe(true);
+    expect(audited.payload.files.limits[0].path).toBe('global.max_open_orders');
   });
 });
 

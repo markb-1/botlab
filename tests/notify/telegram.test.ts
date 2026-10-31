@@ -40,7 +40,7 @@ function fakeTelegram() {
 
 const msg = (text: string, chat: number | string = ADMIN, id = 1) => ({
   update_id: id,
-  message: { text, date: Math.floor(Date.now() / 1000), chat: { id: chat } },
+  message: { text, date: Math.floor(Date.now() / 1000), chat: { id: chat }, from: { id: chat } },
 });
 
 function setup(overrides: Partial<ConstructorParameters<typeof NotificationService>[0]> = {}, s = settings) {
@@ -87,7 +87,7 @@ describe('Telegram commands', () => {
     tg.pushUpdates([
       msg('/halt now', '999', 1),
       msg('/pause Weather Bot', '999', 2),
-      { update_id: 3, callback_query: { id: 'cb', data: 'pause:b1', message: { chat: { id: 999 } } } },
+      { update_id: 3, callback_query: { id: 'cb', data: 'pause:b1', from: { id: 999 }, message: { chat: { id: 999 } } } },
     ]);
     await notifier.pollOnce(0);
     await notifier.flush();
@@ -95,6 +95,20 @@ describe('Telegram commands', () => {
     expect(killSwitch.activate).not.toHaveBeenCalled();
     expect(stopBot).not.toHaveBeenCalled();
     expect(tg.messages()).toEqual([]);
+  });
+
+  it('ignores another sender in the admin chat (group), forwarded messages, and button presses by other users', async () => {
+    const { tg, notifier, killSwitch, stopBot, updates } = setup();
+    const inGroup = { update_id: 1, message: { text: '/halt', date: Math.floor(Date.now() / 1000), chat: { id: Number(ADMIN) }, from: { id: 777 } } };
+    const forwarded = { update_id: 2, message: { ...msg('/halt', ADMIN, 2).message, forward_origin: { type: 'user' } } };
+    const oldForward = { update_id: 3, message: { ...msg('/halt', ADMIN, 3).message, forward_from: { id: 5 } } };
+    const otherPress = { update_id: 4, callback_query: { id: 'c', data: 'pause:b1', from: { id: 777 }, message: { chat: { id: Number(ADMIN) } } } };
+    tg.pushUpdates([inGroup, forwarded, oldForward, otherPress]);
+    await notifier.pollOnce(0);
+    await notifier.flush();
+    expect(updates).toHaveLength(0);
+    expect(killSwitch.activate).not.toHaveBeenCalled();
+    expect(stopBot).not.toHaveBeenCalled();
   });
 
   it('/halt from the admin chat activates the kill switch as human and replies', async () => {
@@ -120,7 +134,7 @@ describe('Telegram commands', () => {
 
   it('/pause stops a running bot by name or id; the inline button does the same', async () => {
     const { tg, notifier, stopBot } = setup();
-    tg.pushUpdates([msg('/pause weather', ADMIN, 1), { update_id: 2, callback_query: { id: 'cb1', data: 'pause:b1', message: { chat: { id: Number(ADMIN) } } } }]);
+    tg.pushUpdates([msg('/pause weather', ADMIN, 1), { update_id: 2, callback_query: { id: 'cb1', data: 'pause:b1', from: { id: Number(ADMIN) }, message: { chat: { id: Number(ADMIN) } } } }]);
     await notifier.pollOnce(0);
     await notifier.flush();
     expect(stopBot).toHaveBeenCalledTimes(2);
@@ -136,6 +150,27 @@ describe('Telegram commands', () => {
     expect(stopBot).not.toHaveBeenCalled();
     expect(tg.messages().join('\n')).toMatch(/not running/);
     expect(tg.messages().join('\n')).toMatch(/No bot matches/);
+  });
+
+  it('/pause with duplicate names asks for the id; retired bots are ignored by name', async () => {
+    const bots = [
+      { id: 'a1', name: 'Twin', stage: 'full', mode: 'live' },
+      { id: 'a2', name: 'Twin', stage: 'paper', mode: 'paper' },
+      { id: 'r1', name: 'Old Weather', stage: 'retired', mode: 'live' },
+      { id: 'w1', name: 'Weather One', stage: 'full', mode: 'live' },
+      { id: 'w2', name: 'Weather Two', stage: 'full', mode: 'live' },
+    ];
+    const { tg, notifier, stopBot } = setup({
+      botRepo: { findAll: () => bots, findById: (id: string) => bots.find((b) => b.id === id) } as never,
+      isRunning: (id) => id === 'a1' || id === 'r1' || id === 'w2',
+    });
+    tg.pushUpdates([msg('/pause twin', ADMIN, 1), msg('/pause old weather', ADMIN, 2), msg('/pause weather', ADMIN, 3), msg('/pause a1', ADMIN, 4)]);
+    await notifier.pollOnce(0);
+    await notifier.flush();
+    const m = tg.messages();
+    expect(m[0]).toMatch(/Several bots are named "twin"[\s\S]*id a1[\s\S]*id a2/);
+    expect(m[1]).toMatch(/No bot matches/); // retired is not matched by name
+    expect(stopBot.mock.calls).toEqual([['w2', 'human'], ['a1', 'human']]); // 'weather': the one running bot; then explicit id
   });
 
   it('/status, /bots and /help answer; /run and /code are unknown', async () => {
@@ -255,6 +290,57 @@ describe('Telegram notifications', () => {
     const server = { notify: { telegram: { enabled: true, bot_token: 'file', chat_id: '1' } } };
     expect(telegramSettingsFrom(server, { TELEGRAM_BOT_TOKEN: 'env' } as never).token).toBe('env');
     expect(telegramSettingsFrom(server, {} as never).token).toBe('file');
+  });
+});
+
+describe('config alerts and transport details', () => {
+  it('a risk-raising edit that also disables Telegram still alerts the old chat', async () => {
+    const { classifyChange } = await import('../../electron/config');
+    const { LimitsSchema, MandateSchema, ServerSchema } = await import('../../electron/config');
+    const { FeesSchema } = await import('../../electron/orders/FeeService');
+    const base = () => ({ limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}), fees: FeesSchema.parse({}), server: ServerSchema.parse({}) });
+    const before = base();
+    before.server.notify.telegram = { enabled: true, bot_token: 'OLDTOKEN-1234', chat_id: '111' };
+    const after = structuredClone(before);
+    after.server.notify.telegram = { enabled: false, bot_token: 'OLDTOKEN-1234', chat_id: '111' };
+    after.limits.per_bot_defaults.max_order_usd = 30;
+
+    // The notifier's live settings are already the NEW ones (disabled)
+    const { tg, notifier, service } = setup({}, { enabled: false, token: 'OLDTOKEN-1234', chatId: '111' });
+    let listener: ((e: any) => void) | undefined;
+    service.attachConfig({ onChange: (l: any) => ((listener = l), () => undefined), onInvalid: () => () => undefined });
+    const changes = classifyChange(before, after);
+    listener!({ before, after, changes, raises: changes.filter((c) => c.effect === 'raises'), actor: 'human', source: 'write' });
+    await notifier.flush();
+
+    const sent = tg.sent.filter((s) => s.method === 'sendMessage');
+    expect(sent).toHaveLength(1);
+    expect(sent[0].body.chat_id).toBe('111');
+    expect(sent[0].body.text).toMatch(/Risk limits raised[\s\S]*max_order_usd: 25 → 30/);
+    expect(sent[0].body.text).toMatch(/notify\.telegram\.enabled: true → false/);
+  });
+
+  it('announces the first valid config after an invalid start', async () => {
+    const { tg, notifier, service } = setup();
+    let listener: ((e: any) => void) | undefined;
+    service.attachConfig({ onChange: (l: any) => ((listener = l), () => undefined), onInvalid: () => () => undefined });
+    listener!({ before: {}, after: {}, changes: [{ file: 'limits', path: 'global.max_open_orders', old: 50, new: 7, effect: 'lowers' }], raises: [], actor: 'system', source: 'file', firstValid: true });
+    await notifier.flush();
+    expect(tg.messages()[0]).toMatch(/now valid and loaded[\s\S]*max_open_orders: 50 → 7/);
+  });
+
+  it('resets the update offset when the token changes', async () => {
+    let s = settings;
+    const tg = fakeTelegram();
+    const notifier = new TelegramNotifier({ getSettings: () => s, fetchImpl: tg.fetchImpl, minIntervalMs: 0 });
+    tg.pushUpdates([msg('/help', ADMIN, 50)]);
+    await notifier.pollOnce(0);
+    await notifier.pollOnce(0);
+    s = { ...settings, token: 'OTHERTOKEN' };
+    await notifier.pollOnce(0);
+    const polls = tg.sent.filter((x) => x.method === 'getUpdates');
+    expect(polls[1].body.offset).toBe(51);
+    expect(polls[2].body.offset).toBeUndefined();
   });
 });
 

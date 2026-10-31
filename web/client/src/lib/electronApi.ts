@@ -313,8 +313,8 @@ export const configApi = {
     throw new Error('Not in Electron environment');
   },
 
-  write: async (file: 'limits' | 'mandate' | 'fees' | 'server', value: unknown) => {
-    if (isElectron) return unwrapResponse(await window.electronAPI.config.write(file, value));
+  write: async (file: 'limits' | 'mandate' | 'fees' | 'server', value: unknown, expectedSha256?: string) => {
+    if (isElectron) return unwrapResponse(await window.electronAPI.config.write(file, value, expectedSha256));
     throw new Error('Not in Electron environment');
   },
 

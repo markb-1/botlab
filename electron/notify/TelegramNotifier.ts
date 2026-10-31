@@ -31,6 +31,8 @@ export interface OutgoingMessage {
   priority?: 'high' | 'normal';
   /** Never merged with other messages (replies, messages with buttons) */
   keepSeparate?: boolean;
+  /** Send with these settings instead of the live ones (e.g. an alert about a change that turns Telegram off or moves the chat) */
+  via?: TelegramSettings;
 }
 
 export interface IncomingMessage {
@@ -81,6 +83,7 @@ export class TelegramNotifier {
   private running = false;
   private pollAbort: AbortController | null = null;
   private offset: number | null = null;
+  private offsetToken: string | null = null;
   private pollLoop: Promise<void> | null = null;
   private wake: (() => void) | null = null;
   private nextAllowedAt = 0;
@@ -113,7 +116,8 @@ export class TelegramNotifier {
   /** Queue a message. Never throws, never waits for the network. */
   send(message: OutgoingMessage): void {
     try {
-      if (!this.settings()) return;
+      const usable = message.via ?? this.settings();
+      if (!usable || !usable.enabled || !usable.token || !usable.chatId) return;
       const q: Queued = { ...message, attempts: 0 };
       if (message.priority === 'high') {
         const firstNormal = this.queue.findIndex((m) => m.priority !== 'high');
@@ -166,12 +170,12 @@ export class TelegramNotifier {
   private takeNext(): Queued | null {
     const first = this.queue.shift();
     if (!first) return null;
-    if (first.keepSeparate || first.buttons || first.priority === 'high') return first;
+    if (first.keepSeparate || first.buttons || first.via || first.priority === 'high') return first;
     // Coalesce following plain normal-priority messages into one
     let text = first.text;
     while (this.queue.length > 0) {
       const next = this.queue[0];
-      if (next.keepSeparate || next.buttons || next.priority === 'high' || text.length + next.text.length + 2 > MAX_TEXT) break;
+      if (next.keepSeparate || next.buttons || next.via || next.priority === 'high' || text.length + next.text.length + 2 > MAX_TEXT) break;
       text += `\n\n${next.text}`;
       this.queue.shift();
     }
@@ -182,13 +186,10 @@ export class TelegramNotifier {
     if (this.sending) return;
     this.sending = true;
     try {
-      const settings = this.settings();
       const item = this.takeNext();
       if (!item) return;
-      if (!settings) {
-        this.queue = []; // disabled meanwhile
-        return;
-      }
+      const settings = item.via ?? this.settings();
+      if (!settings) return; // disabled meanwhile: drop this item
       this.lastSentAt = this.now();
       try {
         await this.call(settings, 'sendMessage', {
@@ -201,7 +202,7 @@ export class TelegramNotifier {
         });
       } catch (err) {
         item.attempts++;
-        logger.error(`[Telegram] sendMessage failed (attempt ${item.attempts}): ${this.redact(err)}`);
+        logger.error(`[Telegram] sendMessage failed (attempt ${item.attempts}): ${this.redact(err, item.via?.token)}`);
         if (item.priority === 'high' && item.attempts < MAX_ATTEMPTS) this.queue.unshift(item);
       }
     } finally {
@@ -232,8 +233,10 @@ export class TelegramNotifier {
     return json.result;
   }
 
-  private redact(err: unknown): string {
-    const msg = err instanceof Error ? err.message : String(err);
+  private redact(err: unknown, extraToken?: string): string {
+    let msg = err instanceof Error ? err.message : String(err);
+    if (extraToken) msg = msg.split(extraToken).join('***');
+    msg = msg.replace(/\d{6,}:[A-Za-z0-9_-]{30,}/g, '***');
     const token = (() => {
       try {
         return this.opts.getSettings().token;
@@ -300,6 +303,11 @@ export class TelegramNotifier {
     if (!settings) return;
     this.pollAbort = new AbortController();
     const signal = AbortSignal.any([this.pollAbort.signal, AbortSignal.timeout((timeoutSec + 10) * 1000)]);
+    if (this.offsetToken !== settings.token) {
+      // A different bot has its own update numbering: an old offset would skip or repeat its updates
+      this.offset = null;
+      this.offsetToken = settings.token;
+    }
     const first = this.offset === null;
     const result = (await this.call(
       settings,
@@ -324,22 +332,31 @@ export class TelegramNotifier {
     if (first && this.offset === null) this.offset = 0;
   }
 
-  /** Admin chat only; everything else is dropped. */
+  /**
+   * Admin only. The sender (`from.id`) must equal the configured `chat_id` as well as the chat, which
+   * holds only in a private chat with the owner (in a group other members would have other ids).
+   * Forwarded messages are ignored.
+   */
   private parse(u: TelegramUpdate, adminChatId: string): IncomingUpdate | null {
-    if (u.message?.text !== undefined) {
-      if (String(u.message.chat?.id) !== adminChatId) {
-        logger.warning('[Telegram] Ignored a message from an unknown chat');
+    const m = u.message;
+    if (m?.text !== undefined) {
+      if (m.forward_origin !== undefined || m.forward_from !== undefined || m.forward_from_chat !== undefined || m.forward_date !== undefined) {
+        logger.warning('[Telegram] Ignored a forwarded message');
         return null;
       }
-      return { kind: 'message', text: u.message.text, chatId: String(u.message.chat.id), date: u.message.date ?? 0 };
+      if (String(m.chat?.id) !== adminChatId || String(m.from?.id) !== adminChatId) {
+        logger.warning('[Telegram] Ignored a message from an unknown chat or sender');
+        return null;
+      }
+      return { kind: 'message', text: m.text, chatId: String(m.chat.id), date: m.date ?? 0 };
     }
-    if (u.callback_query?.data !== undefined) {
-      const chat = u.callback_query.message?.chat?.id;
-      if (String(chat) !== adminChatId) {
-        logger.warning('[Telegram] Ignored a button press from an unknown chat');
+    const cb = u.callback_query;
+    if (cb?.data !== undefined) {
+      if (String(cb.message?.chat?.id) !== adminChatId || String(cb.from?.id) !== adminChatId) {
+        logger.warning('[Telegram] Ignored a button press from an unknown chat or sender');
         return null;
       }
-      return { kind: 'callback', data: u.callback_query.data, chatId: String(chat), callbackId: u.callback_query.id };
+      return { kind: 'callback', data: cb.data, chatId: adminChatId, callbackId: cb.id };
     }
     return null;
   }
@@ -358,8 +375,17 @@ export class TelegramNotifier {
 
 interface TelegramUpdate {
   update_id: number;
-  message?: { text?: string; date?: number; chat: { id: number | string } };
-  callback_query?: { id: string; data?: string; message?: { chat?: { id: number | string } } };
+  message?: {
+    text?: string;
+    date?: number;
+    chat: { id: number | string };
+    from?: { id: number | string };
+    forward_origin?: unknown;
+    forward_from?: unknown;
+    forward_from_chat?: unknown;
+    forward_date?: unknown;
+  };
+  callback_query?: { id: string; data?: string; from?: { id: number | string }; message?: { chat?: { id: number | string } } };
 }
 
 /** Settings from server.yaml with the TELEGRAM_BOT_TOKEN override. */

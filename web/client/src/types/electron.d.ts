@@ -87,7 +87,8 @@ interface ElectronAPI {
   /** Config files (spec §3). Human only. `file` is 'limits' | 'mandate' | 'fees' | 'server'. */
   config: {
     get: () => Promise<IpcResponse>;
-    write: (file: string, value: unknown) => Promise<IpcResponse>;
+    /** `expectedSha256`: the file's hash from `config.get().hashes`; the write is refused if the file changed since. */
+    write: (file: string, value: unknown, expectedSha256?: string) => Promise<IpcResponse>;
     history: (file: string) => Promise<IpcResponse>;
     restore: (file: string, versionId: string) => Promise<IpcResponse>;
   };

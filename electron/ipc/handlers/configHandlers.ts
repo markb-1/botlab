@@ -19,16 +19,16 @@ export function registerConfigHandlers(config: ConfigService, isTrustedSender: (
   ipcMain.handle('config:get', async (event) => {
     if (!isTrustedSender(event.sender)) return untrusted;
     try {
-      return { success: true, data: { config: config.getRedacted(), error: config.getLastError() } };
+      return { success: true, data: { config: config.getRedacted(), error: config.getLastError(), hashes: config.getFileHashes() } };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
   });
 
-  ipcMain.handle('config:write', async (event, file: string, value: unknown) => {
+  ipcMain.handle('config:write', async (event, file: string, value: unknown, expectedSha256?: string) => {
     if (!isTrustedSender(event.sender)) return untrusted;
     try {
-      return { success: true, data: summary(await config.write(asFile(file), value, 'human')) };
+      return { success: true, data: summary(await config.write(asFile(file), value, 'human', typeof expectedSha256 === 'string' ? expectedSha256 : undefined)) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }

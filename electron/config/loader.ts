@@ -76,16 +76,40 @@ function formatIssues(error: z.ZodError): string[] {
  * Parse and validate one YAML document against a schema.
  * `source` is used only for error messages (usually the file path).
  */
-export function parseConfigYaml<T extends z.ZodType>(schema: T, text: string, source: string): z.infer<T> {
+export interface ParseOptions {
+  /**
+   * Hot-reload mode: an empty/comment-only file is an error and every section in `requiredSections`
+   * must be present, so a truncated file can never fall back to defaults. Defaults apply only to
+   * a newly created file and to keys missing inside a present section.
+   */
+  strict?: boolean;
+  requiredSections?: readonly string[];
+}
+
+export function parseConfigYaml<T extends z.ZodType>(schema: T, text: string, source: string, opts: ParseOptions = {}): z.infer<T> {
   let raw: unknown;
   try {
-    raw = YAML.parse(text);
+    // prettyErrors: false keeps the offending source line (which may hold a secret) out of the message
+    raw = YAML.parse(text, { prettyErrors: false });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = err instanceof Error ? err.message.split('\n')[0] : String(err);
     throw new ConfigError(`Invalid YAML in ${source}: ${msg}`, source, [msg]);
   }
 
-  // An empty file means "all defaults"
+  if (opts.strict) {
+    const isObject = typeof raw === 'object' && raw !== null && !Array.isArray(raw);
+    if (!isObject) {
+      const issues = ['file is empty or not a mapping (an empty file never resets to defaults)'];
+      throw new ConfigError(`Invalid config in ${source}:\n  ${issues.join('\n  ')}`, source, issues);
+    }
+    const missing = (opts.requiredSections ?? []).filter((k) => !(k in (raw as Record<string, unknown>)));
+    if (missing.length > 0) {
+      const issues = missing.map((k) => `missing section "${k}" (truncated file?)`);
+      throw new ConfigError(`Invalid config in ${source}:\n  ${issues.join('\n  ')}`, source, issues);
+    }
+  }
+
+  // An empty file means "all defaults" (initial creation only)
   const result = schema.safeParse(raw ?? {});
   if (!result.success) {
     const issues = formatIssues(result.error);

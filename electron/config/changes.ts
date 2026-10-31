@@ -36,6 +36,15 @@ export const REDACTED = '***';
 const SECRET_PATHS = new Set(['server:notify.telegram.bot_token']);
 export const isSecretPath = (file: string, path: string): boolean => SECRET_PATHS.has(`${file}:${path}`);
 
+/** Remove known secrets and anything shaped like a Telegram bot token from text that may be logged, audited or sent. */
+export function redactSecrets(text: string, secrets: readonly (string | undefined)[] = []): string {
+  let out = text;
+  for (const s of secrets) if (s && s.length >= 4) out = out.split(s).join(REDACTED);
+  out = out.replace(/\d{6,}:[A-Za-z0-9_-]{30,}/g, REDACTED);
+  out = out.replace(/(bot_token\s*:\s*)(["']?)[^\s"'#]+\2/g, `$1${REDACTED}`);
+  return out;
+}
+
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -196,6 +205,9 @@ export function classifyKey(file: ConfigFileName, path: string, o: unknown, n: u
       return o === n ? 'neutral' : n < o ? 'raises' : 'lowers';
     }
     case 'server':
+      // Notifications are a safety net: turning them off or pointing them elsewhere is a loosening
+      if (path === 'notify.telegram.enabled') return o === true && n === false ? 'raises' : 'neutral';
+      if (path === 'notify.telegram.chat_id' || path === 'notify.telegram.bot_token') return 'raises';
       return 'neutral';
   }
 }

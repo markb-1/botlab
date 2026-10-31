@@ -150,8 +150,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   config: {
     get: () =>
       ipcRenderer.invoke('config:get'),
-    write: (file: string, value: unknown) =>
-      ipcRenderer.invoke('config:write', file, value),
+    write: (file: string, value: unknown, expectedSha256?: string) =>
+      ipcRenderer.invoke('config:write', file, value, expectedSha256),
     history: (file: string) =>
       ipcRenderer.invoke('config:history', file),
     restore: (file: string, versionId: string) =>
@@ -265,7 +265,7 @@ declare global {
       };
       config: {
         get: () => Promise<any>;
-        write: (file: string, value: unknown) => Promise<any>;
+        write: (file: string, value: unknown, expectedSha256?: string) => Promise<any>;
         history: (file: string) => Promise<any>;
         restore: (file: string, versionId: string) => Promise<any>;
       };
