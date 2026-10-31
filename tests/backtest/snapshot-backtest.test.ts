@@ -5,10 +5,10 @@
 
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import path from 'path';
-import { compileScript } from '../../electron/runtime/compileScript';
-import { groupSteps, runSnapshotSimulation, SnapshotMarket, type SnapshotSimulationInput } from '../../electron/backtest/snapshotSimulate';
-import { BacktestEngine } from '../../electron/backtest/BacktestEngine';
-import type { BookSnapshot, Level } from '../../electron/recorder/snapshotCodec';
+import { compileScript } from '../../packages/core/src/runtime/compileScript';
+import { groupSteps, runSnapshotSimulation, SnapshotMarket, type SnapshotSimulationInput } from '../../packages/core/src/backtest/snapshotSimulate';
+import { BacktestEngine } from '../../packages/core/src/backtest/BacktestEngine';
+import type { BookSnapshot, Level } from '../../packages/core/src/recorder/snapshotCodec';
 import { buildWorker, ROOT } from '../sandbox/buildWorker';
 
 function snap(tokenId: string, ts: number, bids: Level[], asks: Level[]): BookSnapshot {
@@ -150,7 +150,7 @@ describe('snapshot backtest', () => {
 describe('BacktestEngine with polymarket-snapshots', () => {
   let workerPath: string;
   beforeAll(async () => {
-    workerPath = await buildWorker(path.join(ROOT, 'electron', 'backtest', 'backtest-worker.ts'));
+    workerPath = await buildWorker(path.join(ROOT, 'packages', 'core', 'src', 'backtest', 'backtest-worker.ts'));
   }, 30_000);
 
   it('replays snapshots in the sandboxed worker and stores trades', async () => {

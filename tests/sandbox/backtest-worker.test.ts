@@ -15,12 +15,12 @@ const klines = Array.from({ length: 5 }, (_, i) => ({
   closeTime: 1_700_000_000_000 + (i + 1) * 3_600_000 - 1,
 }));
 
-vi.mock('../../electron/backtest/klineCache', () => ({
+vi.mock('../../packages/core/src/backtest/klineCache', () => ({
   fetchKlines: vi.fn(async () => klines),
 }));
 
-import { BacktestEngine } from '../../electron/backtest/BacktestEngine';
-import { compileScript } from '../../electron/runtime/compileScript';
+import { BacktestEngine } from '../../packages/core/src/backtest/BacktestEngine';
+import { compileScript } from '../../packages/core/src/runtime/compileScript';
 import { buildWorker, ROOT } from './buildWorker';
 import { escapeProbe } from './escapeProbe';
 
@@ -48,7 +48,7 @@ describe('BacktestEngine worker', () => {
   let workerPath: string;
 
   beforeAll(async () => {
-    workerPath = await buildWorker(path.join(ROOT, 'electron', 'backtest', 'backtest-worker.ts'));
+    workerPath = await buildWorker(path.join(ROOT, 'packages', 'core', 'src', 'backtest', 'backtest-worker.ts'));
   }, 30_000);
 
   function engine(compiledScript: string, repo: ReturnType<typeof fakeRepo>, timeoutMs = 2000) {

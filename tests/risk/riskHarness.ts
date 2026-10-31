@@ -4,23 +4,23 @@
 
 import { vi } from 'vitest';
 import { openTestDb, type TestDb } from '../orders/db';
-import { LimitsSchema, MandateSchema, type LimitsConfig } from '../../electron/config';
-import { AuditRepository } from '../../electron/database/repositories/AuditRepository';
-import { ScriptRepository } from '../../electron/database/repositories/ScriptRepository';
-import { AuditService } from '../../electron/audit/AuditService';
-import { OrderCanceller } from '../../electron/orders/OrderCanceller';
-import { HaltService } from '../../electron/risk/HaltService';
-import { KillSwitch } from '../../electron/risk/KillSwitch';
-import { RiskMonitor } from '../../electron/risk/RiskMonitor';
-import { RiskEngine } from '../../electron/risk/RiskEngine';
-import { FeeService } from '../../electron/orders/FeeService';
-import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import { OrderService, type ClobBook, type OrderServiceDeps } from '../../electron/orders/OrderService';
-import type { MarketInfo, MarketQualityProvider } from '../../electron/orders/MarketDataService';
+import { LimitsSchema, MandateSchema, type LimitsConfig } from '../../packages/core/src/config';
+import { AuditRepository } from '../../packages/core/src/db/repositories/AuditRepository';
+import { ScriptRepository } from '../../packages/core/src/db/repositories/ScriptRepository';
+import { AuditService } from '../../packages/core/src/audit/AuditService';
+import { OrderCanceller } from '../../packages/core/src/orders/OrderCanceller';
+import { HaltService } from '../../packages/core/src/risk/HaltService';
+import { KillSwitch } from '../../packages/core/src/risk/KillSwitch';
+import { RiskMonitor } from '../../packages/core/src/risk/RiskMonitor';
+import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
+import { FeeService } from '../../packages/core/src/orders/FeeService';
+import { DbRiskStateProvider } from '../../packages/core/src/orders/DbRiskStateProvider';
+import { OrderService, type ClobBook, type OrderServiceDeps } from '../../packages/core/src/orders/OrderService';
+import type { MarketInfo, MarketQualityProvider } from '../../packages/core/src/orders/MarketDataService';
 
 /** Market assessed as unambiguous economics (the market cache is tested separately) */
 const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economics', ambiguityScore: 0, rulesChangedAt: null }) };
-import type { BinanceAdapter, PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import type { BinanceAdapter, PolymarketAdapter } from '../../packages/core/src/orders/ExchangeAdapter';
 
 export type FakePolymarket = PolymarketAdapter & Record<'cancelOrders' | 'getOrder' | 'postMarketOrder' | 'postLimitOrder', ReturnType<typeof vi.fn>>;
 

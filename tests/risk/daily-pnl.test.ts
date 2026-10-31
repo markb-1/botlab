@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeDailyPnl, utcDayStart, type PnlFill } from '../../electron/risk/dailyPnl';
+import { computeDailyPnl, utcDayStart, type PnlFill } from '../../packages/core/src/risk/dailyPnl';
 
 const DAY_START = Date.parse('2026-06-02T00:00:00Z');
 const YESTERDAY = DAY_START - 6 * 3_600_000;

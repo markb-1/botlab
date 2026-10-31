@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { LimitsSchema } from '../../electron/config';
+import { LimitsSchema } from '../../packages/core/src/config';
 import {
   decideRampTransition,
   demoteOnLossHalt,
@@ -7,7 +7,7 @@ import {
   lowerStage,
   templateTrustAfter,
   type RampInput,
-} from '../../electron/risk/ramp';
+} from '../../packages/core/src/risk/ramp';
 
 const DAY = 86_400_000;
 const NOW = Date.parse('2026-06-20T12:00:00Z');

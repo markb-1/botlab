@@ -4,15 +4,15 @@
 
 import { vi } from 'vitest';
 import { openTestDb, type TestDb } from '../orders/db';
-import { MarketCacheRepository } from '../../electron/database/repositories/MarketCacheRepository';
-import { ForecastRepository } from '../../electron/database/repositories/ForecastRepository';
-import { CategoryRightsRepository } from '../../electron/database/repositories/CategoryRightsRepository';
-import { AuditRepository } from '../../electron/database/repositories/AuditRepository';
-import { AuditService } from '../../electron/audit/AuditService';
-import { MarketCacheService } from '../../electron/ledger/MarketCacheService';
-import { LedgerService } from '../../electron/ledger/LedgerService';
-import { defaultCategories, LimitsSchema, MandateSchema, type MandateConfig } from '../../electron/config';
-import { FeeService } from '../../electron/orders/FeeService';
+import { MarketCacheRepository } from '../../packages/core/src/db/repositories/MarketCacheRepository';
+import { ForecastRepository } from '../../packages/core/src/db/repositories/ForecastRepository';
+import { CategoryRightsRepository } from '../../packages/core/src/db/repositories/CategoryRightsRepository';
+import { AuditRepository } from '../../packages/core/src/db/repositories/AuditRepository';
+import { AuditService } from '../../packages/core/src/audit/AuditService';
+import { MarketCacheService } from '../../packages/core/src/ledger/MarketCacheService';
+import { LedgerService } from '../../packages/core/src/ledger/LedgerService';
+import { defaultCategories, LimitsSchema, MandateSchema, type MandateConfig } from '../../packages/core/src/config';
+import { FeeService } from '../../packages/core/src/orders/FeeService';
 
 export const DAY = 86_400_000;
 export const T0 = Date.parse('2026-10-01T00:00:00Z');

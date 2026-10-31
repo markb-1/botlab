@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'events';
 
 // Mock logger to suppress output
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: {
     info: vi.fn(),
     error: vi.fn(),
@@ -21,7 +21,7 @@ class MockScriptRunner extends EventEmitter {
 
 let mockScriptRunnerInstance: MockScriptRunner;
 
-vi.mock('../../electron/runtime/ScriptRunner', () => ({
+vi.mock('../../packages/core/src/runtime/ScriptRunner', () => ({
   ScriptRunner: vi.fn().mockImplementation(() => {
     mockScriptRunnerInstance = new MockScriptRunner();
     return mockScriptRunnerInstance;
@@ -35,13 +35,13 @@ const mockPaperState = {
   getPositions: vi.fn().mockReturnValue([]),
 };
 
-vi.mock('../../electron/runtime/PaperTradingState', () => ({
+vi.mock('../../packages/core/src/runtime/PaperTradingState', () => ({
   PaperTradingState: vi.fn().mockImplementation(() => mockPaperState),
 }));
 
-import { ScriptBotRunner } from '../../electron/runtime/ScriptBotRunner';
-import { ScriptRunner } from '../../electron/runtime/ScriptRunner';
-import { PaperTradingState } from '../../electron/runtime/PaperTradingState';
+import { ScriptBotRunner } from '../../packages/core/src/runtime/ScriptBotRunner';
+import { ScriptRunner } from '../../packages/core/src/runtime/ScriptRunner';
+import { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
 
 function makeBotRecord(overrides: Record<string, unknown> = {}) {
   return {

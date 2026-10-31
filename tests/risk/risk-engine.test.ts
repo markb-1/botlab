@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { LimitsSchema, MandateSchema, type BotLabConfig } from '../../electron/config';
+import { LimitsSchema, MandateSchema, type BotLabConfig } from '../../packages/core/src/config';
 import {
   RiskEngine,
   horizonBucket,
@@ -8,7 +8,7 @@ import {
   type RiskStateSnapshot,
   type MarketSnapshot,
   type BotRiskInfo,
-} from '../../electron/risk';
+} from '../../packages/core/src/risk';
 
 const NOW = Date.parse('2026-06-01T00:00:00Z');
 const MIN = 60_000;

@@ -1,15 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
 import { openLedgerHarness, gammaMarket, DAY, T0, type LedgerHarness } from './harness';
-import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import { RiskEngine } from '../../electron/risk/RiskEngine';
-import { LimitsSchema, MandateSchema } from '../../electron/config';
-import type { OrderRequest } from '../../electron/risk/types';
+import { DbRiskStateProvider } from '../../packages/core/src/orders/DbRiskStateProvider';
+import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
+import { LimitsSchema, MandateSchema } from '../../packages/core/src/config';
+import type { OrderRequest } from '../../packages/core/src/risk/types';
 
 const HOUR = 3_600_000;
 
@@ -246,7 +246,7 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       });
       const bad = row(0, 0.9, T0, T0 + 2 * DAY);
       const atMid = Array.from({ length: 9 }, (_, i) => row(i + 1, 0.5, T0 + 2 * DAY + i * 6 * HOUR, T0 + 2 * DAY + (i + 1) * 6 * HOUR));
-      const { bucketVotes } = await import('../../electron/ledger/LedgerService');
+      const { bucketVotes } = await import('../../packages/core/src/ledger/LedgerService');
       expect(bucketVotes([bad, ...atMid]).skill[0].value).toBeCloseTo(-0.56);
       // Slightly off the mid (|p − m| = 0.03) still counts, but only for its active time
       const nearMid = atMid.map((r) => ({ ...r, probability: 0.53, skill: 0.25 - 0.53 ** 2 }));

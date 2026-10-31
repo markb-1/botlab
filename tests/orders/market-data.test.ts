@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseGammaMarket } from '../../electron/orders/MarketDataService';
+import { parseGammaMarket } from '../../packages/core/src/orders/MarketDataService';
 
 describe('market metadata', () => {
   const gamma = {
@@ -30,7 +30,7 @@ describe('market metadata', () => {
 
 describe('CLOB post response classification', () => {
   it('only definite client errors are rejections', async () => {
-    const { interpretPostResponse } = await import('../../electron/exchange/polymarket/orders');
+    const { interpretPostResponse } = await import('../../packages/core/src/exchange/polymarket/orders');
     expect(interpretPostResponse({ error: 'bad order', status: 400 }, 'buy').kind).toBe('rejected');
     expect(interpretPostResponse({ error: 'unauthorized', status: 401 }, 'buy').kind).toBe('rejected');
     for (const status of [408, 425, 429, 500, 502, 503]) {

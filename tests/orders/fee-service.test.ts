@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { ConfigError } from '../../electron/config';
-import { DEFAULT_FEES_YAML, FeeService, FeesSchema, loadFees } from '../../electron/orders/FeeService';
+import { ConfigError } from '../../packages/core/src/config';
+import { DEFAULT_FEES_YAML, FeeService, FeesSchema, loadFees } from '../../packages/core/src/orders/FeeService';
 
 describe('FeeService', () => {
   it('defaults match the spec table and config/fees.example.yaml', () => {

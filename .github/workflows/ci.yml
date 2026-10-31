@@ -26,6 +26,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - name: Typecheck
-        run: npx tsc -p electron/tsconfig.json --noEmit
+      - name: Typecheck (core + electron)
+        run: npm run typecheck
       - run: npm test

@@ -1,18 +1,18 @@
 import { ipcMain } from 'electron';
-import type { BotRepository } from '../../database/repositories/BotRepository';
-import type { WalletRepository } from '../../database/repositories/WalletRepository';
-import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
-import type { OrderRepository } from '../../database/repositories/OrderRepository';
-import type { BotTradeRepository } from '../../database/repositories/BotTradeRepository';
-import type { BotStorageRepository } from '../../database/repositories/BotStorageRepository';
-import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
-import type { BotManager } from '../../../src/core/BotManager';
-import type { WalletManager } from '../../../src/core/WalletManager';
-import type { IpcBot, IpcBotTrade } from '../types';
-import type { AuditService } from '../../audit/AuditService';
-import { initialStage, lowerStage } from '../../risk/ramp';
-import type { BotStage } from '../../risk/types';
-import logger from '../../../src/utils/logger';
+import type { BotRepository } from '../../../packages/core/src/db/repositories/BotRepository';
+import type { WalletRepository } from '../../../packages/core/src/db/repositories/WalletRepository';
+import type { ScriptRepository } from '../../../packages/core/src/db/repositories/ScriptRepository';
+import type { OrderRepository } from '../../../packages/core/src/db/repositories/OrderRepository';
+import type { BotTradeRepository } from '../../../packages/core/src/db/repositories/BotTradeRepository';
+import type { BotStorageRepository } from '../../../packages/core/src/db/repositories/BotStorageRepository';
+import type { SettingsRepository } from '../../../packages/core/src/db/repositories/SettingsRepository';
+import type { BotManager } from '../../../packages/core/src/bots/BotManager';
+import type { WalletManager } from '../../../packages/core/src/bots/WalletManager';
+import type { IpcBot, IpcBotTrade } from '../../../packages/core/src/services/types';
+import type { AuditService } from '../../../packages/core/src/audit/AuditService';
+import { initialStage, lowerStage } from '../../../packages/core/src/risk/ramp';
+import type { BotStage } from '../../../packages/core/src/risk/types';
+import logger from '../../../packages/core/src/utils/logger';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -559,7 +559,7 @@ export function registerBotHandlers(
           // Cash balance from on-chain
           try {
             const settings = settingsRepo.get();
-            const getMyBalanceMod = await import('../../../src/utils/getMyBalance');
+            const getMyBalanceMod = await import('../../../packages/core/src/utils/getMyBalance');
             cashBalance = await getMyBalanceMod.default(balanceAddress, settings.rpc_url, settings.usdc_contract_address);
           } catch (err) {
             logger.error(`Failed to fetch live balance for bot ${botId}: ${err}`);
@@ -663,7 +663,7 @@ export function registerBotHandlers(
                 let cashBalance = 0;
 
                 try {
-                  const getMyBalanceMod = await import('../../../src/utils/getMyBalance');
+                  const getMyBalanceMod = await import('../../../packages/core/src/utils/getMyBalance');
                   cashBalance = await getMyBalanceMod.default(balanceAddress, settings.rpc_url, settings.usdc_contract_address);
                 } catch { /* ignore */ }
 

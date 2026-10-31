@@ -9,16 +9,16 @@ import { ESLint } from 'eslint';
  */
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const SCAN_DIRS = ['electron', 'src', 'web/client/src', 'scripts'];
+const SCAN_DIRS = ['electron', 'packages', 'templates', 'web/client/src', 'scripts'];
 const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs']);
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'dist-electron', 'release']);
 
 /** Modules that talk to exchange order endpoints directly */
-const ORDER_ENDPOINT_MODULES = ['electron/exchange/polymarket/orders.ts', 'electron/sdk/binance.ts'];
+const ORDER_ENDPOINT_MODULES = ['packages/core/src/exchange/polymarket/orders.ts', 'packages/core/src/exchange/binance/client.ts'];
 /** The only module that may import the order-endpoint functions */
-const ADAPTER_MODULE = 'electron/orders/ExchangeAdapter.ts';
+const ADAPTER_MODULE = 'packages/core/src/orders/ExchangeAdapter.ts';
 /** Modules allowed to build live adapters (they hand them to OrderService) */
-const ADAPTER_USERS = (f: string) => f.startsWith('electron/orders/') || f === 'src/core/BotManager.ts';
+const ADAPTER_USERS = (f: string) => f.startsWith('packages/core/src/orders/') || f === 'packages/core/src/bots/BotManager.ts';
 
 const RULES: Array<{ name: string; pattern: RegExp; allowed: (file: string) => boolean }> = [
   {
@@ -39,7 +39,7 @@ const RULES: Array<{ name: string; pattern: RegExp; allowed: (file: string) => b
   {
     name: 'use of Binance order functions',
     pattern: /\bexecuteBinance(Buy|Sell)\b/,
-    allowed: (f) => f === ADAPTER_MODULE || f === 'electron/sdk/binance.ts',
+    allowed: (f) => f === ADAPTER_MODULE || f === 'packages/core/src/exchange/binance/client.ts',
   },
   {
     name: 'construction of live exchange adapters',
@@ -84,17 +84,17 @@ describe('order choke point', () => {
 
   it('the adapters actually contain the calls the guard looks for', () => {
     const read = (f: string) => fs.readFileSync(path.join(ROOT, f), 'utf8');
-    expect(read('electron/exchange/polymarket/orders.ts')).toMatch(/\.postOrder\(/);
-    expect(read('electron/sdk/binance.ts')).toMatch(/\/api\/v3\/order/);
+    expect(read('packages/core/src/exchange/polymarket/orders.ts')).toMatch(/\.postOrder\(/);
+    expect(read('packages/core/src/exchange/binance/client.ts')).toMatch(/\/api\/v3\/order/);
   });
 
   it('detects violations', () => {
-    expect(findViolations('electron/runtime/RpcHandler.ts', 'await clob.postOrder(o, OrderType.FOK)')).toHaveLength(1);
+    expect(findViolations('packages/core/src/runtime/RpcHandler.ts', 'await clob.postOrder(o, OrderType.FOK)')).toHaveLength(1);
     expect(findViolations('src/x.ts', 'const s = await client.createMarketOrder({})')).toHaveLength(1);
     expect(findViolations('src/x.ts', "fetch(`${BASE}/api/v3/order?x=1`)")).toHaveLength(1);
     expect(findViolations('src/x.ts', "import { postLimitOrder } from '../exchange/polymarket/orders';")).toHaveLength(1);
-    expect(findViolations('electron/runtime/X.ts', 'executeBinanceBuy(creds, s, 1)')).toHaveLength(1);
-    expect(findViolations('electron/runtime/X.ts', 'createPolymarketAdapter(clob)')).toHaveLength(1);
+    expect(findViolations('packages/core/src/runtime/X.ts', 'executeBinanceBuy(creds, s, 1)')).toHaveLength(1);
+    expect(findViolations('packages/core/src/runtime/X.ts', 'createPolymarketAdapter(clob)')).toHaveLength(1);
     expect(findViolations('electron/x.ts', '// clob.postOrder( is documented here')).toHaveLength(0);
     expect(findViolations('electron/x.ts', 'orderRepo.create({})')).toHaveLength(0);
     expect(findViolations('src/x.ts', "fetch('https://x/sapi/v1/margin/order')")).toHaveLength(1);
@@ -108,7 +108,7 @@ describe('order choke point — ESLint rules', () => {
 import { ClobClient } from '@polymarket/clob-client';
 import type { Side } from '@polymarket/clob-client';
 import { postLimitOrder } from '../exchange/polymarket/orders';
-import { executeBinanceSell, getBinancePrice } from '../sdk/binance';
+import { executeBinanceSell, getBinancePrice } from '../exchange/binance/client';
 export async function probe(c: ClobClient, s: Side) {
   await c.postOrder({} as never);
   await (c as unknown as Record<string, (x: unknown) => Promise<void>>)['createMarketOrder']({});
@@ -126,7 +126,7 @@ export async function probe(c: ClobClient, s: Side) {
   };
 
   it('flags order calls, endpoints and imports outside the adapters', async () => {
-    const errors = await chokeErrors('electron/runtime/Probe.ts');
+    const errors = await chokeErrors('packages/core/src/runtime/Probe.ts');
     // clob value import, order module, Binance order fn, .postOrder, ['createMarketOrder'], 2 endpoints
     expect(errors).toEqual([
       '2:@typescript-eslint/no-restricted-imports',
@@ -137,13 +137,13 @@ export async function probe(c: ClobClient, s: Side) {
       '9:no-restricted-syntax',
       '10:no-restricted-syntax',
     ]);
-    expect(await chokeErrors('src/core/Probe.ts')).toHaveLength(7);
+    expect(await chokeErrors('electron/ipc/Probe.ts')).toHaveLength(7);
   }, 60_000);
 
   it('allows them in the adapter modules; BotManager may only import clob-client values', async () => {
-    expect(await chokeErrors('electron/exchange/polymarket/orders.ts')).toEqual([]);
-    expect(await chokeErrors('electron/sdk/binance.ts')).toEqual([]);
-    const botManager = await chokeErrors('src/core/BotManager.ts');
+    expect(await chokeErrors('packages/core/src/exchange/polymarket/orders.ts')).toEqual([]);
+    expect(await chokeErrors('packages/core/src/exchange/binance/client.ts')).toEqual([]);
+    const botManager = await chokeErrors('packages/core/src/bots/BotManager.ts');
     expect(botManager).not.toContain('2:@typescript-eslint/no-restricted-imports');
     expect(botManager).toContain('7:no-restricted-syntax');
   }, 60_000);

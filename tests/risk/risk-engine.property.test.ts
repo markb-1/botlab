@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
-import { LimitsSchema, MandateSchema, type BotLabConfig } from '../../electron/config';
+import { LimitsSchema, MandateSchema, type BotLabConfig } from '../../packages/core/src/config';
 import {
   RiskEngine,
   horizonBucket,
@@ -8,7 +8,7 @@ import {
   type BotStage,
   type OrderRequest,
   type RiskStateSnapshot,
-} from '../../electron/risk';
+} from '../../packages/core/src/risk';
 
 /**
  * Property: whatever sequence of orders bots send, applying only the orders the

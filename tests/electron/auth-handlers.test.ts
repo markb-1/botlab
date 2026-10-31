@@ -21,11 +21,11 @@ vi.mock('electron', () => ({
   },
 }));
 
-vi.mock('../../electron/security/keyManager', () => ({
+vi.mock('../../packages/core/src/security/keyManager', () => ({
   keyManager: mockKeyManager,
 }));
 
-vi.mock('../../electron/security/passwordManager', () => ({
+vi.mock('../../packages/core/src/security/passwordManager', () => ({
   generateSalt: (...args: unknown[]) => mockGenerateSalt(...args),
   deriveEncryptionKey: (...args: unknown[]) => mockDeriveEncryptionKey(...args),
   hashForVerification: (...args: unknown[]) => mockHashForVerification(...args),

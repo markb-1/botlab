@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { PaperTradingState } from '../../electron/runtime/PaperTradingState';
-import type { BotStorageRepository } from '../../electron/database/repositories/BotStorageRepository';
-import type { OrderBook } from '../../electron/sdk/types';
+import { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
+import type { BotStorageRepository } from '../../packages/core/src/db/repositories/BotStorageRepository';
+import type { OrderBook } from '../../packages/core/src/sdk/types';
 
 function makeOrderBook(opts: {
   asks?: Array<{ price: string; size: string }>;

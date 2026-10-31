@@ -4,12 +4,12 @@
 
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { decrypt, encrypt, isV2 } from '../../electron/security/crypto';
-import { migrateSecretsToV2 } from '../../electron/security/migrateSecrets';
+import { decrypt, encrypt, isV2 } from '../../packages/core/src/security/crypto';
+import { migrateSecretsToV2 } from '../../packages/core/src/security/migrateSecrets';
 import { openTestDb, sqliteAvailable } from '../orders/db';
 
 const KEY = '0f'.repeat(32);

@@ -16,9 +16,7 @@
   },
   "include": [
     "./**/*.ts",
-    "../src/core/**/*.ts",
-    "../src/utils/logger.ts",
-    "../src/utils/getMyBalance.ts"
+    "../packages/core/src/**/*.ts"
   ],
-  "exclude": ["node_modules", "../node_modules", "./scripts/templates/**"]
+  "exclude": ["node_modules", "../node_modules"]
 }

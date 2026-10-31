@@ -1,8 +1,8 @@
 import { ipcMain, type WebContents } from 'electron';
-import type { LedgerService } from '../../ledger/LedgerService';
-import type { MarketCacheService } from '../../ledger/MarketCacheService';
-import type { ForecastFilter, ForecastStatus } from '../../database/repositories/ForecastRepository';
-import type { CategoryRightsState, HorizonBucket } from '../../risk/types';
+import type { LedgerService } from '../../../packages/core/src/ledger/LedgerService';
+import type { MarketCacheService } from '../../../packages/core/src/ledger/MarketCacheService';
+import type { ForecastFilter, ForecastStatus } from '../../../packages/core/src/db/repositories/ForecastRepository';
+import type { CategoryRightsState, HorizonBucket } from '../../../packages/core/src/risk/types';
 
 /**
  * Forecast ledger and market IPC (spec §6). Everything arriving over IPC comes from the UI, so the

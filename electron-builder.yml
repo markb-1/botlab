@@ -9,8 +9,7 @@ directories:
 files:
   - dist-electron/**/*
   - web/client/dist/**/*
-  - src/core/**/*
-  - src/utils/**/*
+  - templates/**/*
   - node_modules/**/*
   - package.json
 

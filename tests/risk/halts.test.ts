@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
 import { openRiskHarness, type RiskHarness } from './riskHarness';
-import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
-import { RISK_HALT_EVENT, type RiskHaltEvent } from '../../electron/risk/HaltService';
+import { GLOBAL_SCOPE } from '../../packages/core/src/db/repositories/RiskStateRepository';
+import { RISK_HALT_EVENT, type RiskHaltEvent } from '../../packages/core/src/risk/HaltService';
 
 const DAY = 86_400_000;
 const DAY_START = Date.parse('2026-06-02T00:00:00Z');

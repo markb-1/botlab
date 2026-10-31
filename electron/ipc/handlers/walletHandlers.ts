@@ -1,8 +1,8 @@
 import { ipcMain } from 'electron';
-import type { WalletRepository } from '../../database/repositories/WalletRepository';
-import type { WalletManager } from '../../../src/core/WalletManager';
-import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
-import type { IpcWallet, IpcBalance } from '../types';
+import type { WalletRepository } from '../../../packages/core/src/db/repositories/WalletRepository';
+import type { WalletManager } from '../../../packages/core/src/bots/WalletManager';
+import type { SettingsRepository } from '../../../packages/core/src/db/repositories/SettingsRepository';
+import type { IpcWallet, IpcBalance } from '../../../packages/core/src/services/types';
 
 function walletRowToIpc(row: any): IpcWallet {
   return {
@@ -119,7 +119,7 @@ export function registerWalletHandlers(
         return { success: false, error: 'RPC URL or USDC contract address not configured in settings' };
       }
 
-      const { default: getMyBalance } = await import('../../../src/utils/getMyBalance');
+      const { default: getMyBalance } = await import('../../../packages/core/src/utils/getMyBalance');
       const balance = await getMyBalance(balanceAddress, settings.rpc_url, settings.usdc_contract_address);
 
       const result: IpcBalance = {

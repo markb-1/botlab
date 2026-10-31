@@ -14,7 +14,7 @@ import {
   executeBinanceBuy,
   executeBinanceSell,
   testConnection,
-} from '../../electron/sdk/binance';
+} from '../../packages/core/src/exchange/binance/client';
 
 function okResponse(data: unknown) {
   return { ok: true, status: 200, json: () => Promise.resolve(data), text: () => Promise.resolve(JSON.stringify(data)) };

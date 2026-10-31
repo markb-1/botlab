@@ -1,10 +1,10 @@
 import { ipcMain } from 'electron';
-import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
-import type { IpcSettings } from '../types';
-import { keyManager } from '../../security/keyManager';
-import { encrypt, decrypt } from '../../security/crypto';
-import { testConnection } from '../../sdk/binance';
-import { testClaudeConnection } from '../../sdk/claude';
+import type { SettingsRepository } from '../../../packages/core/src/db/repositories/SettingsRepository';
+import type { IpcSettings } from '../../../packages/core/src/services/types';
+import { keyManager } from '../../../packages/core/src/security/keyManager';
+import { encrypt, decrypt } from '../../../packages/core/src/security/crypto';
+import { testConnection } from '../../../packages/core/src/exchange/binance/client';
+import { testClaudeConnection } from '../../ai/claude';
 
 function settingsRowToIpc(row: any): IpcSettings {
   return {

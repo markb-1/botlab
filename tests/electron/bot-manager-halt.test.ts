@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
@@ -26,9 +26,9 @@ const { FakeRunner, runners, runnerHooks } = vi.hoisted(() => {
   }
   return { FakeRunner, runners, runnerHooks };
 });
-vi.mock('../../electron/runtime/ScriptBotRunner', () => ({ ScriptBotRunner: FakeRunner }));
+vi.mock('../../packages/core/src/runtime/ScriptBotRunner', () => ({ ScriptBotRunner: FakeRunner }));
 
-import { BotManager } from '../../src/core/BotManager';
+import { BotManager } from '../../packages/core/src/bots/BotManager';
 
 const PRIVATE_KEY = '0x' + '11'.repeat(32);
 

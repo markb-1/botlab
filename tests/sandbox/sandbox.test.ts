@@ -9,15 +9,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { compileScript } from '../../electron/runtime/compileScript';
-import { ScriptRunner, type ScriptRunnerOptions } from '../../electron/runtime/ScriptRunner';
-import { scriptFetch } from '../../electron/runtime/scriptFetch';
-import { RpcHandler, MAX_CONCURRENT_FETCHES } from '../../electron/runtime/RpcHandler';
-import { evaluateScript } from '../../electron/runtime/sandbox';
+import { compileScript } from '../../packages/core/src/runtime/compileScript';
+import { ScriptRunner, type ScriptRunnerOptions } from '../../packages/core/src/runtime/ScriptRunner';
+import { scriptFetch } from '../../packages/core/src/runtime/scriptFetch';
+import { RpcHandler, MAX_CONCURRENT_FETCHES } from '../../packages/core/src/runtime/RpcHandler';
+import { evaluateScript } from '../../packages/core/src/runtime/sandbox';
 import { buildWorker, ROOT } from './buildWorker';
 import { escapeProbe, PROBE_ATTEMPTS } from './escapeProbe';
 
@@ -49,7 +49,7 @@ describe('compileScript', () => {
   });
 
   it('compiles every builtin template', async () => {
-    const dir = path.join(ROOT, 'electron', 'scripts', 'templates');
+    const dir = path.join(ROOT, 'templates');
     const files = fs.readdirSync(dir).filter((f) => f.endsWith('.ts'));
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
@@ -146,7 +146,7 @@ describe('script worker', () => {
   const runners: ScriptRunner[] = [];
 
   beforeAll(async () => {
-    bootstrapPath = await buildWorker(path.join(ROOT, 'electron', 'runtime', 'worker-bootstrap.ts'));
+    bootstrapPath = await buildWorker(path.join(ROOT, 'packages', 'core', 'src', 'runtime', 'worker-bootstrap.ts'));
   }, 30_000);
 
   afterEach(async () => {

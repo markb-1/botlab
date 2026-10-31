@@ -1,9 +1,9 @@
 import { ipcMain } from 'electron';
-import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
-import { keyManager } from '../../security/keyManager';
-import { decrypt } from '../../security/crypto';
-import { callClaude, extractCodeFromResponse } from '../../sdk/claude';
-import { buildSystemPrompt } from '../../sdk/claudeSystemPrompt';
+import type { SettingsRepository } from '../../../packages/core/src/db/repositories/SettingsRepository';
+import { keyManager } from '../../../packages/core/src/security/keyManager';
+import { decrypt } from '../../../packages/core/src/security/crypto';
+import { callClaude, extractCodeFromResponse } from '../../ai/claude';
+import { buildSystemPrompt } from '../../../packages/core/src/sdk/guide';
 
 /**
  * Get the decrypted Claude API key from settings.

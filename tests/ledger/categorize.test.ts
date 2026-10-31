@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import YAML from 'yaml';
 import fs from 'fs';
 import path from 'path';
-import { categorize } from '../../electron/ledger/categorize';
-import { CategoriesSchema, DEFAULT_CATEGORIES_YAML, defaultCategories, MandateSchema, parseConfigYaml } from '../../electron/config';
+import { categorize } from '../../packages/core/src/ledger/categorize';
+import { CategoriesSchema, DEFAULT_CATEGORIES_YAML, defaultCategories, MandateSchema, parseConfigYaml } from '../../packages/core/src/config';
 
 const cfg = defaultCategories();
 

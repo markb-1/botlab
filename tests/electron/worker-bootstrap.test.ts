@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { evaluateScript } from '../../electron/runtime/sandbox';
+import { evaluateScript } from '../../packages/core/src/runtime/sandbox';
 
 /**
  * Tests for the worker-bootstrap onTick integration.

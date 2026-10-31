@@ -1,13 +1,13 @@
 import { ipcMain } from 'electron';
-import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
-import { keyManager } from '../../security/keyManager';
+import type { SettingsRepository } from '../../../packages/core/src/db/repositories/SettingsRepository';
+import { keyManager } from '../../../packages/core/src/security/keyManager';
 import {
   generateSalt,
   deriveEncryptionKey,
   hashForVerification,
   verifyPassword,
   FALLBACK_PASSWORD,
-} from '../../security/passwordManager';
+} from '../../../packages/core/src/security/passwordManager';
 
 /**
  * Callback invoked after successful authentication.

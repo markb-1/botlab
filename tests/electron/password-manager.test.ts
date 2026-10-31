@@ -5,7 +5,7 @@ import {
   hashForVerification,
   verifyPassword,
   FALLBACK_PASSWORD,
-} from '../../electron/security/passwordManager';
+} from '../../packages/core/src/security/passwordManager';
 
 describe('passwordManager', () => {
   describe('generateSalt()', () => {

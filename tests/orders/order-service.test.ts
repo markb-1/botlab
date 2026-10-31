@@ -1,22 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable, openTestDb, type TestDb } from './db';
-import { LimitsSchema, MandateSchema } from '../../electron/config';
-import { RiskEngine } from '../../electron/risk/RiskEngine';
-import { FeeService } from '../../electron/orders/FeeService';
-import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import { OrderService, type BotOrderContext, type ClobBook } from '../../electron/orders/OrderService';
-import type { MarketInfo, MarketQualityProvider } from '../../electron/orders/MarketDataService';
+import { LimitsSchema, MandateSchema } from '../../packages/core/src/config';
+import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
+import { FeeService } from '../../packages/core/src/orders/FeeService';
+import { DbRiskStateProvider } from '../../packages/core/src/orders/DbRiskStateProvider';
+import { OrderService, type BotOrderContext, type ClobBook } from '../../packages/core/src/orders/OrderService';
+import type { MarketInfo, MarketQualityProvider } from '../../packages/core/src/orders/MarketDataService';
 
 /** Market assessed as unambiguous economics (the market cache is tested separately) */
 const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economics', ambiguityScore: 0, rulesChangedAt: null }) };
-import type { PolymarketAdapter, BinanceAdapter } from '../../electron/orders/ExchangeAdapter';
-import { PaperTradingState } from '../../electron/runtime/PaperTradingState';
-import type { RiskDecision } from '../../electron/risk/types';
+import type { PolymarketAdapter, BinanceAdapter } from '../../packages/core/src/orders/ExchangeAdapter';
+import { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
+import type { RiskDecision } from '../../packages/core/src/risk/types';
 
 const NOW = Date.parse('2026-06-01T00:00:00Z');
 const DAY = 86_400_000;

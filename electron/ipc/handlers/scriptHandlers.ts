@@ -1,9 +1,9 @@
 import { ipcMain, dialog, BrowserWindow } from 'electron';
 import * as fs from 'fs';
-import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
-import type { IpcScript } from '../types';
-import type { AuditService } from '../../audit/AuditService';
-import { compileScript } from '../../runtime/compileScript';
+import type { ScriptRepository } from '../../../packages/core/src/db/repositories/ScriptRepository';
+import type { IpcScript } from '../../../packages/core/src/services/types';
+import type { AuditService } from '../../../packages/core/src/audit/AuditService';
+import { compileScript } from '../../../packages/core/src/runtime/compileScript';
 
 /** .botlab file format */
 interface BotLabScriptFile {

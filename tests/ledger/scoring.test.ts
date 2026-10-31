@@ -12,9 +12,9 @@ import {
   voteStats,
   type EventVote,
   type RightsInput,
-} from '../../electron/ledger/scoring';
-import { autoRaiseReason, effectiveAmbiguity, normalizeRulesText, rulesHash } from '../../electron/ledger/ambiguity';
-import { MandateSchema } from '../../electron/config';
+} from '../../packages/core/src/ledger/scoring';
+import { autoRaiseReason, effectiveAmbiguity, normalizeRulesText, rulesHash } from '../../packages/core/src/ledger/ambiguity';
+import { MandateSchema } from '../../packages/core/src/config';
 
 const DAY = 86_400_000;
 const NOW = Date.parse('2026-10-31T00:00:00Z');

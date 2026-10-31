@@ -6,8 +6,8 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { compileScript } from '../../electron/runtime/compileScript';
-import { evaluateScript } from '../../electron/runtime/sandbox';
+import { compileScript } from '../../packages/core/src/runtime/compileScript';
+import { evaluateScript } from '../../packages/core/src/runtime/sandbox';
 
 type SellSize = (p: {
   heldTokens: number;
@@ -21,7 +21,7 @@ let copySellSize: SellSize;
 let compiled: string;
 
 beforeAll(async () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'electron', 'scripts', 'templates', 'copy-trading.ts'), 'utf-8');
+  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'copy-trading.ts'), 'utf-8');
   const r = await compileScript(source);
   if ('error' in r) throw new Error(r.error);
   compiled = r.code;

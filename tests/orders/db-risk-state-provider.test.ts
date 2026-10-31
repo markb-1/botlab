@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { sqliteAvailable, openTestDb, type TestDb } from './db';
-import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import type { OrderRequest } from '../../electron/risk/types';
+import { DbRiskStateProvider } from '../../packages/core/src/orders/DbRiskStateProvider';
+import type { OrderRequest } from '../../packages/core/src/risk/types';
 
 const NOW = Date.parse('2026-06-01T12:00:00Z');
 const DAY = 86_400_000;

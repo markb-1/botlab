@@ -6,20 +6,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('electron', () => ({ ipcMain: { handle: vi.fn() } }));
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
 import { openRiskHarness, MARKET, type RiskHarness } from '../risk/riskHarness';
-import { applyPlacementResult } from '../../electron/orders/orderFills';
+import { applyPlacementResult } from '../../packages/core/src/orders/orderFills';
 import { walletChangeBlocker } from '../../electron/ipc/handlers/botHandlers';
-import { WalletRepository } from '../../electron/database/repositories/WalletRepository';
-import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
-import { Reconciler, RECONCILER_FAILURE_ALERT, type ReconcilerDeps } from '../../electron/reconcile/Reconciler';
-import type { DataApiPosition, DataApiTrade } from '../../electron/reconcile/dataApi';
-import type { MarketView } from '../../electron/ledger/MarketCacheService';
-import type { ClobTrade } from '../../electron/orders/ExchangeAdapter';
+import { WalletRepository } from '../../packages/core/src/db/repositories/WalletRepository';
+import { GLOBAL_SCOPE } from '../../packages/core/src/db/repositories/RiskStateRepository';
+import { Reconciler, RECONCILER_FAILURE_ALERT, type ReconcilerDeps } from '../../packages/core/src/reconcile/Reconciler';
+import type { DataApiPosition, DataApiTrade } from '../../packages/core/src/reconcile/dataApi';
+import type { MarketView } from '../../packages/core/src/ledger/MarketCacheService';
+import type { ClobTrade } from '../../packages/core/src/orders/ExchangeAdapter';
 
 const TAKER = 0.02;
 

@@ -4,14 +4,14 @@ import os from 'os';
 import path from 'path';
 import YAML from 'yaml';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { ConfigService, renderYaml, type ConfigChangedEvent } from '../../electron/config/ConfigService';
-import { RiskEngine } from '../../electron/risk/RiskEngine';
-import { DEFAULT_LIMITS_YAML, ConfigError } from '../../electron/config';
-import { sha256 } from '../../electron/config/history';
+import { ConfigService, renderYaml, type ConfigChangedEvent } from '../../packages/core/src/config/ConfigService';
+import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
+import { DEFAULT_LIMITS_YAML, ConfigError } from '../../packages/core/src/config';
+import { sha256 } from '../../packages/core/src/config/history';
 
 interface AuditCall {
   actor: string;

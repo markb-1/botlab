@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeAll } from 'vitest';
-import fetchData from '../../src/utils/fetchData';
+import fetchData from '../../packages/core/src/utils/fetchData';
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { LimitsSchema, MandateSchema, ServerSchema, classifyChange, overallEffect, redactChange, diffConfig, type AppConfig } from '../../electron/config';
-import { FeesSchema } from '../../electron/orders/FeeService';
+import { LimitsSchema, MandateSchema, ServerSchema, classifyChange, overallEffect, redactChange, diffConfig, type AppConfig } from '../../packages/core/src/config';
+import { FeesSchema } from '../../packages/core/src/orders/FeeService';
 
 const base = (): AppConfig => ({
   limits: LimitsSchema.parse({}),

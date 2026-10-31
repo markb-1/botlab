@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock trading SDK before importing RpcHandler
-vi.mock('../../electron/sdk/trading', () => ({
+vi.mock('../../packages/core/src/exchange/polymarket/trading', () => ({
   getOrderBook: vi.fn().mockResolvedValue({ asks: [{ price: '0.60', size: '100' }], bids: [{ price: '0.55', size: '100' }] }),
   getMarketPrice: vi.fn().mockResolvedValue({ bid: 0.55, ask: 0.60, mid: 0.575, spread: 0.05 }),
   getPositions: vi.fn().mockResolvedValue([]),
@@ -9,20 +9,20 @@ vi.mock('../../electron/sdk/trading', () => ({
 }));
 
 // Mock logger
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { RpcHandler, type RpcHandlerDeps } from '../../electron/runtime/RpcHandler';
-import type { PaperTradingState } from '../../electron/runtime/PaperTradingState';
-import type { RpcRequest } from '../../electron/sdk/types';
+import { RpcHandler, type RpcHandlerDeps } from '../../packages/core/src/runtime/RpcHandler';
+import type { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
+import type { RpcRequest } from '../../packages/core/src/sdk/types';
 import {
   getOrderBook,
   getMarketPrice,
   getPositions,
   getBalance,
-} from '../../electron/sdk/trading';
-import logger from '../../src/utils/logger';
+} from '../../packages/core/src/exchange/polymarket/trading';
+import logger from '../../packages/core/src/utils/logger';
 
 function makeMockPaperState() {
   return {

@@ -3,14 +3,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
 import { openRiskHarness, type RiskHarness } from './riskHarness';
-import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
-import { ShutdownMarker, applyStartupHalt, recoverOpenOrders, UNCLEAN_SHUTDOWN_REASON } from '../../electron/risk/StartupRecovery';
+import { GLOBAL_SCOPE } from '../../packages/core/src/db/repositories/RiskStateRepository';
+import { ShutdownMarker, applyStartupHalt, recoverOpenOrders, UNCLEAN_SHUTDOWN_REASON } from '../../packages/core/src/risk/StartupRecovery';
 
 const DAY = 86_400_000;
 const T0 = Date.parse('2026-06-02T12:00:00Z');

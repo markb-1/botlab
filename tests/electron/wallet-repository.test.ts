@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { WalletRepository, type WalletRow } from '../../electron/database/repositories/WalletRepository';
+import { WalletRepository, type WalletRow } from '../../packages/core/src/db/repositories/WalletRepository';
 
 // Mock generateId for deterministic IDs
 let idCounter = 0;
-vi.mock('../../electron/database/index', () => ({
+vi.mock('../../packages/core/src/db/index', () => ({
   generateId: () => `wallet-${++idCounter}`,
 }));
 

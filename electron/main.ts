@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, powerMonitor } from 'electron';
 import path from 'path';
-import { initializeDatabase, closeDatabase, getDataDir } from './database/index';
+import { initializeDatabase, closeDatabase, getDataDir } from '../packages/core/src/db/index';
 import {
   BotRepository,
   WalletRepository,
@@ -16,12 +16,12 @@ import {
   ForecastRepository,
   CategoryRightsRepository,
   OrderbookSnapshotRepository,
-} from './database/repositories/index';
-import type { Database } from './database/index';
-import { keyManager } from './security/keyManager';
-import { migrateSecretsToV2 } from './security/migrateSecrets';
-import { WalletManager } from '../src/core/WalletManager';
-import { BotManager } from '../src/core/BotManager';
+} from '../packages/core/src/db/repositories/index';
+import type { Database } from '../packages/core/src/db/index';
+import { keyManager } from '../packages/core/src/security/keyManager';
+import { migrateSecretsToV2 } from '../packages/core/src/security/migrateSecrets';
+import { WalletManager } from '../packages/core/src/bots/WalletManager';
+import { BotManager } from '../packages/core/src/bots/BotManager';
 import { registerAuthHandlers } from './ipc/handlers/authHandlers';
 import { registerBotHandlers } from './ipc/handlers/botHandlers';
 import { registerWalletHandlers } from './ipc/handlers/walletHandlers';
@@ -30,31 +30,31 @@ import { registerScriptHandlers } from './ipc/handlers/scriptHandlers';
 import { registerAiHandlers } from './ipc/handlers/aiHandlers';
 import { registerBacktestHandlers } from './ipc/handlers/backtestHandlers';
 import { registerRiskHandlers } from './ipc/handlers/riskHandlers';
-import { seedTemplates, getBuiltinTemplates } from './database/seed';
-import { AuditService } from './audit/AuditService';
-import { OrderCanceller } from './orders/OrderCanceller';
-import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/MarketDataService';
-import { FeeService } from './orders/FeeService';
-import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
-import { LedgerService } from './ledger/LedgerService';
+import { seedTemplates, getBuiltinTemplates } from '../packages/core/src/db/seed';
+import { AuditService } from '../packages/core/src/audit/AuditService';
+import { OrderCanceller } from '../packages/core/src/orders/OrderCanceller';
+import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from '../packages/core/src/orders/MarketDataService';
+import { FeeService } from '../packages/core/src/orders/FeeService';
+import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from '../packages/core/src/ledger/MarketCacheService';
+import { LedgerService } from '../packages/core/src/ledger/LedgerService';
 import { registerLedgerHandlers } from './ipc/handlers/ledgerHandlers';
-import { defaultCategories } from './config/categoriesSchema';
-import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from './risk/HaltService';
-import { KillSwitch } from './risk/KillSwitch';
-import { RiskMonitor } from './risk/RiskMonitor';
-import { ShutdownMarker, applyStartupHalt, recoverOpenOrders } from './risk/StartupRecovery';
-import { resolveConfigDir } from './config';
-import { ConfigService } from './config/ConfigService';
+import { defaultCategories } from '../packages/core/src/config/categoriesSchema';
+import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from '../packages/core/src/risk/HaltService';
+import { KillSwitch } from '../packages/core/src/risk/KillSwitch';
+import { RiskMonitor } from '../packages/core/src/risk/RiskMonitor';
+import { ShutdownMarker, applyStartupHalt, recoverOpenOrders } from '../packages/core/src/risk/StartupRecovery';
+import { resolveConfigDir } from '../packages/core/src/config';
+import { ConfigService } from '../packages/core/src/config/ConfigService';
 import { registerConfigHandlers } from './ipc/handlers/configHandlers';
-import { TelegramNotifier, telegramSettingsFrom } from './notify/TelegramNotifier';
-import { NotificationService } from './notify/NotificationService';
-import { unfilledNotional } from './orders/DbRiskStateProvider';
-import { getBinanceOrderBook, getBinancePrice, getBinanceServerTime } from './sdk/binance';
-import { FEE_CATEGORIES, type FeeCategory } from './orders/FeeService';
-import type { ClockSkewGuard } from './orders/OrderService';
-import { Reconciler } from './reconcile/Reconciler';
-import { fetchDataApiPositions, fetchDataApiTrades } from './reconcile/dataApi';
-import { Recorder } from './recorder/Recorder';
+import { TelegramNotifier, telegramSettingsFrom } from '../packages/core/src/notify/TelegramNotifier';
+import { NotificationService } from '../packages/core/src/notify/NotificationService';
+import { unfilledNotional } from '../packages/core/src/orders/DbRiskStateProvider';
+import { getBinanceOrderBook, getBinancePrice, getBinanceServerTime } from '../packages/core/src/exchange/binance/client';
+import { FEE_CATEGORIES, type FeeCategory } from '../packages/core/src/orders/FeeService';
+import type { ClockSkewGuard } from '../packages/core/src/orders/OrderService';
+import { Reconciler } from '../packages/core/src/reconcile/Reconciler';
+import { fetchDataApiPositions, fetchDataApiTrades } from '../packages/core/src/reconcile/dataApi';
+import { Recorder } from '../packages/core/src/recorder/Recorder';
 import { registerReconcileHandlers } from './ipc/handlers/reconcileHandlers';
 
 // Load environment variables

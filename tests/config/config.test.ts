@@ -15,7 +15,7 @@ import {
   DEFAULT_SERVER_YAML,
   ServerSchema,
   parseConfigYaml,
-} from '../../electron/config';
+} from '../../packages/core/src/config';
 
 let dir: string;
 

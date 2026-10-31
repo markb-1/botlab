@@ -1,14 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
 import { openLedgerHarness, gammaMarket, DAY, type LedgerHarness } from './harness';
-import { MARKET_RULES_CHANGED_EVENT, parseGammaMarketFull, type RulesChangedEvent } from '../../electron/ledger/MarketCacheService';
-import type { MarketInfo } from '../../electron/orders/MarketDataService';
-import { NotificationService } from '../../electron/notify/NotificationService';
+import { MARKET_RULES_CHANGED_EVENT, parseGammaMarketFull, type RulesChangedEvent } from '../../packages/core/src/ledger/MarketCacheService';
+import type { MarketInfo } from '../../packages/core/src/orders/MarketDataService';
+import { NotificationService } from '../../packages/core/src/notify/NotificationService';
 
 const info = (marketId: string, labels: string[] = ['Economy']): MarketInfo => ({
   marketId, question: 'q', outcome: 'Yes', tokenIds: [`${marketId}-yes`, `${marketId}-no`], endDate: null, volume24hrUsd: 1, labels, closed: false,

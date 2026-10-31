@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import fetchData from '../../src/utils/fetchData';
+import fetchData from '../../packages/core/src/utils/fetchData';
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
 

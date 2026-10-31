@@ -6,12 +6,12 @@
  * warning. CI installs it for Node, so they always run there.
  */
 
-import { closeDatabase, initializeDatabase, type Database } from '../../electron/database/index';
-import { BotRepository } from '../../electron/database/repositories/BotRepository';
-import { BotTradeRepository } from '../../electron/database/repositories/BotTradeRepository';
-import { BotStorageRepository } from '../../electron/database/repositories/BotStorageRepository';
-import { OrderRepository } from '../../electron/database/repositories/OrderRepository';
-import { RiskStateRepository } from '../../electron/database/repositories/RiskStateRepository';
+import { closeDatabase, initializeDatabase, type Database } from '../../packages/core/src/db/index';
+import { BotRepository } from '../../packages/core/src/db/repositories/BotRepository';
+import { BotTradeRepository } from '../../packages/core/src/db/repositories/BotTradeRepository';
+import { BotStorageRepository } from '../../packages/core/src/db/repositories/BotStorageRepository';
+import { OrderRepository } from '../../packages/core/src/db/repositories/OrderRepository';
+import { RiskStateRepository } from '../../packages/core/src/db/repositories/RiskStateRepository';
 
 export const sqliteAvailable: boolean = (() => {
   try {

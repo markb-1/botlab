@@ -4,14 +4,14 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable, openTestDb, type TestDb } from '../orders/db';
-import { OrderbookSnapshotRepository } from '../../electron/database/repositories/OrderbookSnapshotRepository';
-import { computeWatchSet, Recorder, DOWNSAMPLE_BUCKET_MS, RETENTION_FULL_MS } from '../../electron/recorder/Recorder';
-import { snapshotFromBook, type BookSnapshot } from '../../electron/recorder/snapshotCodec';
+import { OrderbookSnapshotRepository } from '../../packages/core/src/db/repositories/OrderbookSnapshotRepository';
+import { computeWatchSet, Recorder, DOWNSAMPLE_BUCKET_MS, RETENTION_FULL_MS } from '../../packages/core/src/recorder/Recorder';
+import { snapshotFromBook, type BookSnapshot } from '../../packages/core/src/recorder/snapshotCodec';
 
 describe('computeWatchSet', () => {
   const marketTokens = (m: string) => ({ m1: ['a1', 'a2'], m2: ['b1', 'b2'] })[m] ?? null;

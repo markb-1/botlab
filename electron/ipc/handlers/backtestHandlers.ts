@@ -5,11 +5,11 @@
 
 import { ipcMain } from 'electron';
 import type Database from 'better-sqlite3';
-import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
-import { BacktestRepository } from '../../database/repositories/BacktestRepository';
-import { BacktestEngine, type BacktestSource } from '../../backtest/BacktestEngine';
-import type { FeeRatesInput } from '../../backtest/snapshotSimulate';
-import type { OrderbookSnapshotRepository } from '../../database/repositories/OrderbookSnapshotRepository';
+import type { ScriptRepository } from '../../../packages/core/src/db/repositories/ScriptRepository';
+import { BacktestRepository } from '../../../packages/core/src/db/repositories/BacktestRepository';
+import { BacktestEngine, type BacktestSource } from '../../../packages/core/src/backtest/BacktestEngine';
+import type { FeeRatesInput } from '../../../packages/core/src/backtest/snapshotSimulate';
+import type { OrderbookSnapshotRepository } from '../../../packages/core/src/db/repositories/OrderbookSnapshotRepository';
 
 /** Polymarket snapshot backtests (spec §10) */
 export interface SnapshotBacktestDeps {

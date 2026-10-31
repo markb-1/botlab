@@ -20,11 +20,11 @@ const chokePointSyntax = [
     },
     {
         selector: `Literal[value=/${ORDER_ENDPOINTS}/]`,
-        message: 'Binance order endpoints may only be used in electron/sdk/binance.ts.',
+        message: 'Binance order endpoints may only be used in packages/core/src/exchange/binance/client.ts.',
     },
     {
         selector: `TemplateElement[value.raw=/${ORDER_ENDPOINTS}/]`,
-        message: 'Binance order endpoints may only be used in electron/sdk/binance.ts.',
+        message: 'Binance order endpoints may only be used in packages/core/src/exchange/binance/client.ts.',
     },
 ];
 const clobValueImports = [
@@ -34,15 +34,22 @@ const clobValueImports = [
 const orderModuleImports = [
     {
         group: ['**/exchange/polymarket/orders', '**/exchange/polymarket/orders.*'],
-        message: 'Only electron/orders/ExchangeAdapter.ts may import the Polymarket order adapter.',
+        message: 'Only packages/core/src/orders/ExchangeAdapter.ts may import the Polymarket order adapter.',
     },
     {
-        group: ['**/sdk/binance', '**/sdk/binance.*'],
+        group: ['**/exchange/binance/client', '**/exchange/binance/client.*'],
         importNames: ['executeBinanceBuy', 'executeBinanceSell'],
-        message: 'Only electron/orders/ExchangeAdapter.ts may import Binance order functions.',
+        message: 'Only packages/core/src/orders/ExchangeAdapter.ts may import Binance order functions.',
     },
 ];
 const restrictedImports = (opts) => ['error', opts];
+// packages/core is transport-free (spec §1.1): no Electron, no apps/*
+const coreTransportImports = [
+    { name: 'electron', message: 'packages/core must not import electron (transport code lives in electron/ or apps/*).' },
+];
+const coreTransportPatterns = [
+    { group: ['electron/*', '**/electron/**', '**/apps/**'], message: 'packages/core must not import from electron/ or apps/*.' },
+];
 
 /** @type {import('eslint').Linter.Config[]} */
 export default [
@@ -71,26 +78,42 @@ export default [
     },
     // Order choke point. Later blocks override earlier ones for the files they list.
     {
-        files: ['electron/**/*.ts', 'src/**/*.ts', 'scripts/**/*.{js,mjs,cjs,ts}'],
+        files: ['electron/**/*.ts', 'templates/**/*.ts', 'scripts/**/*.{js,mjs,cjs,ts}'],
         rules: {
             '@typescript-eslint/no-restricted-imports': restrictedImports({ paths: clobValueImports, patterns: orderModuleImports }),
             'no-restricted-syntax': chokePointSyntax,
         },
     },
     {
-        // Builds the ClobClient and the live adapters it hands to OrderService
-        files: ['src/core/BotManager.ts', 'electron/orders/**/*.ts'],
+        files: ['packages/core/**/*.ts'],
         rules: {
-            '@typescript-eslint/no-restricted-imports': restrictedImports({ patterns: orderModuleImports }),
+            '@typescript-eslint/no-restricted-imports': restrictedImports({
+                paths: [...clobValueImports, ...coreTransportImports],
+                patterns: [...orderModuleImports, ...coreTransportPatterns],
+            }),
+            'no-restricted-syntax': chokePointSyntax,
         },
     },
     {
-        files: ['electron/orders/ExchangeAdapter.ts'],
-        rules: { '@typescript-eslint/no-restricted-imports': 'off' },
+        // Builds the ClobClient and the live adapters it hands to OrderService
+        files: ['packages/core/src/bots/BotManager.ts', 'packages/core/src/orders/**/*.ts'],
+        rules: {
+            '@typescript-eslint/no-restricted-imports': restrictedImports({
+                paths: coreTransportImports,
+                patterns: [...orderModuleImports, ...coreTransportPatterns],
+            }),
+        },
+    },
+    {
+        files: ['packages/core/src/orders/ExchangeAdapter.ts'],
+        rules: { '@typescript-eslint/no-restricted-imports': restrictedImports({ paths: coreTransportImports, patterns: coreTransportPatterns }) },
     },
     {
         // The exchange adapters themselves
-        files: ['electron/exchange/polymarket/orders.ts', 'electron/sdk/binance.ts'],
-        rules: { '@typescript-eslint/no-restricted-imports': 'off', 'no-restricted-syntax': 'off' },
+        files: ['packages/core/src/exchange/polymarket/orders.ts', 'packages/core/src/exchange/binance/client.ts'],
+        rules: {
+            '@typescript-eslint/no-restricted-imports': restrictedImports({ paths: coreTransportImports, patterns: coreTransportPatterns }),
+            'no-restricted-syntax': 'off',
+        },
     },
 ];

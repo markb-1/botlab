@@ -1,7 +1,7 @@
 import { ipcMain, type WebContents } from 'electron';
-import type { HaltService } from '../../risk/HaltService';
-import type { KillSwitch } from '../../risk/KillSwitch';
-import type { BotRepository } from '../../database/repositories/BotRepository';
+import type { HaltService } from '../../../packages/core/src/risk/HaltService';
+import type { KillSwitch } from '../../../packages/core/src/risk/KillSwitch';
+import type { BotRepository } from '../../../packages/core/src/db/repositories/BotRepository';
 
 /**
  * Risk IPC (spec §4.2, §4.3, §4.6). Everything arriving over IPC comes from the UI, so the actor

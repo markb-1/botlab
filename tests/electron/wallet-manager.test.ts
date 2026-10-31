@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { WalletManager } from '../../src/core/WalletManager';
-import type { WalletRepository, WalletRow } from '../../electron/database/repositories/WalletRepository';
+import { WalletManager } from '../../packages/core/src/bots/WalletManager';
+import type { WalletRepository, WalletRow } from '../../packages/core/src/db/repositories/WalletRepository';
 
 // Mock logger to prevent file I/O
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 

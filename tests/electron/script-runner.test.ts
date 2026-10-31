@@ -31,13 +31,13 @@ vi.mock('worker_threads', () => ({
 
 // Mock RpcHandler
 const mockRpcHandle = vi.fn().mockResolvedValue({ id: 'rpc-1', result: 'ok' });
-vi.mock('../../electron/runtime/RpcHandler', () => ({
+vi.mock('../../packages/core/src/runtime/RpcHandler', () => ({
   RpcHandler: vi.fn().mockImplementation(() => ({
     handle: mockRpcHandle,
   })),
 }));
 
-import { ScriptRunner, type ScriptRunnerOptions } from '../../electron/runtime/ScriptRunner';
+import { ScriptRunner, type ScriptRunnerOptions } from '../../packages/core/src/runtime/ScriptRunner';
 
 function makeOptions(overrides: Partial<ScriptRunnerOptions> = {}): ScriptRunnerOptions {
   return {

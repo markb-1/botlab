@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../../src/utils/logger', () => ({
+vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
-import { TelegramNotifier, telegramSettingsFrom, type IncomingUpdate } from '../../electron/notify/TelegramNotifier';
-import { NotificationService, REJECTION_STORM_THRESHOLD } from '../../electron/notify/NotificationService';
+import { TelegramNotifier, telegramSettingsFrom, type IncomingUpdate } from '../../packages/core/src/notify/TelegramNotifier';
+import { NotificationService, REJECTION_STORM_THRESHOLD } from '../../packages/core/src/notify/NotificationService';
 import { EventEmitter } from 'events';
 
 const ADMIN = '4242';
@@ -272,7 +272,7 @@ describe('Telegram notifications', () => {
 
     // Polling errors surface from pollOnce (the loop catches and backs off), never from send paths
     await expect(notifier.pollOnce(0)).rejects.toThrow();
-    const { default: logger } = await import('../../src/utils/logger');
+    const { default: logger } = await import('../../packages/core/src/utils/logger');
     const logged = JSON.stringify((logger.error as any).mock.calls);
     expect(logged).not.toContain('TOKEN123');
   });
@@ -295,9 +295,9 @@ describe('Telegram notifications', () => {
 
 describe('config alerts and transport details', () => {
   it('a risk-raising edit that also disables Telegram still alerts the old chat', async () => {
-    const { classifyChange } = await import('../../electron/config');
-    const { LimitsSchema, MandateSchema, ServerSchema } = await import('../../electron/config');
-    const { FeesSchema } = await import('../../electron/orders/FeeService');
+    const { classifyChange } = await import('../../packages/core/src/config');
+    const { LimitsSchema, MandateSchema, ServerSchema } = await import('../../packages/core/src/config');
+    const { FeesSchema } = await import('../../packages/core/src/orders/FeeService');
     const base = () => ({ limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}), fees: FeesSchema.parse({}), server: ServerSchema.parse({}) });
     const before = base();
     before.server.notify.telegram = { enabled: true, bot_token: 'OLDTOKEN-1234', chat_id: '111' };

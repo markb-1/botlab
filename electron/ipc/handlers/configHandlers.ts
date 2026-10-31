@@ -1,6 +1,6 @@
 import { ipcMain, type WebContents } from 'electron';
-import type { ConfigService } from '../../config/ConfigService';
-import { CONFIG_FILE_NAMES, type ConfigFileName } from '../../config/changes';
+import type { ConfigService } from '../../../packages/core/src/config/ConfigService';
+import { CONFIG_FILE_NAMES, type ConfigFileName } from '../../../packages/core/src/config/changes';
 
 /**
  * Config IPC (spec §3). Human only: every call must come from the app's main window; the actor

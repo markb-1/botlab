@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { PaperTradingState } from '../../electron/runtime/PaperTradingState';
-import type { BinanceOrderBook } from '../../electron/sdk/types';
+import { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
+import type { BinanceOrderBook } from '../../packages/core/src/sdk/types';
 
 function makeStorageRepo() {
   const store = new Map<string, unknown>();

@@ -1,7 +1,7 @@
 import { ipcMain, type WebContents } from 'electron';
-import type { Reconciler } from '../../reconcile/Reconciler';
-import type { OrderbookSnapshotRepository } from '../../database/repositories/OrderbookSnapshotRepository';
-import type { AuditService } from '../../audit/AuditService';
+import type { Reconciler } from '../../../packages/core/src/reconcile/Reconciler';
+import type { OrderbookSnapshotRepository } from '../../../packages/core/src/db/repositories/OrderbookSnapshotRepository';
+import type { AuditService } from '../../../packages/core/src/audit/AuditService';
 
 /**
  * Reconciler and recorder IPC (spec §10, §13). Writes are human-only and accepted from the main window only.

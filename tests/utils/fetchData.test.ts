@@ -21,7 +21,7 @@ vi.mock('axios', async () => {
 });
 
 // Import after mocking
-import fetchData from '../../src/utils/fetchData';
+import fetchData from '../../packages/core/src/utils/fetchData';
 
 const mockedAxios = vi.mocked(axios);
 
