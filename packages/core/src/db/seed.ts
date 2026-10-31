@@ -90,14 +90,26 @@ export async function seedTemplates(
     const version = meta.version || '1.0.0';
 
     // Check if this template already exists
-    const existing = scriptRepo.findByNameAndVersion(name, version);
+    // Same name and version, else the builtin row of the same name (a new meta.version updates it in place, so its
+    // bots run the new code — and go back to paper — instead of staying on an orphaned old row)
+    const existing =
+      scriptRepo.findByNameAndVersion(name, version) ?? scriptRepo.findAll().find((r) => r.name === name && r.origin === 'builtin' && r.is_template === 1);
     if (existing) {
       // Update source and recompile if template file has changed on disk
       const sourceChanged = existing.source.trim() !== source.trim();
+      if (existing.version !== version) scriptRepo.update(existing.id, { version }, 'system');
       if (sourceChanged || !existing.compiled) {
         const compiled = await compileSource(source);
         if (compiled) {
-          scriptRepo.update(existing.id, { source, compiled }, 'system');
+          // A changed source also brings its description and config schema (the agent's config checks read the
+          // schema, R172); the 1c rule sends every bot on it back to paper (ScriptRepository.update)
+          scriptRepo.update(
+            existing.id,
+            { source, compiled, ...(sourceChanged ? { description: meta.description || '', configSchema: meta.configSchema || {} } : {}) },
+            'system'
+          );
+          // A builtin whose meta says trust `new` (5c: Copy Trading v2) must prove the changed code again (R183)
+          if (sourceChanged && meta.trust === 'new' && existing.trust !== 'new') scriptRepo.setTrust(existing.id, 'new');
           console.log(`[Seed] Updated template: ${name} v${version}${sourceChanged ? ' (source changed)' : ' (compiled)'}`);
         }
       }

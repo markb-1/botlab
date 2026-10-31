@@ -50,6 +50,9 @@ import type {
   ExitRequest,
   OrderHistoryEntry,
   CapitalDemand,
+  MandateSummary,
+  CopyContext,
+  CopyLeaderStatus,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../utils/kellyCalculator';
 
@@ -290,7 +293,13 @@ export function createBotContext(params: {
       getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
       getExitFlags: () => rpcCall('risk:getExitFlags') as Promise<BotExitFlag[]>,
       getExitPolicy: () => rpcCall('risk:getExitPolicy') as Promise<ExitPolicy>,
+      getMandateSummary: () => rpcCall('risk:getMandateSummary') as Promise<MandateSummary | null>,
     } as RiskContext,
+
+    // Copy Trading template only: the server refuses it for any other bot
+    copy: {
+      getLeaders: (addresses: string[]) => rpcCall('copy:getLeaders', addresses) as Promise<CopyLeaderStatus[]>,
+    } as CopyContext,
 
     // Retire this bot (server-side, audited as the bot); the worker is stopped shortly after
     requestRetire: (reason: string) => rpcCall('bot:requestRetire', reason) as Promise<{ accepted: boolean }>,

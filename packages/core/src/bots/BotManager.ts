@@ -24,7 +24,8 @@ import { PaperTradingState } from '../runtime/PaperTradingState';
 import { builtinRoleOf, isStandingRole, type BuiltinRole } from '../db/repositories/ScriptRepository';
 import type { PositionExitFlagRepository } from '../db/repositories/AgentRepository';
 import { PortfolioService, type ExitOrderService } from '../orders/PortfolioService';
-import type { BotPushEventName } from '../sdk/types';
+import type { BotPushEventName, MandateSummary } from '../sdk/types';
+import type { CopyLeaderService } from '../services/CopyLeaderService';
 import type { Database } from '../db/index';
 import type { OrderRepository } from '../db/repositories/OrderRepository';
 import type { RiskStateRepository } from '../db/repositories/RiskStateRepository';
@@ -97,6 +98,8 @@ export interface BotManagerOrderDeps {
   clock?: ClockSkewGuard;
   /** position_exit_flags (R140): read and closed by the builtin position manager (ctx.portfolio) */
   exitFlags?: PositionExitFlagRepository;
+  /** Copy-trading leaders (5c): ctx.copy and order attribution for the builtin Copy Trading template */
+  copyLeaders?: Pick<CopyLeaderService, 'statusFor' | 'recordOrder'>;
 }
 
 /**
@@ -426,6 +429,21 @@ export class BotManager extends EventEmitter {
   }
 
   /** Limits currently in force; null when the config failed to load. */
+  /** The mandate's market filters as bots see them (ctx.risk.getMandateSummary); null when the config is invalid */
+  getMandateSummary(): MandateSummary | null {
+    const cfg = this.riskEngine?.getConfig();
+    if (!cfg) return null;
+    const { mandate, limits } = cfg;
+    return {
+      categoriesAllow: [...mandate.categories.allow],
+      resolvesWithinDays: [mandate.markets.resolves_within_days[0], mandate.markets.resolves_within_days[1]],
+      longHorizonDays: [mandate.markets.long_horizon_days[0], mandate.markets.long_horizon_days[1]],
+      minLiquidityUsd: Math.max(mandate.markets.min_liquidity_usd, limits.per_market.min_liquidity_usd),
+      maxAmbiguityScore: mandate.markets.max_ambiguity_score,
+      strategiesAllow: [...mandate.strategies.allow],
+    };
+  }
+
   getLimits(): LimitsConfig | null {
     return this.riskEngine?.getConfig().limits ?? null;
   }
@@ -749,6 +767,16 @@ export class BotManager extends EventEmitter {
         : {}),
       exitPolicy: (simulated: boolean) => this.getExitPolicy(simulated),
       ...(this.orderDeps?.marketCache ? { eventMarketIds: (eventId: string) => this.orderDeps!.marketCache!.getEventMarketIds(eventId) } : {}),
+      mandateSummary: () => this.getMandateSummary(),
+      // Copy Trading template only (role from the script row): leader status and order attribution, bound to this bot
+      ...(role === 'copy' && this.orderDeps?.copyLeaders
+        ? {
+            copy: {
+              getLeaders: (addresses: unknown) => this.orderDeps!.copyLeaders!.statusFor(botId, addresses),
+              recordOrder: (orderId: string, info: Parameters<CopyLeaderService['recordOrder']>[2]) => this.orderDeps!.copyLeaders!.recordOrder(botId, orderId, info),
+            },
+          }
+        : {}),
       // Retire runs after the RPC reply (it stops this very worker), via the core's BotService (audited as the bot)
       requestRetire: (reason: string) => {
         setImmediate(() => this.emit(BOT_RETIRE_REQUEST_EVENT, { botId, reason }));

@@ -10,7 +10,7 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail, MandateSummary, CopyLeaderStatus, CopyOrderTag } from '../sdk/types';
 import type { MarketView } from '../ledger/MarketCacheService';
 import type { ForecastView } from '../ledger/LedgerService';
 import type { PaperTradingState } from './PaperTradingState';
@@ -113,6 +113,13 @@ export interface RpcHandlerDeps {
   eventMarketIds?: (eventId: string) => Promise<string[] | null>;
   /** Retire this bot (ctx.requestRetire): BotManager runs it after the reply, outside the RPC */
   requestRetire?: (reason: string) => void;
+  /** The mandate's market filters (ctx.risk.getMandateSummary); null = config invalid */
+  mandateSummary?: () => MandateSummary | null;
+  /** Copy-trading leaders (5c): given only to the builtin Copy Trading template; missing ⇒ ctx.copy fails, orders are not attributed */
+  copy?: {
+    getLeaders(addresses: unknown): CopyLeaderStatus[];
+    recordOrder(orderId: string, info: { leader: string; key?: string | null; side: 'buy' | 'sell'; leaderPrice?: number | null; leaderUsd?: number | null }): void;
+  };
 }
 
 /** Ambiguity at or above which the Position Manager exits (its `ambiguity` trigger); the template reads it from here */
@@ -148,6 +155,7 @@ export function toMarketDetail(m: MarketView, askedFor: string, scope: string[] 
     disputed: m.disputed,
     umaResolutionStatus: m.umaResolutionStatus,
     inScope: scope === null || scope.includes(m.marketId),
+    liquidityUsd: m.liquidityUsd,
     updatedAt: m.updatedAt,
   };
 }
@@ -267,7 +275,7 @@ export class RpcHandler {
       case 'polymarket:placeLimit': {
         const opts = (args[4] && typeof args[4] === 'object' ? args[4] : {}) as LimitOrderOpts;
         if (args[1] !== 'sell') this.refuseBuy('placeLimit');
-        return this.orders.placeLimit({
+        const result = await this.orders.placeLimit({
           tokenId: args[0] as string,
           side: args[1] as 'buy' | 'sell',
           price: args[2] as number,
@@ -277,6 +285,22 @@ export class RpcHandler {
           reason: opts.reason,
           forecastId: opts.forecastId,
         });
+        // Copy bots (5c): which leader trade the order copies, for the per-leader P&L (only the copy template's bots)
+        const tag = opts.copy as CopyOrderTag | undefined;
+        if (this.deps.copy && tag && typeof tag === 'object' && typeof tag.leader === 'string' && result.ok && result.orderId) {
+          try {
+            this.deps.copy.recordOrder(result.orderId, {
+              leader: tag.leader,
+              key: typeof tag.key === 'string' ? tag.key : null,
+              side: args[1] === 'sell' ? 'sell' : 'buy',
+              leaderPrice: typeof tag.leaderPrice === 'number' ? tag.leaderPrice : null,
+              leaderUsd: typeof tag.leaderUsd === 'number' ? tag.leaderUsd : null,
+            });
+          } catch (err) {
+            logger.warning(`[RpcHandler] Copy attribution of order ${result.orderId} failed: ${err instanceof Error ? err.message : err}`);
+          }
+        }
+        return result;
       }
 
       case 'polymarket:cancel':
@@ -307,6 +331,13 @@ export class RpcHandler {
 
       case 'risk:getExitPolicy':
         return this.deps.exitPolicy ? this.deps.exitPolicy() : defaultExitPolicy();
+
+      case 'risk:getMandateSummary':
+        return this.deps.mandateSummary ? this.deps.mandateSummary() : null;
+
+      case 'copy:getLeaders':
+        if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');
+        return this.deps.copy.getLeaders(args[0]);
 
       case 'polymarket:getEventMarketIds': {
         const eventId = args[0];

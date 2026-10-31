@@ -215,6 +215,8 @@ export const NotesFilterSchema = z.object({
   limit: z.number().int().min(1).max(500).optional(),
 });
 export const RunHistorySchema = z.object({ limit: z.number().int().min(1).max(100).optional() });
+/** Re-activate a dropped copy-trading leader (human only) */
+export const CopyLeaderReactivateSchema = z.object({ address: z.string().regex(/^0x[0-9a-fA-F]{40}$/) });
 export const LeaderboardInputSchema = z.object({
   period: z.enum(['DAY', 'WEEK', 'MONTH', 'ALL']).optional(),
   orderBy: z.enum(['PNL', 'VOL']).optional(),

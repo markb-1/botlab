@@ -66,6 +66,10 @@ export interface ScriptBotRunnerDeps {
   exitPolicy?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitPolicy']>>;
   /** ctx.polymarket.getEventMarketIds */
   eventMarketIds?: RpcHandlerDeps['eventMarketIds'];
+  /** ctx.risk.getMandateSummary */
+  mandateSummary?: RpcHandlerDeps['mandateSummary'];
+  /** ctx.copy and copy-order attribution: builtin Copy Trading template only */
+  copy?: RpcHandlerDeps['copy'];
 }
 
 export const DEFAULT_PAPER_BALANCE = 10_000;
@@ -117,6 +121,8 @@ export class ScriptBotRunner extends BaseBotRunner {
       requestRetire: this.deps.requestRetire,
       ...(this.deps.exitPolicy ? { exitPolicy: () => this.deps.exitPolicy!(this.deps.mode === 'paper') } : {}),
       eventMarketIds: this.deps.eventMarketIds,
+      mandateSummary: this.deps.mandateSummary,
+      ...(this.deps.role === 'copy' && this.deps.copy ? { copy: this.deps.copy } : {}),
     };
 
     // Create paper trading state if in paper mode

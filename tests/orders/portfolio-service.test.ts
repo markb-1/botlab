@@ -243,7 +243,11 @@ describe.skipIf(!sqliteAvailable)('PortfolioService', () => {
     expect(builtinRoleOf(pm)).toBe('position-manager');
     expect(builtinRoleOf(ex)).toBe('forecast-executor');
     expect(ex.trust).toBe('new');
-    expect(scripts.findAll().find((s) => s.name === 'Copy Trading')!.trust).toBe('proven');
+    expect(scripts.findAll().find((s) => s.name === 'Binance Spot Trading' || s.name.startsWith('Binance'))!.trust).toBe('proven');
+    // Copy Trading v2 (5c) is new code: trust new, strategy role copy
+    const copyTpl = scripts.findAll().find((s) => s.name === 'Copy Trading')!;
+    expect(copyTpl.trust).toBe('new');
+    expect(builtinRoleOf(copyTpl)).toBe('copy');
     // A human copy of the source (same meta) has no role: the role is never read from a script
     const copy = scripts.create({ name: 'Position Manager (copy)', source: pm.source, origin: 'human' });
     scripts.setBuiltinRole(copy.id, 'position-manager');

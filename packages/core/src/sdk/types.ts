@@ -79,6 +79,9 @@ export interface BotContext {
   // === All bots' positions and risk exits: builtin Position Manager template only (others get an error) ===
   portfolio: PortfolioContext;
 
+  // === Copy-trading leaders and their status: builtin Copy Trading template only (others get an error) ===
+  copy: CopyContext;
+
   /**
    * Ask the server to retire THIS bot (stage `retired`: stopped, never trades again; only a human can un-retire).
    * For per-opportunity bots whose opportunity is over (markets resolved, gap closed for days). The server stops
@@ -156,6 +159,22 @@ export interface LimitOrderOpts {
   ttlMinutes?: number;
   reason?: string;
   forecastId?: string;
+  /**
+   * Builtin Copy Trading template only (ignored for other bots): the leader trade this order copies, recorded by the
+   * server for the per-leader P&L (leader scoring, spec §9.5).
+   */
+  copy?: CopyOrderTag;
+}
+
+/** The leader trade a copy order mirrors (LimitOrderOpts.copy). */
+export interface CopyOrderTag {
+  /** Leader wallet (0x address) */
+  leader: string;
+  /** De-duplication key of the leader's trade (transaction hash + log index) */
+  key?: string;
+  /** Leader's fill price and USD size */
+  leaderPrice?: number;
+  leaderUsd?: number;
 }
 
 /** Result of placing an order. Rejections are returned (ok: false), not thrown. */
@@ -283,6 +302,8 @@ export interface MarketDetail {
   umaResolutionStatus: string | null;
   /** This bot may trade the market: it is in the bot's market_ids (or the bot is not market-scoped) */
   inScope: boolean;
+  /** Gamma liquidity (USD) the risk engine compares with the minimum; null if unknown */
+  liquidityUsd: number | null;
   /** When the cache row was last refreshed */
   updatedAt: string;
 }
@@ -312,6 +333,45 @@ export interface RiskContext {
    * bot's config: buying into a market it would exit at once is pointless.
    */
   getExitPolicy(): Promise<ExitPolicy>;
+  /**
+   * The mandate's market filters (read-only), as the risk engine applies them to buys: allowed categories,
+   * settlement horizons, minimum liquidity, maximum ambiguity, allowed strategies. null when the config is invalid
+   * (every buy is refused then).
+   */
+  getMandateSummary(): Promise<MandateSummary | null>;
+}
+
+/** The mandate's market filters (ctx.risk.getMandateSummary). */
+export interface MandateSummary {
+  /** Categories bots may buy in (`categories.allow`) */
+  categoriesAllow: string[];
+  /** Default settlement horizon in days [min, max] */
+  resolvesWithinDays: [number, number];
+  /** Long horizon in days [min, max] (capped by a global share of exposure) */
+  longHorizonDays: [number, number];
+  /** Minimum market liquidity (USD): the larger of the mandate's and limits.yaml per_market */
+  minLiquidityUsd: number;
+  /** Markets with ambiguity above this are not bought */
+  maxAmbiguityScore: number;
+  /** Strategy keys allowed for agent bots (`strategies.allow`) */
+  strategiesAllow: string[];
+}
+
+/** One leader of a copy bot as the server knows it (ctx.copy.getLeaders). */
+export interface CopyLeaderStatus {
+  /** Lower-case 0x address */
+  address: string;
+  /** active: copy it; dropped: its copies lost (auto-drop) — never copy until a human re-activates it; removed / unknown: not a leader of this bot */
+  status: 'active' | 'dropped' | 'removed' | 'unknown';
+  droppedReason: string | null;
+}
+
+/**
+ * ctx.copy — builtin Copy Trading template only (checked by the server from the script record). The status of the
+ * leaders named in the bot's config; the server runs the leader auto-drop check here.
+ */
+export interface CopyContext {
+  getLeaders(addresses: string[]): Promise<CopyLeaderStatus[]>;
 }
 
 /** The Position Manager's risk-exit thresholds (ctx.risk.getExitPolicy). */
@@ -792,6 +852,8 @@ export type RpcMethod =
   | 'risk:getBudget'
   | 'risk:getExitFlags'
   | 'risk:getExitPolicy'
+  | 'risk:getMandateSummary'
+  | 'copy:getLeaders'
   | 'bot:requestRetire'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'

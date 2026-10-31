@@ -26,6 +26,7 @@ import logger from '../utils/logger';
 import { ServiceError, conflict, notFound } from './errors';
 import type { BotCreateInput, BotUpdateInput } from './schemas';
 import type { LimitsConfig, MandateConfig } from '../config/schema';
+import { copyLeadersOf, MAX_COPY_LEADERS, type CopyLeaderService } from './CopyLeaderService';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -371,6 +372,8 @@ export interface BotServiceDeps {
   getForecast?: (id: string) => { tokenId: string; status: string } | null;
   /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
   getMandate?: () => MandateConfig | null;
+  /** Copy-trading leader rows (5c): kept in step with a copy bot's config, dropped leaders stay dropped */
+  copyLeaders?: Pick<CopyLeaderService, 'sync' | 'droppedAmong' | 'forgetBot'>;
   now?: () => number;
 }
 
@@ -385,10 +388,14 @@ export interface StrategyMarketInfo {
 }
 
 /** Mandate `strategies.allow` key of each builtin strategy role */
-const STRATEGY_KEYS: Record<StrategyRole, string> = { consistency: 'consistency', 'resolution-rule': 'resolution_rule' };
+const STRATEGY_KEYS: Record<StrategyRole, string> = { consistency: 'consistency', 'resolution-rule': 'resolution_rule', copy: 'copy' };
 
-/** The token ids a strategy-role bot's config trades (consistency: `tokens`; resolution-rule: `token_id`). */
+/**
+ * The token ids a strategy-role bot's config trades (consistency: `tokens`; resolution-rule: `token_id`; copy: none —
+ * it follows leaders across markets and is not market-scoped).
+ */
 export function strategyConfigTokens(role: StrategyRole, config: Record<string, unknown> | undefined): string[] {
+  if (role === 'copy') return [];
   const c = config ?? {};
   const raw = role === 'consistency' ? (Array.isArray(c.tokens) ? c.tokens : []) : [c.token_id];
   return [...new Set(raw.filter((t): t is string => typeof t === 'string' && t.trim() !== '').map((t) => t.trim()))];
@@ -521,6 +528,16 @@ export class BotService {
     }
     const errors = validateConfigAgainstSchema(config, schema);
     if (errors.length > 0) deny(`config does not match the ${role} template: ${errors.slice(0, 5).join('; ')}`);
+    if (role === 'copy') {
+      // Copy bots (5c, spec §9.5) follow leaders, not tokens: valid leader addresses, a dropped leader is not re-added
+      const { leaders, invalid } = copyLeadersOf(config);
+      if (invalid.length > 0) deny(`leaders must be 0x addresses (not ${invalid.slice(0, 3).join(', ')})`);
+      if (leaders.length === 0) deny('config names no leader (leaders: [0x…]; get_leaderboard proposes some)');
+      if (leaders.length > MAX_COPY_LEADERS) deny(`at most ${MAX_COPY_LEADERS} leaders per bot`);
+      const dropped = target ? (this.deps.copyLeaders?.droppedAmong(target, leaders) ?? []) : [];
+      if (dropped.length > 0) deny(`leader ${dropped[0]} was dropped on this bot for losing copies; only a human can re-activate it`);
+      return;
+    }
     const tokens = strategyConfigTokens(role, config);
     if (tokens.length === 0) deny(`config names no token (${role === 'consistency' ? 'tokens' : 'token_id'})`);
     if (!marketIds || marketIds.length === 0) deny(`${role} bots need marketIds covering every token in the config`);
@@ -654,6 +671,7 @@ export class BotService {
       createdBy: who.kind,
       marketIds: data.marketIds ?? null,
     });
+    if (builtinRoleOf(script) === 'copy') this.deps.copyLeaders?.sync(row.id, data.config, who.kind);
     audit?.record(actor, 'bot.create', row.id, {
       name: data.name,
       scriptId: data.scriptId,
@@ -726,6 +744,16 @@ export class BotService {
       botRepo.setTemplateVersion(id, script?.revision ?? null);
     }
     const fresh = botRepo.findById(id) ?? row;
+    // Copy bots (5c): leader rows follow the config (takes effect at the bot's next start, like any config change)
+    if ((data.config !== undefined || data.scriptId !== undefined) && builtinRoleOf(scriptRepo.findById(fresh.script_id)) === 'copy') {
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = JSON.parse(fresh.config || '{}') as Record<string, unknown>;
+      } catch {
+        cfg = {};
+      }
+      this.deps.copyLeaders?.sync(id, cfg, who.kind);
+    }
     return this.toView(fresh);
   }
 
@@ -747,6 +775,7 @@ export class BotService {
     if (!deleted) throw conflict('Bot not found or cannot be deleted (must be stopped)');
     audit?.record(actor, 'bot.delete', id, { name: botRow?.name, scriptId: botRow?.script_id, stage: botRow?.stage });
     this.deps.activity?.forget(id);
+    this.deps.copyLeaders?.forgetBot(id);
 
     // Clean up auto-generated paper wallet
     if (isPaperWallet && paperWalletId) {

@@ -86,6 +86,8 @@ import type { AgentTrigger } from './agent/schedule';
 import { PublicError, publicLookupError } from './services/redact';
 import { getBalance } from './exchange/polymarket/trading';
 import { getBinanceBalance } from './exchange/binance/client';
+import { CopyLeaderRepository } from './db/repositories/CopyLeaderRepository';
+import { CopyLeaderService } from './services/CopyLeaderService';
 
 export interface CoreOptions {
   /** Directory for the database, shutdown marker, notify state and config history (created if missing) */
@@ -148,6 +150,8 @@ export interface CoreServices {
   auditLog: AuditLogService;
   /** Agent runs, notes, budget and exit flags (spec §7) */
   agent: AgentService;
+  /** Copy-trading leaders and their scores (spec §9.5, 5c) */
+  copy: CopyLeaderService;
 }
 
 export interface Core {
@@ -319,6 +323,7 @@ export function createCore(options: CoreOptions): Core {
     },
     isRunning: (id) => botManager?.isRunning(id) ?? false,
     getAgentDigest: () => agentService.digestText(),
+    getCopyDigest: () => copyLeaders.digestText(),
     stateFile: path.join(dataDir, 'notify-state.json'),
   });
 
@@ -466,6 +471,19 @@ export function createCore(options: CoreOptions): Core {
   // Recent bot logs / custom events for the UI (Logs and Events tabs); filled from bot:event after unlock
   const activity = new BotActivityLog();
 
+  // ── Copy-trading leaders (5c): per-leader P&L marks at the market cache's last outcome price ──
+  const copyLeaders = new CopyLeaderService({
+    repo: new CopyLeaderRepository(db),
+    botRepo,
+    audit,
+    mark: (tokenId) => {
+      const m = marketCache.getCachedByToken(tokenId);
+      const i = m ? m.tokens.findIndex((t) => t.tokenId === tokenId) : -1;
+      const p = m && i >= 0 && m.outcomePrices ? parseFloat(m.outcomePrices[i] ?? '') : NaN;
+      return Number.isFinite(p) ? p : null;
+    },
+  });
+
   // ── Services ──────────────────────────────────────────────────────
   const services: CoreServices = {
     bots: new BotService({
@@ -494,6 +512,7 @@ export function createCore(options: CoreOptions): Core {
         return f ? { tokenId: f.token_id, status: f.status } : null;
       },
       getMandate: () => configService.getConfig()?.mandate ?? null,
+      copyLeaders,
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),
     scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null, guardAgentRun }),
@@ -568,6 +587,7 @@ export function createCore(options: CoreOptions): Core {
     }),
     auditLog: new AuditLogService(repos.auditRepo),
     agent: agentService,
+    copy: copyLeaders,
   };
 
   // ── Lifecycle ─────────────────────────────────────────────────────
@@ -722,6 +742,7 @@ export function createCore(options: CoreOptions): Core {
       ledger,
       clock: clockGuard,
       exitFlags: exitFlagRepo,
+      copyLeaders,
     });
     botManager = manager;
     // ctx.requestRetire (5b): a script retires its own bot, audited as the bot

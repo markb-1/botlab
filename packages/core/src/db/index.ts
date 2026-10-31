@@ -606,6 +606,35 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     'ALTER TABLE scripts ADD COLUMN builtin_role TEXT',
     // 5a: the bot that placed an order on another bot's behalf (position-manager exits; NULL = the bot itself)
     'ALTER TABLE orders ADD COLUMN placed_by TEXT',
+    // 5c: copy-trading leaders per bot (spec §9.5 leader scoring). status: active (copied), dropped (auto-drop on
+    // losing copies; only a human re-activates), removed (no longer in the bot's config). active_since starts the
+    // auto-drop window (reset on re-activation / re-adding).
+    `CREATE TABLE IF NOT EXISTS copy_leaders (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      address TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','dropped','removed')),
+      added_at TEXT NOT NULL,
+      added_by TEXT NOT NULL,
+      active_since TEXT NOT NULL,
+      dropped_at TEXT,
+      dropped_reason TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE(bot_id, address)
+    )`,
+    // 5c: which leader trade an order copied (attribution for the per-leader P&L); written by the server when a
+    // copy-role bot places an order tagged with the leader (LimitOrderOpts.copy)
+    `CREATE TABLE IF NOT EXISTS copy_trades (
+      order_id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      leader TEXT NOT NULL,
+      leader_key TEXT,
+      side TEXT NOT NULL,
+      leader_price REAL,
+      leader_usd REAL,
+      created_at TEXT NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_copy_trades_bot ON copy_trades(bot_id, leader)',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

@@ -36,13 +36,14 @@ export interface ScriptRow {
  * - standing (spec §9.1, §9.2): forecast executor, position manager — one running instance per mode, human-operated
  *   (the agent may only pause them, R168);
  * - per-opportunity strategies (spec §9.3, §9.4; 5b): consistency, resolution-rule — any number of bots, the agent
- *   creates them (its bots' `market_ids` must cover every token in the config, checked by BotService).
+ *   creates them (its bots' `market_ids` must cover every token in the config, checked by BotService); copy (5c,
+ *   spec §9.5) — follows leaders across markets, so it is not market-scoped.
  */
 export type StandingRole = 'forecast-executor' | 'position-manager';
-export type StrategyRole = 'consistency' | 'resolution-rule';
+export type StrategyRole = 'consistency' | 'resolution-rule' | 'copy';
 export type BuiltinRole = StandingRole | StrategyRole;
 export const STANDING_ROLES: readonly StandingRole[] = ['forecast-executor', 'position-manager'];
-export const STRATEGY_ROLES: readonly StrategyRole[] = ['consistency', 'resolution-rule'];
+export const STRATEGY_ROLES: readonly StrategyRole[] = ['consistency', 'resolution-rule', 'copy'];
 export const BUILTIN_ROLES: readonly BuiltinRole[] = [...STANDING_ROLES, ...STRATEGY_ROLES];
 
 /** A standing (single-instance, human-operated) role */
@@ -50,7 +51,7 @@ export function isStandingRole(role: BuiltinRole | null | undefined): role is St
   return !!role && (STANDING_ROLES as readonly string[]).includes(role);
 }
 
-/** A per-opportunity strategy role (consistency, resolution-rule) */
+/** A per-opportunity strategy role (consistency, resolution-rule, copy) */
 export function isStrategyRole(role: BuiltinRole | null | undefined): role is StrategyRole {
   return !!role && (STRATEGY_ROLES as readonly string[]).includes(role);
 }
