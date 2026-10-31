@@ -178,6 +178,52 @@ On macOS and Linux, `npm run service:install` prints a launchd / systemd unit wi
 
 ---
 
+## Hosting on a VPS
+
+Polymarket blocks some IPs: whole countries (**geo-block**, the Terms of Service restrict them) and, separately,
+many datacenter ranges (**bot protection**: Cloudflare challenge pages, 403s, 429s, dropped connections — an
+Oracle Cloud VM has been blocked this way). Test a candidate server **before** migrating:
+
+1. Rent the smallest **hourly-billed** instance in the provider / region you want and install Node 22 and BotLab
+   (`npm install`; no database or key needed).
+2. Run the check:
+
+   ```bash
+   npm run cli -- check-polymarket              # table + verdict; --json for machine-readable output
+   npm run cli -- check-polymarket --binance    # also Binance's public API (451 = restricted location)
+   ```
+
+   It calls, read-only, every endpoint BotLab uses: Cloudflare's trace (public IP and country), Polymarket's
+   geoblock endpoint, the CLOB (`/time` with clock skew, `/markets/{id}`, `/book`), Gamma (`/markets`, `/events`)
+   and the data API (`/positions`, `/activity`), 10 s timeout each. Each row is `ok`, `geo_blocked`,
+   `bot_challenge`, `forbidden`, `rate_limited`, `network_error` or `unexpected`, and the last line is the verdict:
+   `OK: this IP can use Polymarket` (exit 0), `BLOCKED (geo): …` or `BLOCKED (datacenter/bot protection): …`
+   (exit 1), `DEGRADED: …` (exit 2: rate limits, partial failures, clock skew, Binance restricted).
+3. **Keep the instance only if the verdict is OK**; otherwise destroy it and try another provider or region.
+   After migrating, re-run the check now and then (e.g. weekly, or when orders start failing): ranges get
+   re-classified. With a configured wallet, `npm run cli -- check-polymarket --prod --with-credentials` also makes
+   authenticated read-only CLOB calls (derive the existing API key — it never creates one —, list API keys,
+   close-only status). It opens the database read-only, so it may run next to the server; keys are never printed.
+
+- **Geo vs datacenter**: a geo-block is about the country — another provider in the same country will not help,
+  only a server in an allowed country will. A datacenter / bot block is about the IP range — another provider
+  or region (or a residential connection) can work.
+- **Do not use a VPN or proxy to get around a geo restriction**: it breaks Polymarket's Terms of Service and can
+  get the account restricted to close-only or closed. (`HTTPS_PROXY` is honoured by the check, but then it
+  tests the proxy's IP and says so.)
+- **Expose BotLab over Tailscale only**: bind it to the Tailscale address (`BOTLAB_HOST=100.x.y.z`; or keep
+  127.0.0.1 behind `tailscale serve`), never `0.0.0.0`; allow no inbound port in the provider's firewall (SSH over
+  Tailscale too, if you can), and open the UI at `http://<machine>.<tailnet>.ts.net:3780` (`*.ts.net` names are
+  allowed by default).
+- **Back up off the box**: the nightly backups land in `<data dir>/backups` on the same disk. Copy them elsewhere
+  (restic / rclone / rsync to another machine or bucket) and keep the **master key** in a separate place
+  (password manager): a backup without it cannot decrypt the wallet keys.
+- A **home connection** (the Windows service above, a Mac mini, a Raspberry-class Linux box) is the most reliable
+  fallback: residential IPs are rarely filtered, and a UPS plus the halted restart after a power cut cover the
+  rest.
+
+---
+
 ## Configuration
 
 | variable | default | |
@@ -616,7 +662,7 @@ npm start              # built server serving the built UI (production paths)
 npm run typecheck      # core + server + web
 npm test               # vitest (SKIP_NETWORK_TESTS=1 skips live-API tests)
 npm run lint           # ESLint (0 errors expected)
-npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke
+npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke | check-polymarket
 npm run gen:sdk        # regenerate botlab-sdk.d.ts (packages/core/src/sdk/sdkDts.generated.ts) after editing sdk/types.ts
 npm run mcp:stdio      # MCP stdio proxy (BOTLAB_URL, BOTLAB_AGENT_TOKEN); mcp:stdio:dev runs it from source
 ```
