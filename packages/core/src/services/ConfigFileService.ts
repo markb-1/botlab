@@ -5,10 +5,10 @@
  * `write` keeps the stored value.
  */
 
-import type { ConfigChangedEvent, ConfigService } from '../config/ConfigService';
+import { configJsonSchemas, type ConfigChangedEvent, type ConfigService } from '../config/ConfigService';
 import { CONFIG_FILE_NAMES, type ConfigFileName } from '../config/changes';
 import { requireActor, type Actor, type HumanActor } from './actors';
-import { invalidInput } from './errors';
+import { invalidInput, notFound } from './errors';
 
 export interface ConfigChangeSummary {
   changes: ConfigChangedEvent['changes'];
@@ -42,6 +42,26 @@ export class ConfigFileService {
   history(file: unknown, actor: Actor) {
     requireActor(actor, ['human', 'agent'], 'config.history');
     return this.config.history(asFile(file));
+  }
+
+  /** JSON Schema of each file (UI forms) */
+  schemas() {
+    return configJsonSchemas();
+  }
+
+  /** Validate and classify an edit without writing it (UI "review changes"). Human only. */
+  preview(file: unknown, value: unknown, actor: HumanActor) {
+    requireActor(actor, ['human'], 'config.preview');
+    return this.config.preview(asFile(file), value);
+  }
+
+  /** Text of a history version, secrets redacted (UI diff). Human only. */
+  versionText(file: unknown, versionId: unknown, actor: HumanActor): { versionId: string; text: string } {
+    requireActor(actor, ['human'], 'config.versionText');
+    const id = String(versionId);
+    const text = this.config.versionText(asFile(file), id);
+    if (text === null) throw notFound(`Unknown version ${id}`);
+    return { versionId: id, text };
   }
 
   /** Human only */

@@ -76,6 +76,19 @@ export class ScriptService {
     return scriptRowToIpc(row);
   }
 
+  /** Source versions (script_versions), newest first, without the source text */
+  versions(id: string): Array<{ version: number; sourceHash: string; createdAt: string; createdBy: string }> {
+    if (!this.deps.scriptRepo.findById(id)) throw notFound('Script not found');
+    return this.deps.scriptRepo.findVersions(id).map((v) => ({ version: v.version, sourceHash: v.source_hash, createdAt: v.created_at, createdBy: v.created_by }));
+  }
+
+  /** One version's source (bot code view, version diff) */
+  version(id: string, version: number): { version: number; source: string; sourceHash: string; createdAt: string; createdBy: string } {
+    const v = this.deps.scriptRepo.findVersions(id).find((r) => r.version === version);
+    if (!v) throw notFound(`Version ${version} of script ${id} not found`);
+    return { version: v.version, source: v.source, sourceHash: v.source_hash, createdAt: v.created_at, createdBy: v.created_by };
+  }
+
   /** Compile check only, does not save */
   async compile(source: string): Promise<{ compiled: true } | { compiled: false; error: string }> {
     const result = await compileScript(source);

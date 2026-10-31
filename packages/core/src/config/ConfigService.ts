@@ -20,7 +20,7 @@ import path from 'path';
 import chokidar, { type FSWatcher } from 'chokidar';
 import writeFileAtomic from 'write-file-atomic';
 import YAML, { isMap, isScalar } from 'yaml';
-import type { z } from 'zod';
+import { z } from 'zod';
 import type { AuditActor, AuditService } from '../audit/AuditService';
 import { FeesSchema, DEFAULT_FEES_YAML } from '../orders/FeeService';
 import { CATEGORIES_FILE, ConfigError, FEES_FILE_NAME, LIMITS_FILE, MANDATE_FILE, SERVER_FILE, parseConfigYaml, resolveConfigDir } from './loader';
@@ -53,7 +53,7 @@ const FILE_NAMES: Record<ConfigFileName, string> = {
   server: SERVER_FILE,
   categories: CATEGORIES_FILE,
 };
-const SCHEMAS: Record<ConfigFileName, z.ZodType> = {
+export const SCHEMAS: Record<ConfigFileName, z.ZodType> = {
   limits: LimitsSchema,
   mandate: MandateSchema,
   fees: FeesSchema,
@@ -67,6 +67,14 @@ const DEFAULT_TEXT: Record<ConfigFileName, string> = {
   server: DEFAULT_SERVER_YAML,
   categories: DEFAULT_CATEGORIES_YAML,
 };
+
+/**
+ * JSON Schema (input side: defaults shown, transforms ignored) of each config file, generated from
+ * the same zod schemas the loader uses (spec §3: the UI form comes from the schema).
+ */
+export function configJsonSchemas(): Record<ConfigFileName, unknown> {
+  return Object.fromEntries(CONFIG_FILE_NAMES.map((f) => [f, z.toJSONSchema(SCHEMAS[f], { io: 'input', unrepresentable: 'any' })])) as Record<ConfigFileName, unknown>;
+}
 
 /** Sections that must be present in a reloaded file (a truncated file must not fall back to defaults). */
 const shapeKeys = (schema: unknown): string[] => Object.keys((schema as { shape: Record<string, unknown> }).shape);
@@ -487,6 +495,31 @@ export class ConfigService {
   /** Previous versions, newest first. */
   history(file: ConfigFileName): ConfigVersion[] {
     return this.store?.list(file) ?? [];
+  }
+
+  /** File text of a version with secrets redacted (UI diff); null if unknown. */
+  versionText(file: ConfigFileName, versionId: string): string | null {
+    if (!CONFIG_FILE_NAMES.includes(file)) return null;
+    const text = this.store?.read(file, versionId) ?? null;
+    return text === null ? null : this.scrub(text);
+  }
+
+  /**
+   * Dry run of `write` (UI "review changes"): the same schema and cross-file validation, then the
+   * risk classification of every changed key. Nothing is written. Problems are returned, not thrown.
+   */
+  preview(file: ConfigFileName, newValue: unknown): { valid: boolean; issues: string[]; changes: ClassifiedChange[]; raises: boolean } {
+    const fail = (issues: string[]) => ({ valid: false, issues: issues.map((i) => this.scrub(i)), changes: [], raises: false });
+    if (!CONFIG_FILE_NAMES.includes(file)) return fail([`Unknown config file: ${String(file)}`]);
+    const current = this.current;
+    if (!current) return fail([`The current config is invalid, so edits cannot be checked against it: ${this.getLastError() ?? 'not loaded'}`]);
+    const result = SCHEMAS[file].safeParse(this.unmask(file, newValue, current));
+    if (!result.success) return fail(result.error.issues.map((i) => `${i.path.length ? i.path.join('.') : '(root)'}: ${i.message}`));
+    const candidate = { ...current, [file]: result.data } as AppConfig;
+    const cross = validateCrossFile(candidate.limits, candidate.mandate);
+    if (cross.length > 0) return fail(cross);
+    const changes = classifyChange({ [file]: current[file] }, { [file]: result.data }).map(redactChange);
+    return { valid: true, issues: [], changes, raises: changes.some((c) => c.effect === 'raises') };
   }
 
   /** Re-apply the file text of a previous version (validated like any edit). */

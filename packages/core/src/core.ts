@@ -72,6 +72,10 @@ import { RiskService } from './services/RiskService';
 import { ConfigFileService } from './services/ConfigFileService';
 import { ReconcileService } from './services/ReconcileService';
 import { MarketService } from './services/MarketService';
+import { OverviewService } from './services/OverviewService';
+import { AuditLogService } from './services/AuditLogService';
+import { getBalance } from './exchange/polymarket/trading';
+import { getBinanceBalance } from './exchange/binance/client';
 
 export interface CoreOptions {
   /** Directory for the database, shutdown marker, notify state and config history (created if missing) */
@@ -121,6 +125,10 @@ export interface CoreServices {
   markets: MarketService;
   reconcile: ReconcileService;
   audit: AuditService;
+  /** Dashboard risk picture (spec §12, §7.3 get_overview) */
+  overview: OverviewService;
+  /** Audit log queries (Audit page, halt history) */
+  auditLog: AuditLogService;
 }
 
 export interface Core {
@@ -399,6 +407,41 @@ export function createCore(options: CoreOptions): Core {
     markets: new MarketService(marketCache),
     reconcile: new ReconcileService({ getReconciler: () => reconciler, snapshotRepo, audit }),
     audit,
+    overview: new OverviewService({
+      botRepo,
+      scriptRepo,
+      tradeRepo,
+      orderRepo,
+      riskStateRepo,
+      getConfig: () => configService.getConfig(),
+      getConfigError: () => configService.getLastError(),
+      getCachedMarketByToken: (tokenId) => marketCache.getCachedByToken(tokenId),
+      ledgerStats: () => ledger.stats(),
+      getReconciler: () => reconciler,
+      // Cash of the (non-paper) wallets live bots use, plus Binance USDT when credentials are set
+      getLiveCashUsd: async () => {
+        if (!botManager) throw new Error('locked: the master key is not loaded');
+        const settings = botManager.getSettings();
+        const walletIds = new Set(
+          botRepo
+            .findAll()
+            .filter((b) => b.mode === 'live' && b.stage !== 'retired' && b.wallet_id)
+            .map((b) => b.wallet_id)
+        );
+        let cash = 0;
+        for (const id of walletIds) {
+          const w = walletRepo.findById(id);
+          if (!w || w.is_paper === 1) continue;
+          if (!settings.rpcUrl || !settings.usdcContractAddress) throw new Error('RPC URL or USDC contract not configured');
+          cash += await getBalance(w.proxy_address || w.address, settings.rpcUrl, settings.usdcContractAddress);
+        }
+        if (settings.binanceApiKey && settings.binanceApiSecret) {
+          cash += await getBinanceBalance({ apiKey: settings.binanceApiKey, apiSecret: settings.binanceApiSecret }, 'USDT');
+        }
+        return cash;
+      },
+    }),
+    auditLog: new AuditLogService(repos.auditRepo),
   };
 
   // ── Lifecycle ─────────────────────────────────────────────────────

@@ -15,3 +15,8 @@ export { ConfigFileService } from './ConfigFileService';
 export type { ConfigChangeSummary } from './ConfigFileService';
 export { ReconcileService } from './ReconcileService';
 export { MarketService } from './MarketService';
+export { OverviewService } from './OverviewService';
+export type { OverviewView, BotAllocationView } from './OverviewService';
+export { AuditLogService } from './AuditLogService';
+export type { AuditQuery, AuditPage, AuditEntryView } from './AuditLogService';
+export type { BotOrderView } from './BotService';

@@ -1013,11 +1013,16 @@ export class Reconciler implements ClockSkewGuard {
    * trade history cannot be read. Per token only the quantity held before the wallet's first order is
    * adopted; anything beyond needs `includePostFirstOrder: true` (audited).
    */
-  async adoptPositions(walletId: string, botId: string, humanActor: HumanActor, opts: { includePostFirstOrder?: boolean } = {}): Promise<AdoptResult> {
+  /**
+   * `dryRun` (UI preview): the same checks, order sync and plan, but nothing is adopted and only a
+   * non-human caller is audited; the planned rows are returned in `adopted`.
+   */
+  async adoptPositions(walletId: string, botId: string, humanActor: HumanActor, opts: { includePostFirstOrder?: boolean; dryRun?: boolean } = {}): Promise<AdoptResult> {
     const actor = auditActorOf(humanActor);
     const includePost = opts.includePostFirstOrder === true;
+    const dryRun = opts.dryRun === true;
     const deny = (why: string): never => {
-      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost }, `denied: ${why}`);
+      if (!dryRun) this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost }, `denied: ${why}`);
       throw new Error(why);
     };
     if (!isHumanActor(humanActor)) {
@@ -1075,6 +1080,13 @@ export class Reconciler implements ClockSkewGuard {
         }
         if (!includePost && post > DUST_QTY) result.skipped.push({ tokenId: d.symbol, reason: `${post.toFixed(2)} bought after the wallet's first order not adopted` });
         plan.push({ d, qty, post: includePost ? post : 0 });
+      }
+
+      if (dryRun) {
+        for (const { d, qty, post } of plan) {
+          result.adopted.push({ tokenId: d.symbol, marketId: d.marketId, quantity: qty, price: d.price!, ...(post > 0 ? { postFirstOrderQuantity: post } : {}) });
+        }
+        return result;
       }
 
       const owner = this.owner(botId);

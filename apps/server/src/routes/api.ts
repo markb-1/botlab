@@ -10,6 +10,11 @@
  * in §4.6. Human-only admin actions (§4.6: clear halt, config write/restore, adopt, set ambiguity, force
  * rights; wallets and exchange credentials; settings; API tokens) also need a password check within
  * 15 minutes (`recentAuth`).
+ *
+ * Read routes added for the 3c pages: `/api/risk/overview` (get_overview; all scopes), `/api/audit`
+ * (admin + readonly), `/api/config/schema` (admin + readonly), `/api/config/:file/preview` and
+ * `/api/config/:file/history/:versionId` (admin session only), script versions, bot orders, forecast by
+ * id and market search (all scopes), `/api/reconcile/adopt/preview` (admin session only).
  */
 
 import type { CoreServices } from '../../../../packages/core/src/core';
@@ -38,6 +43,7 @@ import {
 import type { ForecastFilter } from '../../../../packages/core/src/db/repositories/ForecastRepository';
 import type { CategoryRightsState, HorizonBucket } from '../../../../packages/core/src/risk/types';
 import { z } from 'zod';
+import { ServiceError } from '../../../../packages/core/src/services/errors';
 import { queryBool, queryNumber, type RouteDef } from '../http/routes';
 import type { Scope } from '../http/principal';
 
@@ -67,6 +73,8 @@ export function botRoutes(bots: CoreServices['bots']): RouteDef[] {
     { method: 'get', path: '/api/bots/:id/trades', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param, query }) => bots.trades(param('id'), queryNumber(query('hours'))) },
     { method: 'get', path: '/api/bots/:id/positions', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.positions(param('id')) },
     { method: 'get', path: '/api/bots/:id/stats', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.stats(param('id')) },
+    // Order attempts incl. risk rejections (spec §12 Bot detail; §7.3 get_open_orders)
+    { method: 'get', path: '/api/bots/:id/orders', allow: READ_ALL, handler: ({ param, query }) => bots.orders(param('id'), queryNumber(query('limit'))) },
   ];
 }
 
@@ -136,6 +144,14 @@ export function scriptRoutes(scripts: CoreServices['scripts']): RouteDef[] {
     { method: 'patch', path: '/api/scripts/:id', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ param, body, actor }) => scripts.update(param('id'), parseInput(ScriptUpdateSchema, body), actor()) },
     { method: 'delete', path: '/api/scripts/:id', domainErrors: 'conflict', handler: ({ param, actor }) => scripts.delete(param('id'), actor()) },
     { method: 'get', path: '/api/scripts/:id/schema', allow: READ_ALL, handler: ({ param }) => scripts.getSchema(param('id')) },
+    // Version history + source of one version (code view / diff; §7.3 get_script "source + version history")
+    { method: 'get', path: '/api/scripts/:id/versions', allow: READ_ALL, handler: ({ param }) => scripts.versions(param('id')) },
+    {
+      method: 'get',
+      path: '/api/scripts/:id/versions/:version',
+      allow: READ_ALL,
+      handler: ({ param }) => scripts.version(param('id'), parseInput(z.coerce.number().int().positive(), param('version'))),
+    },
     { method: 'post', path: '/api/scripts/:id/fork', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ param, body, actor }) => scripts.fork(param('id'), parseInput(ForkSchema, body)?.newName, actor()) },
     /** `.botlab` file content; the browser saves it (formerly a native save dialog) */
     { method: 'get', path: '/api/scripts/:id/export', allow: ADMIN, handler: ({ param }) => scripts.exportScript(param('id')) },
@@ -157,9 +173,11 @@ export function backtestRoutes(backtests: CoreServices['backtests']): RouteDef[]
 
 const ReasonSchema = z.object({ reason: z.string() });
 
-export function riskRoutes(risk: CoreServices['risk']): RouteDef[] {
+export function riskRoutes(risk: CoreServices['risk'], overview: CoreServices['overview']): RouteDef[] {
   return [
     { method: 'get', path: '/api/risk/state', allow: READ_ALL, handler: () => risk.getState() },
+    // Dashboard: equity, exposure vs limits, daily P&L, halts, reconciler, rights, allocations (§7.3 get_overview)
+    { method: 'get', path: '/api/risk/overview', allow: READ_ALL, handler: () => overview.overview() },
     {
       method: 'post',
       path: '/api/risk/clear-halt',
@@ -179,11 +197,27 @@ export function riskRoutes(risk: CoreServices['risk']): RouteDef[] {
 
 const ConfigWriteBody = z.object({ value: z.unknown(), expectedSha256: z.string().optional() });
 const ConfigRestoreBody = z.object({ versionId: z.string() });
+const ConfigPreviewBody = z.object({ value: z.unknown() });
 
 export function configRoutes(config: CoreServices['config']): RouteDef[] {
   return [
     // Secrets masked; the agent reads limits/mandate (spec §7.3 resources)
     { method: 'get', path: '/api/config', allow: ADMIN_AGENT, handler: ({ actor }) => config.get(actor()) },
+    // JSON Schema of each file (the UI form is generated from the loader's zod schemas, spec §3)
+    { method: 'get', path: '/api/config/schema', handler: () => config.schemas() },
+    // Dry run of a write: validation issues + risk classification of each change (no recent password needed: nothing is written)
+    {
+      method: 'post',
+      path: '/api/config/:file/preview',
+      handler: ({ param, body, human }) => config.preview(parseInput(ConfigFileSchema, param('file')), parseInput(ConfigPreviewBody, body).value, human()),
+    },
+    // Text of one history version, secrets redacted (diff in the UI)
+    {
+      method: 'get',
+      path: '/api/config/:file/history/:versionId',
+      allow: ADMIN,
+      handler: ({ param, human }) => config.versionText(parseInput(ConfigFileSchema, param('file')), param('versionId'), human()),
+    },
     {
       method: 'put',
       path: '/api/config/:file',
@@ -239,7 +273,19 @@ export function ledgerRoutes(ledger: CoreServices['ledger'], markets: CoreServic
         return ledger.list((filter ?? {}) as ForecastFilter);
       },
     },
+    {
+      method: 'get',
+      path: '/api/ledger/forecasts/:id',
+      allow: READ_ALL,
+      handler: ({ param }) => {
+        const f = ledger.getForecast(param('id'));
+        if (!f) throw new ServiceError('not_found', 'Forecast not found');
+        return f;
+      },
+    },
     { method: 'get', path: '/api/ledger/stats', allow: READ_ALL, handler: () => ledger.stats() },
+    // Search of the market cache (§7.3 search_markets, cached markets only)
+    { method: 'get', path: '/api/markets', allow: READ_ALL, handler: ({ query }) => markets.search(query('q') ?? '', queryNumber(query('limit'))) },
     {
       method: 'post',
       path: '/api/ledger/rights',
@@ -279,6 +325,16 @@ export function reconcileRoutes(reconcile: CoreServices['reconcile']): RouteDef[
         return reconcile.adoptPositions(walletId, botId, human(), { includePostFirstOrder });
       },
     },
+    // What adoption would do now (same checks, nothing written); human admin, no recent password needed
+    {
+      method: 'post',
+      path: '/api/reconcile/adopt/preview',
+      domainErrors: 'conflict',
+      handler: ({ body, human }) => {
+        const { walletId, botId, includePostFirstOrder } = parseInput(AdoptPositionsSchema, body);
+        return reconcile.adoptPreview(walletId, botId, human(), { includePostFirstOrder });
+      },
+    },
     { method: 'get', path: '/api/recorder/watchlist', allow: READ_ALL, handler: () => reconcile.watchlistList() },
     {
       method: 'post',
@@ -294,6 +350,29 @@ export function reconcileRoutes(reconcile: CoreServices['reconcile']): RouteDef[
   ];
 }
 
+// ── Audit log (read; admin + readonly) ──────────────────────────────────
+
+export function auditRoutes(auditLog: CoreServices['auditLog']): RouteDef[] {
+  return [
+    {
+      method: 'get',
+      path: '/api/audit',
+      handler: ({ query }) =>
+        auditLog.list({
+          action: query('action'),
+          actionPrefix: query('actionPrefix'),
+          actor: query('actor'),
+          target: query('target'),
+          since: query('since'),
+          until: query('until'),
+          before: queryNumber(query('before')),
+          limit: queryNumber(query('limit')),
+        }),
+    },
+    { method: 'get', path: '/api/audit/actions', handler: () => auditLog.actions() },
+  ];
+}
+
 export function apiRoutes(services: CoreServices): RouteDef[] {
   return [
     ...botRoutes(services.bots),
@@ -301,10 +380,11 @@ export function apiRoutes(services: CoreServices): RouteDef[] {
     ...settingsRoutes(services.settings),
     ...scriptRoutes(services.scripts),
     ...backtestRoutes(services.backtests),
-    ...riskRoutes(services.risk),
+    ...riskRoutes(services.risk, services.overview),
     ...configRoutes(services.config),
     ...ledgerRoutes(services.ledger, services.markets),
     ...reconcileRoutes(services.reconcile),
+    ...auditRoutes(services.auditLog),
   ];
 }
 

@@ -24,6 +24,21 @@ export interface IpcBot {
   mode: 'live' | 'paper';
   /** Ramp stage (spec §4.5) */
   stage?: string;
+  /** human | agent */
+  createdBy?: string;
+  /** Per-bot allocation override (can only lower the configured one); null = configured */
+  allocationUsd?: number | null;
+  retireReason?: string | null;
+  pausedBy?: string | null;
+  strategy?: string | null;
+  /** Markets the bot may trade; null = unscoped */
+  marketIds?: string[] | null;
+  /** scripts.revision the bot was created on */
+  templateVersion?: number | null;
+  /** The script's current revision and trust (the bot runs the latest compiled code, R20) */
+  scriptRevision?: number | null;
+  scriptTrust?: string | null;
+  stageChangedAt?: string | null;
   lastStartedAt?: string | null;
   lastStoppedAt?: string | null;
   lastHeartbeat?: string | null;

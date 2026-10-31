@@ -38,6 +38,13 @@ export class ReconcileService {
     return r.adoptPositions(walletId, botId, actor, { includePostFirstOrder: opts?.includePostFirstOrder === true });
   }
 
+  /** What `adoptPositions` would adopt now (same checks; nothing written). Human only. */
+  async adoptPreview(walletId: unknown, botId: unknown, actor: HumanActor, opts?: { includePostFirstOrder?: unknown }) {
+    const r = this.reconciler();
+    if (typeof walletId !== 'string' || !walletId || typeof botId !== 'string' || !botId) throw invalidInput('walletId and botId are required');
+    return r.adoptPositions(walletId, botId, actor, { includePostFirstOrder: opts?.includePostFirstOrder === true, dryRun: true });
+  }
+
   watchlistList() {
     return this.deps.snapshotRepo.watchlist();
   }

@@ -9,7 +9,7 @@
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { WalletRepository } from '../db/repositories/WalletRepository';
 import type { ScriptRepository } from '../db/repositories/ScriptRepository';
-import type { OrderRepository } from '../db/repositories/OrderRepository';
+import type { OrderRepository, OrderRow } from '../db/repositories/OrderRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { SettingsRepository } from '../db/repositories/SettingsRepository';
@@ -145,6 +145,16 @@ async function fetchLivePositions(address: string): Promise<PolymarketPosition[]
   return allPositions;
 }
 
+function parseMarketIds(raw: unknown): string[] | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 function botRowToIpc(
   row: any,
   walletRepo: WalletRepository,
@@ -165,6 +175,16 @@ function botRowToIpc(
     enabled: row.enabled === 1,
     mode: (row.mode as 'live' | 'paper') || 'live',
     stage: row.stage,
+    createdBy: row.created_by ?? 'human',
+    allocationUsd: row.allocation_usd ?? null,
+    retireReason: row.retire_reason ?? null,
+    pausedBy: row.paused_by ?? null,
+    strategy: row.strategy ?? null,
+    marketIds: parseMarketIds(row.market_ids),
+    templateVersion: row.template_version ?? null,
+    scriptRevision: script?.revision ?? null,
+    scriptTrust: script?.trust ?? null,
+    stageChangedAt: row.stage_changed_at ?? null,
     lastStartedAt: row.last_started_at,
     lastStoppedAt: row.last_stopped_at,
     lastHeartbeat: row.last_heartbeat,
@@ -245,6 +265,73 @@ export interface BotDashboardStat {
   pnl24h: number;
 }
 
+export interface BotOrderView {
+  id: string;
+  exchange: string;
+  marketId: string;
+  tokenId: string;
+  side: string;
+  orderType: string;
+  price: number;
+  size: number;
+  notionalUsd: number;
+  status: string;
+  filledSize: number;
+  avgFillPrice: number | null;
+  feeUsd: number;
+  simulated: boolean;
+  forecastId: string | null;
+  exchangeOrderId: string | null;
+  expiresAt: string | null;
+  /** Free text the bot gave, or the exchange / pre-check error */
+  reason: string | null;
+  /** Risk check that rejected the order and its message (orders.risk_decision) */
+  failedCheck: string | null;
+  riskReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function orderRowToView(o: OrderRow): BotOrderView {
+  let failedCheck: string | null = null;
+  let riskReason: string | null = null;
+  if (o.risk_decision) {
+    try {
+      const d = JSON.parse(o.risk_decision) as { allowed?: boolean; failedCheck?: string; reason?: string };
+      if (d && d.allowed === false) {
+        failedCheck = d.failedCheck ?? null;
+        riskReason = d.reason ?? null;
+      }
+    } catch {
+      riskReason = 'unreadable risk decision';
+    }
+  }
+  return {
+    id: o.id,
+    exchange: o.exchange,
+    marketId: o.market_id,
+    tokenId: o.token_id,
+    side: o.side,
+    orderType: o.order_type,
+    price: o.price,
+    size: o.size,
+    notionalUsd: o.notional_usd,
+    status: o.status,
+    filledSize: o.filled_size,
+    avgFillPrice: o.avg_fill_price,
+    feeUsd: o.fee_usd,
+    simulated: o.simulated === 1,
+    forecastId: o.forecast_id,
+    exchangeOrderId: o.exchange_order_id,
+    expiresAt: o.expires_at,
+    reason: o.reason,
+    failedCheck,
+    riskReason,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+}
+
 export interface BotServiceDeps {
   botRepo: BotRepository;
   walletRepo: WalletRepository;
@@ -253,7 +340,7 @@ export interface BotServiceDeps {
   storageRepo: BotStorageRepository;
   settingsRepo: SettingsRepository;
   audit?: AuditService;
-  orderRepo?: Pick<OrderRepository, 'findOpen'>;
+  orderRepo?: Pick<OrderRepository, 'findOpen' | 'findByBot'>;
   /** The BotManager once the core is unlocked, else null */
   botManager: () => Pick<BotManager, 'startBot' | 'stopBot' | 'restartBot'> | null;
   /** The WalletManager once the core is unlocked, else null */
@@ -432,6 +519,15 @@ export class BotService {
 
   async restart(id: string, by: Actor): Promise<void> {
     await this.manager().restartBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.restart')));
+  }
+
+  /** A bot's order attempts, newest first, including risk rejections with the failed check (spec §12 Bot detail) */
+  orders(botId: string, limit?: number): BotOrderView[] {
+    const { botRepo, orderRepo } = this.deps;
+    if (!botRepo.findById(botId)) throw notFound('Bot not found');
+    if (!orderRepo) return [];
+    const n = Math.min(Math.max(Math.floor(limit ?? 200), 1), 1000);
+    return orderRepo.findByBot(botId, n).map(orderRowToView);
   }
 
   /** A bot's trades; resolves missing market names from the Polymarket API and backfills the database */
