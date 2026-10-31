@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { auditApi } from '../lib/api';
 import { ConfigEditor } from '../components/ConfigEditor';
 import { ClearHaltButton, HaltBanner, KillSwitchButton } from '../components/HaltControls';
@@ -10,6 +10,8 @@ import { dateTime, errorMessage } from '../lib/format';
 import type { AuditPage } from '../types';
 
 type Tab = 'limits' | 'mandate' | 'categories' | 'fees' | 'server' | 'halts';
+/** `#/risk?tab=server` opens a tab directly (the Agent page links to the server.yaml editor) */
+const TABS: Tab[] = ['limits', 'mandate', 'categories', 'fees', 'server', 'halts'];
 
 /**
  * Risk page (spec §12): editors for the human-owned config files (limits, mandate, category mapping,
@@ -17,7 +19,9 @@ type Tab = 'limits' | 'mandate' | 'categories' | 'fees' | 'server' | 'halts';
  * with "clear halt", and the halt history from the audit log.
  */
 export function Risk() {
-  const [tab, setTab] = useState<Tab>('limits');
+  const [params] = useSearchParams();
+  const initial = params.get('tab');
+  const [tab, setTab] = useState<Tab>(TABS.includes(initial as Tab) ? (initial as Tab) : 'limits');
   return (
     <div className="space-y-6">
       <PageHeader title="Risk" subtitle="Limits, mandate and halts. Every change is validated, audited and kept in history." actions={<KillSwitchButton />} />
@@ -83,7 +87,7 @@ export function Risk() {
         <ConfigEditor
           key="server"
           file="server"
-          intro={<p>Time zone and digest, HTTP bind (restart to apply), order-book recorder, Telegram. Telegram is also on the Settings page.</p>}
+          intro={<p>Time zone and digest, HTTP bind (restart to apply), order-book recorder, the scheduled agent (agent.enabled, model, schedule; ANTHROPIC_API_KEY comes from the environment), Telegram. Telegram is also on the Settings page.</p>}
         />
       )}
       {tab === 'halts' && <Halts />}

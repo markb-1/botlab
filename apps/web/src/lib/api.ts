@@ -349,7 +349,7 @@ type Listener = (payload: any) => void;
 const listeners = new Map<string, Set<Listener>>();
 let source: EventSource | null = null;
 
-const EVENT_NAMES = ['bot:event', 'bot:log', 'risk:halt', 'risk:halt-cleared', 'config:changed', 'market:rulesChanged'] as const;
+const EVENT_NAMES = ['bot:event', 'bot:log', 'risk:halt', 'risk:halt-cleared', 'config:changed', 'market:rulesChanged', 'agent:run'] as const;
 export type ServerEventName = (typeof EVENT_NAMES)[number];
 
 function ensureSource(): void {
@@ -403,6 +403,7 @@ export const events = {
   onRiskHaltCleared: (callback: Listener) => onServerEvent('risk:halt-cleared', callback),
   onConfigChanged: (callback: Listener) => onServerEvent('config:changed', callback),
   onMarketRulesChanged: (callback: Listener) => onServerEvent('market:rulesChanged', callback),
+  onAgentRun: (callback: Listener) => onServerEvent('agent:run', callback),
 };
 
 // ── Agent (runs, notes, budget, exit flags; spec §7) ──────────────────────
@@ -411,6 +412,10 @@ export const agentApi = {
   budget: () => call('GET', '/agent/budget'),
   runs: (limit?: number, before?: string) => call('GET', `/agent/runs${qs({ limit, before })}`),
   run: (id: string) => call('GET', `/agent/runs/${enc(id)}`),
+  runCalls: (id: string) => call('GET', `/agent/runs/${enc(id)}/calls`),
+  schedule: () => call('GET', '/agent/schedule'),
+  runNow: (kind: 'cycle' | 'review' | 'event') => call('POST', '/agent/runs', { kind }),
+  cancelRun: () => call('POST', '/agent/runs/current/cancel'),
   notes: (filter?: { scope?: string; q?: string; limit?: number }) => call('GET', `/agent/notes${qs(filter)}`),
   deleteNote: (id: string) => call('DELETE', `/agent/notes/${enc(id)}`),
   exitFlags: (status?: string) => call('GET', `/agent/exit-flags${qs({ status })}`),

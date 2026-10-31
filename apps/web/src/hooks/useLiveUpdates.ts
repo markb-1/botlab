@@ -57,6 +57,8 @@ export function useLiveUpdates(): void {
         qc.invalidateQueries({ queryKey: ['audit'] });
       }),
       onServerEvent('market:rulesChanged', () => qc.invalidateQueries({ queryKey: ['market'] })),
+      // Agent runs (started / usage / finished): runs list, schedule, budget
+      onServerEvent('agent:run', () => throttle.invalidate(['agent'])),
       onServerEvent('bot:event', (e: { type?: string; botId?: string }) => {
         if (!e?.type || !BOT_STATE_EVENTS.has(e.type)) return;
         throttle.invalidate(['bots']);

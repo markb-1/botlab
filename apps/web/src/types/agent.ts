@@ -12,6 +12,12 @@ export interface AgentRun {
   startedAt: string;
   finishedAt: string | null;
   trigger: 'schedule' | 'manual' | 'event';
+  /** review (daily), cycle, event (maintenance only) */
+  kind: 'review' | 'cycle' | 'event';
+  /** Started by the server's runner (scheduled / manual / event), not an interactive client */
+  managed: boolean;
+  model: string | null;
+  durationMs: number | null;
   status: 'running' | 'ok' | 'error' | 'aborted' | 'timeout';
   tokensIn: number;
   tokensOut: number;
@@ -19,6 +25,32 @@ export interface AgentRun {
   summaryMd: string | null;
   toolCalls: number;
   actions: AgentRunAction[];
+}
+
+/** One MCP call of a run (from the audit log) */
+export interface AgentRunCall {
+  id: number;
+  ts: string;
+  tool: string;
+  target: string | null;
+  result: string | null;
+  ms: number | null;
+}
+
+/** GET /api/agent/schedule */
+export interface AgentSchedule {
+  enabled: boolean;
+  unavailable: string | null;
+  apiKeyPresent: boolean;
+  model: string | null;
+  maxTurns: number | null;
+  timezone: string;
+  review: string | null;
+  cycles: string[];
+  nextRuns: Array<{ kind: string; at: string; local: string }>;
+  quietHours: string;
+  events: { enabled: boolean; maxPerDay: number; debounceMinutes: number; today: number; pending: number };
+  activeRun: { runId: string; kind: string; trigger: string; startedAt: string; pid: number | null } | null;
 }
 
 export interface AgentNote {

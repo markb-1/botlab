@@ -2,9 +2,9 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { agentApi } from '../lib/api';
-import { Badge, Card, ConfirmDialog, Empty, ErrorBox, Facts, LimitBar, Notice, PageHeader, Tabs, btnSecondary, inputCls, tdCls, thCls } from '../components/ui';
+import { Badge, Card, ConfirmDialog, Empty, ErrorBox, Facts, LimitBar, Notice, PageHeader, Tabs, btnPrimary, btnSecondary, inputCls, tdCls, thCls } from '../components/ui';
 import { dateTime, errorMessage, relTime, usd } from '../lib/format';
-import type { AgentBudget, AgentNote, AgentRun, PositionExitFlag } from '../types';
+import type { AgentBudget, AgentNote, AgentRun, AgentRunCall, AgentSchedule, PositionExitFlag } from '../types';
 
 type Tab = 'runs' | 'notes' | 'flags';
 
@@ -13,6 +13,122 @@ function statusTone(s: AgentRun['status']) {
   if (s === 'running') return 'blue' as const;
   if (s === 'timeout' || s === 'aborted') return 'yellow' as const;
   return 'red' as const;
+}
+
+function duration(ms: number | null): string {
+  if (ms === null) return '—';
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+}
+
+/** Schedule, next runs, the active run and "Run now" (spec §7.1, §12) */
+function ScheduleCard({ schedule }: { schedule: AgentSchedule }) {
+  const qc = useQueryClient();
+  const [kind, setKind] = useState<'cycle' | 'review' | 'event'>('cycle');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const refresh = () => qc.invalidateQueries({ queryKey: ['agent'] });
+  const runNow = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await agentApi.runNow(kind);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+  const active = schedule.activeRun;
+  return (
+    <Card
+      title="Schedule"
+      actions={
+        <Badge tone={schedule.enabled ? (schedule.unavailable ? 'yellow' : 'green') : 'gray'}>{schedule.enabled ? (schedule.unavailable ? 'enabled, not ready' : 'enabled') : 'disabled'}</Badge>
+      }
+    >
+      <div className="space-y-4">
+        {schedule.unavailable && (
+          <Notice tone={schedule.enabled ? 'yellow' : 'blue'}>
+            {schedule.unavailable}. Switch the agent on in <code>server.yaml</code> (
+            <Link to="/risk?tab=server" className="text-accent hover:underline">
+              Risk → Server
+            </Link>
+            ): <code>agent.enabled: true</code>, with <code>ANTHROPIC_API_KEY</code> in the server environment (README “Running the agent”).
+          </Notice>
+        )}
+        <Facts
+          items={[
+            ['Model', schedule.model ? `${schedule.model} · max ${schedule.maxTurns ?? '—'} turns` : '—'],
+            ['Daily review', schedule.review ?? '—'],
+            ['Cycles', schedule.cycles.length ? schedule.cycles.join(', ') : 'none'],
+            ['Time zone', `${schedule.timezone}; no scheduled runs ${schedule.quietHours}`],
+            [
+              'Next runs',
+              schedule.nextRuns.length ? (
+                <span key="n">
+                  {schedule.nextRuns.slice(0, 3).map((r, i) => (
+                    <span key={r.at} title={dateTime(r.at)}>
+                      {i > 0 && ' · '}
+                      {r.local} {r.kind}
+                    </span>
+                  ))}
+                </span>
+              ) : (
+                '—'
+              ),
+            ],
+            [
+              'Event runs',
+              schedule.events.enabled
+                ? `${schedule.events.today} of ${schedule.events.maxPerDay} today, at most one per ${schedule.events.debounceMinutes} min${schedule.events.pending ? ` · ${schedule.events.pending} trigger(s) waiting` : ''}`
+                : 'off',
+            ],
+            [
+              'Active run',
+              active ? (
+                <span key="a">
+                  <Badge tone="blue">{active.kind}</Badge> {active.trigger}, started {relTime(active.startedAt)}{' '}
+                  <button type="button" className="text-red-400 hover:underline ml-2" onClick={() => setCancelling(true)}>
+                    Stop
+                  </button>
+                </span>
+              ) : (
+                'none'
+              ),
+            ],
+          ]}
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <select className={`${inputCls} w-auto`} value={kind} onChange={(e) => setKind(e.target.value as typeof kind)} aria-label="Run kind">
+            <option value="cycle">Cycle (full)</option>
+            <option value="review">Daily review</option>
+            <option value="event">Maintenance only</option>
+          </select>
+          <button type="button" className={btnPrimary} disabled={busy || !!schedule.unavailable || !!active} onClick={runNow}>
+            {busy ? 'Starting…' : 'Run now'}
+          </button>
+          <span className="text-xs text-gray-500">Counts against the monthly budget; refused while a run is active.</span>
+        </div>
+        {error && <ErrorBox>{error}</ErrorBox>}
+      </div>
+      {cancelling && (
+        <ConfirmDialog
+          title="Stop the agent run"
+          body="The runner is asked to stop; its cost so far is recorded."
+          confirmLabel="Stop run"
+          danger
+          onConfirm={async () => {
+            await agentApi.cancelRun();
+            await refresh();
+          }}
+          onClose={() => setCancelling(false)}
+        />
+      )}
+    </Card>
+  );
 }
 
 /** Summary text as preformatted markdown (rendered as text: it is written by the agent) */
@@ -50,7 +166,7 @@ function BudgetCard({ budget }: { budget: AgentBudget }) {
             [
               'Current run',
               budget.currentRun
-                ? `${budget.currentRun.trigger}, started ${relTime(budget.currentRun.startedAt)} (${budget.currentRun.toolCalls} calls)`
+                ? `${budget.currentRun.kind} (${budget.currentRun.trigger}), started ${relTime(budget.currentRun.startedAt)} (${budget.currentRun.toolCalls} calls, ${usd(budget.currentRun.costUsd)} so far)`
                 : 'none',
             ],
             [
@@ -69,37 +185,69 @@ function BudgetCard({ budget }: { budget: AgentBudget }) {
   );
 }
 
+/** The run's MCP calls from the audit log, loaded when the row is opened */
+function RunCalls({ runId }: { runId: string }) {
+  const { data, error } = useQuery({ queryKey: ['agent', 'runCalls', runId], queryFn: async () => (await agentApi.runCalls(runId)) as AgentRunCall[] });
+  if (error) return <ErrorBox>{errorMessage(error)}</ErrorBox>;
+  if (!data) return <p className="text-xs text-gray-500">Loading calls…</p>;
+  if (data.length === 0) return <p className="text-xs text-gray-500">No MCP calls recorded.</p>;
+  return (
+    <ol className="text-xs text-gray-400 space-y-0.5 max-h-64 overflow-y-auto">
+      {data.map((c) => (
+        <li key={c.id} className="break-words">
+          <span className="text-gray-500 tabular-nums">{new Date(c.ts).toLocaleTimeString()}</span>{' '}
+          <span className={c.result === 'ok' ? 'text-gray-200' : 'text-red-400'}>{c.tool}</span>
+          {c.target && <span className="text-gray-500"> {c.target}</span>}
+          {c.result !== 'ok' && c.result && <span className="text-red-400"> — {c.result}</span>}
+          {c.ms !== null && <span className="text-gray-600"> ({c.ms} ms)</span>}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 function RunRow({ run }: { run: AgentRun }) {
   const [open, setOpen] = useState(false);
+  // Runner-side tools (web search / fetch, resource reads; PascalCase); MCP calls are listed below from the audit log
+  const web = run.actions.filter((a) => /^[A-Z]/.test(a.tool));
   return (
     <>
       <tr className="border-t border-[#222] cursor-pointer hover:bg-[#151515]" onClick={() => setOpen(!open)}>
         <td className={tdCls}>{dateTime(run.startedAt)}</td>
-        <td className={tdCls}>{run.trigger}</td>
+        <td className={tdCls}>
+          {run.kind}
+          <span className="text-gray-500"> · {run.trigger}</span>
+        </td>
         <td className={tdCls}>
           <Badge tone={statusTone(run.status)}>{run.status}</Badge>
         </td>
         <td className={`${tdCls} tabular-nums`}>{usd(run.costUsd)}</td>
+        <td className={`${tdCls} tabular-nums whitespace-nowrap`}>{duration(run.durationMs)}</td>
         <td className={`${tdCls} tabular-nums`}>{run.toolCalls}</td>
         <td className={`${tdCls} max-w-[28rem] truncate`}>{run.summaryMd?.split('\n').find((l) => l.trim()) ?? '—'}</td>
       </tr>
       {open && (
         <tr className="bg-[#111]">
-          <td className={tdCls} colSpan={6}>
+          <td className={tdCls} colSpan={7}>
             <div className="space-y-3">
               <Markdown text={run.summaryMd} />
               <p className="text-xs text-gray-500">
-                {run.tokensIn.toLocaleString()} tokens in · {run.tokensOut.toLocaleString()} out · finished {dateTime(run.finishedAt)}
+                {run.model ? `${run.model} · ` : ''}
+                {run.tokensIn.toLocaleString()} tokens in · {run.tokensOut.toLocaleString()} out · {usd(run.costUsd)} · {duration(run.durationMs)} · finished{' '}
+                {dateTime(run.finishedAt)}
+                {run.managed ? '' : ' · interactive client (cost not tracked)'}
               </p>
-              {run.actions.length > 0 && (
+              {web.length > 0 && (
                 <div className="flex flex-wrap gap-1">
-                  {run.actions.map((a, i) => (
-                    <Badge key={i} tone={a.ok ? 'gray' : 'red'} title={`${dateTime(a.at)}${a.target ? ` · ${a.target}` : ''}`}>
+                  {web.map((a, i) => (
+                    <Badge key={i} tone="gray" title={`${dateTime(a.at)}${a.target ? ` · ${a.target}` : ''}`}>
                       {a.tool}
+                      {a.target ? `: ${a.target.slice(0, 40)}` : ''}
                     </Badge>
                   ))}
                 </div>
               )}
+              <RunCalls runId={run.id} />
             </div>
           </td>
         </tr>
@@ -119,9 +267,10 @@ function Runs() {
         <thead>
           <tr>
             <th className={thCls}>Started</th>
-            <th className={thCls}>Trigger</th>
+            <th className={thCls}>Kind</th>
             <th className={thCls}>Status</th>
             <th className={thCls}>Cost</th>
+            <th className={thCls}>Time</th>
             <th className={thCls}>Calls</th>
             <th className={thCls}>Summary</th>
           </tr>
@@ -236,13 +385,18 @@ function ExitFlags() {
   );
 }
 
-/** Agent (spec §12): run history, memory, budget and exit flags. Scheduled runs and the trigger button come in 4b. */
+/** Agent (spec §12): schedule and "Run now", run history (live via SSE `agent:run`), memory, budget and exit flags */
 export function Agent() {
   const [tab, setTab] = useState<Tab>('runs');
   const { data: budget, error } = useQuery({
     queryKey: ['agent', 'budget'],
     queryFn: async () => (await agentApi.budget()) as AgentBudget,
     refetchInterval: 30_000,
+  });
+  const { data: schedule } = useQuery({
+    queryKey: ['agent', 'schedule'],
+    queryFn: async () => (await agentApi.schedule()) as AgentSchedule | null,
+    refetchInterval: 60_000,
   });
   return (
     <div className="space-y-6">
@@ -251,6 +405,7 @@ export function Agent() {
         subtitle="The AI agent works through MCP with an agent token: paper bots, forecasts, notes. It cannot change limits, wallets or credentials."
       />
       {error && <ErrorBox>{errorMessage(error)}</ErrorBox>}
+      {schedule && <ScheduleCard schedule={schedule} />}
       {budget && <BudgetCard budget={budget} />}
       <Card>
         <Tabs
