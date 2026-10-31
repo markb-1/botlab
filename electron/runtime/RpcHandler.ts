@@ -163,9 +163,10 @@ export class RpcHandler {
         return;
 
       case 'polymarket:cancelAll': {
-        const { failed } = await this.orders.cancelAll();
-        if (failed > 0) throw new Error(`${failed} order(s) could not be cancelled`);
-        return;
+        // Orders with an unknown outcome (no exchange id) are reported, not treated as failures
+        const result = await this.orders.cancelAll();
+        if (result.failed > 0) throw new Error(`${result.failed} order(s) could not be cancelled`);
+        return result;
       }
 
       case 'polymarket:getOpenOrders':

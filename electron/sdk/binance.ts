@@ -41,9 +41,10 @@ export class BinanceHttpError extends Error {
   }
 }
 
-/** True unless Binance answered with a 4xx (a definite rejection). */
+/** True unless Binance answered with a definite rejection: 4xx except 408, 425 and 429. */
 function isUnknownOutcome(err: unknown): boolean {
-  return !(err instanceof BinanceHttpError && err.status !== undefined && err.status >= 400 && err.status < 500);
+  if (!(err instanceof BinanceHttpError) || err.status === undefined) return true;
+  return !(err.status >= 400 && err.status < 500 && ![408, 425, 429].includes(err.status));
 }
 
 export interface BinanceOrderBook {

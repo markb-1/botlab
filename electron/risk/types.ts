@@ -89,7 +89,7 @@ export interface RiskStateSnapshot {
   globalHaltReason?: string | null;
   /** null when the bot does not exist */
   bot: BotRiskInfo | null;
-  /** Wallet equity in USD (for max_total_exposure_pct) */
+  /** Wallet equity in USD (for max_total_exposure_pct). Only checked for buys; may be NaN for sells. */
   equityUsd: number;
   exposure: {
     /** This bot, all markets */

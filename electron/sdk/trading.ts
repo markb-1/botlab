@@ -5,7 +5,7 @@
  * (risk checks) and electron/exchange/polymarket/orders.ts.
  */
 
-import { ClobClient } from '@polymarket/clob-client';
+import type { ClobClient } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 import type {
   OrderBook,

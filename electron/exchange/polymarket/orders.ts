@@ -64,11 +64,23 @@ export function interpretPostResponse(resp: unknown, side: 'buy' | 'sell'): Post
     };
   }
 
-  // An HTTP status means the exchange answered: the order was not accepted
-  if (typeof r.status === 'number' || r.success === false || typeof r.errorMsg === 'string') {
+  // clob-client 4.22.8 returns HTTP errors as { error, status } instead of throwing.
+  // Only a definite client error means the order was not accepted; 5xx, timeouts (408),
+  // too-early (425) and rate limiting (429) may or may not have reached the matching engine.
+  if (typeof r.status === 'number') {
+    return isDefiniteRejection(r.status) ? { kind: 'rejected', error: errorText(r) } : { kind: 'unknown', error: errorText(r) };
+  }
+  // A 2xx body that says it failed is a definite answer
+  if (r.success === false || (typeof r.errorMsg === 'string' && r.errorMsg)) {
     return { kind: 'rejected', error: errorText(r) };
   }
+  // No status (network error, no response): outcome unknown
   return { kind: 'unknown', error: errorText(r) };
+}
+
+/** 4xx except 408 (timeout), 425 (too early) and 429 (rate limited). */
+export function isDefiniteRejection(httpStatus: number): boolean {
+  return httpStatus >= 400 && httpStatus < 500 && ![408, 425, 429].includes(httpStatus);
 }
 
 /**

@@ -79,7 +79,9 @@ function findStateProblems(order: OrderRequest, state: RiskStateSnapshot): strin
   };
 
   need('now', state.now);
-  need('equityUsd', state.equityUsd);
+  // Equity only feeds the total-exposure cap, which applies to buys; an unreadable balance
+  // must not block exits
+  if (order.side === 'buy') need('equityUsd', state.equityUsd);
   need('exposure.botUsd', state.exposure.botUsd);
   need('exposure.marketUsd', state.exposure.marketUsd);
   need('exposure.totalUsd', state.exposure.totalUsd);

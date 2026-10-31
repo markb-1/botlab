@@ -174,6 +174,13 @@ export class PaperTradingState {
     , orderBook.bids[0]);
     const bidPrice = parseFloat(bestBid.price);
 
+    if (opts?.minPrice !== undefined && bidPrice < opts.minPrice) {
+      return {
+        success: false, executedAmount: 0, price: 0, tokenAmount: 0,
+        error: `Bid price ${bidPrice} below min price ${opts.minPrice}`,
+      };
+    }
+
     // Simulate fill
     const availableTokens = parseFloat(bestBid.size);
     const fillTokens = Math.min(amountTokens, availableTokens);

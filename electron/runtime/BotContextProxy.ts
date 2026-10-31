@@ -205,7 +205,7 @@ export function createBotContext(params: {
       placeLimit: (tokenId: string, side: 'buy' | 'sell', price: number, size: number, opts?: LimitOrderOpts) =>
         rpcCall('polymarket:placeLimit', tokenId, side, price, size, opts) as Promise<OrderResult>,
       cancel: (orderId: string) => rpcCall('polymarket:cancel', orderId) as Promise<void>,
-      cancelAll: () => rpcCall('polymarket:cancelAll') as Promise<void>,
+      cancelAll: () => rpcCall('polymarket:cancelAll') as ReturnType<PolymarketContext['cancelAll']>,
       getOpenOrders: () => rpcCall('polymarket:getOpenOrders') as Promise<OpenOrder[]>,
       getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
     } as PolymarketContext,

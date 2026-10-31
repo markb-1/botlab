@@ -37,3 +37,20 @@ describe('market metadata', () => {
     expect(mandateCategory([], mandate)).toBeNull();
   });
 });
+
+describe('CLOB post response classification', () => {
+  it('only definite client errors are rejections', async () => {
+    const { interpretPostResponse } = await import('../../electron/exchange/polymarket/orders');
+    expect(interpretPostResponse({ error: 'bad order', status: 400 }, 'buy').kind).toBe('rejected');
+    expect(interpretPostResponse({ error: 'unauthorized', status: 401 }, 'buy').kind).toBe('rejected');
+    for (const status of [408, 425, 429, 500, 502, 503]) {
+      expect(interpretPostResponse({ error: 'x', status }, 'buy').kind).toBe('unknown');
+    }
+    expect(interpretPostResponse({ error: 'ECONNRESET' }, 'buy').kind).toBe('unknown');
+    expect(interpretPostResponse(undefined, 'buy').kind).toBe('unknown');
+    expect(interpretPostResponse({ success: false, errorMsg: 'not enough balance' }, 'buy').kind).toBe('rejected');
+    expect(
+      interpretPostResponse({ success: true, errorMsg: '', orderID: '0x1', status: 'matched', makingAmount: '10', takingAmount: '20' }, 'buy')
+    ).toEqual({ kind: 'accepted', exchangeOrderId: '0x1', status: 'matched', filledSize: 20, filledNotional: 10 });
+  });
+});

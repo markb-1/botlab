@@ -38,6 +38,11 @@ import logger from '../../src/utils/logger';
 
 const MS_PER_MINUTE = 60_000;
 const QTY_EPS = 1e-9;
+/** A market order with no confirmed result is treated as dead this long after submission */
+const MARKET_ORDER_LIFETIME_MS = 5 * MS_PER_MINUTE;
+/** After expires_at, wait this long (the exchange's GTD security buffer) before declaring a resting order expired */
+const EXPIRY_GRACE_MS = 60_000;
+const OPEN_STATUSES: OrderStatus[] = ['submitted', 'open', 'partially_filled'];
 /** Used when the book does not report a tick size; 0.01 multiples are valid on finer ticks too */
 const DEFAULT_TICK = 0.01;
 /** USD-quoted Binance pairs; anything else has no USD notional and is rejected */
@@ -120,6 +125,14 @@ export interface OpenOrderInfo {
   createdAt: string;
 }
 
+export interface CancelAllResult {
+  cancelled: number;
+  /** Orders the exchange did not confirm cancelled */
+  failed: number;
+  /** Orders with no exchange id (outcome unknown): cannot be cancelled, still count as exposure until they expire */
+  unknownOutcome: number;
+}
+
 export interface RiskBudget {
   /** Allocation left for new Polymarket buys (also bounded by the global total) */
   remainingAllocation: number;
@@ -168,22 +181,28 @@ export interface BotOrderContext {
   paperState?: PaperTradingState | null;
 }
 
-// ─── Process-wide placement lock ───────────────────────────────────────
+// ─── Locks ─────────────────────────────────────────────────────────────
 
-let lockTail: Promise<void> = Promise.resolve();
+type Lock = <T>(fn: () => Promise<T>) => Promise<T>;
 
-/** Run `fn` exclusively with respect to all other placements in this process. */
-async function withPlacementLock<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = lockTail;
-  let release!: () => void;
-  lockTail = new Promise<void>((r) => (release = r));
-  try {
-    await prev;
-    return await fn();
-  } finally {
-    release();
-  }
+/** FIFO async mutex: each `fn` runs only after the previous one settled. */
+function createLock(): Lock {
+  let tail: Promise<void> = Promise.resolve();
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    const prev = tail;
+    let release!: () => void;
+    tail = new Promise<void>((r) => (release = r));
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+    }
+  };
 }
+
+/** Serialises snapshot → check → insert across all bots in this process. */
+const withPlacementLock = createLock();
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -302,6 +321,8 @@ export class OrderService {
   private deps: OrderServiceDeps;
   private bot: BotOrderContext;
   private now: () => number;
+  /** Serialises this bot's exchange syncs and cancels so fills are never applied twice */
+  private botLock: Lock = createLock();
 
   constructor(deps: OrderServiceDeps, bot: BotOrderContext) {
     this.deps = deps;
@@ -395,7 +416,7 @@ export class OrderService {
         const res =
           input.side === 'buy'
             ? ps.simulateBuy(input.tokenId, input.amount, book, { maxPrice: price })
-            : ps.simulateSell(input.tokenId, input.amount, book);
+            : ps.simulateSell(input.tokenId, input.amount, book, { minPrice: price });
         return this.paperOutcome(res);
       }
       return this.requirePolymarket().postMarketOrder({ tokenId: row.token_id, side: input.side, amount: input.amount, price });
@@ -459,8 +480,8 @@ export class OrderService {
           const level = [{ price: String(input.price), size: String(input.size) }];
           const res =
             input.side === 'buy'
-              ? ps.simulateBuy(input.tokenId, input.price * input.size, { bids: [], asks: level })
-              : ps.simulateSell(input.tokenId, input.size, { bids: level, asks: [] });
+              ? ps.simulateBuy(input.tokenId, input.price * input.size, { bids: [], asks: level }, { maxPrice: input.price })
+              : ps.simulateSell(input.tokenId, input.size, { bids: level, asks: [] }, { minPrice: input.price });
           return this.paperOutcome(res);
         }
         return this.requirePolymarket().postLimitOrder({
@@ -555,7 +576,8 @@ export class OrderService {
     if (this.paper && ctx.info && updated.filled_size > 0) {
       this.bot.paperState?.updatePositionMeta(input.tokenId, ctx.info.question, ctx.info.outcome);
     }
-    return resultFromRow(updated, outcome.kind === 'accepted' ? {} : { ok: false, error: outcome.error });
+    if (outcome.kind !== 'accepted') return resultFromRow(updated, { ok: false, error: outcome.error });
+    return resultFromRow(updated, updated.status === 'cancelled' ? { error: 'Order did not fill (unmatched)' } : {});
   }
 
   private async lookupForecast(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null> {
@@ -621,35 +643,49 @@ export class OrderService {
       return this.deps.orderRepo.update(row.id, { status: 'failed' }) ?? row;
     }
     if (outcome.kind === 'unknown') {
-      // May be live on the exchange: keep counting it as open until reconciled (chunk 2b)
+      // May be live on the exchange: keep counting it as open until it expires (a market order
+      // gets a short lifetime so it cannot hold exposure forever)
       logger.error(`[OrderService] ${this.bot.botName}: order ${row.id} outcome unknown, left as submitted: ${outcome.error}`);
+      if (row.order_type === 'market' && !row.expires_at) {
+        return this.deps.orderRepo.update(row.id, { expiresAt: new Date(this.now() + MARKET_ORDER_LIFETIME_MS).toISOString() }) ?? row;
+      }
       return this.deps.orderRepo.findById(row.id) ?? row;
     }
 
     let fill: Fill | null = null;
     let status: OrderStatus;
-    const matched = outcome.status.toLowerCase() === 'matched';
+    let expiresAt: string | null | undefined;
+    const exStatus = outcome.status.toLowerCase();
     if (row.order_type === 'market') {
-      if (matched) {
+      if (exStatus === 'matched') {
         // Fill-or-kill matched ⇒ the whole order filled at `price` or better
         const size = outcome.filledSize ?? row.size;
         const notional = outcome.filledNotional ?? (side === 'buy' ? row.notional_usd : row.size * row.price);
         fill = { size, notional };
         status = 'filled';
+        // Paper fills only take the top level and can be partial; the rest is dead immediately
+        const partial = side === 'buy' ? notional < row.notional_usd - 1e-6 : size < row.size - QTY_EPS;
+        if (this.paper && partial) {
+          status = 'partially_filled';
+          expiresAt = new Date(this.now()).toISOString();
+        }
+      } else if (exStatus === 'unmatched') {
+        status = 'cancelled'; // FOK not filled: nothing happened
       } else {
-        status = 'submitted'; // delayed / unknown: wait for sync
+        status = 'submitted'; // delayed: wait for sync, but not forever
+        expiresAt = new Date(this.now() + MARKET_ORDER_LIFETIME_MS).toISOString();
       }
     } else {
-      const filled = matched ? (outcome.filledSize ?? row.size) : (outcome.filledSize ?? 0);
+      const filled = exStatus === 'matched' ? (outcome.filledSize ?? row.size) : (outcome.filledSize ?? 0);
       if (filled > QTY_EPS) {
         fill = { size: filled, notional: outcome.filledNotional ?? filled * row.price };
       }
       status =
-        filled >= row.size - QTY_EPS ? 'filled' : filled > QTY_EPS ? 'partially_filled' : outcome.status.toLowerCase() === 'live' ? 'open' : 'submitted';
+        filled >= row.size - QTY_EPS ? 'filled' : filled > QTY_EPS ? 'partially_filled' : exStatus === 'live' ? 'open' : 'submitted';
     }
 
-    // Expected fee on what filled; an unfilled marketable order records the fee on its full notional
-    const fee = feeRate * (fill ? fill.notional : row.notional_usd);
+    // Expected fee on what actually filled
+    const fee = fill ? feeRate * fill.notional : 0;
     const tx = this.deps.db.transaction(() => {
       const updated = this.deps.orderRepo.update(row.id, {
         status,
@@ -657,11 +693,14 @@ export class OrderService {
         filledSize: fill?.size ?? 0,
         avgFillPrice: fill && fill.size > 0 ? fill.notional / fill.size : null,
         feeUsd: fee,
+        ...(expiresAt !== undefined ? { expiresAt } : {}),
       });
       if (fill) this.recordFill(row, fill, fee, ctx.info, ctx.category);
       return updated;
     });
-    return tx() ?? row;
+    const updated = tx() ?? row;
+    if (fill) this.deps.provider.invalidateCash();
+    return updated;
   }
 
   private recordFill(row: OrderRow, fill: Fill, feeUsd: number, info: MarketInfo | null, category: string | null): void {
@@ -784,51 +823,84 @@ export class OrderService {
   // ── Open orders, cancel, budget, fees ───────────────────────────────
 
   /**
-   * Refresh this bot's live resting orders from the exchange (fills, cancels, expiry).
-   * Best effort: errors leave rows unchanged (they keep counting as open — fail closed).
+   * Refresh this bot's open orders: pull fills/cancels from the exchange and expire orders
+   * that can no longer fill. Serialised per bot. Lookup errors leave rows open (fail closed).
    * TODO(chunk 2b): the reconciler takes this over for all bots.
    */
-  async syncOpenOrders(): Promise<void> {
-    if (this.paper || !this.bot.polymarket) return;
-    const open = this.deps.orderRepo
-      .findOpen(this.bot.botId, false)
-      .filter((o) => o.exchange === 'polymarket' && o.exchange_order_id);
-    for (const row of open) {
+  syncOpenOrders(): Promise<void> {
+    return this.botLock(() => this.syncUnlocked());
+  }
+
+  private async syncUnlocked(): Promise<void> {
+    const now = this.now();
+    for (const row of this.deps.orderRepo.findOpen(this.bot.botId, this.paper)) {
+      const exp = row.expires_at ? Date.parse(row.expires_at) : null;
+
+      // Paper orders and orders with no exchange id (outcome unknown) cannot be looked up:
+      // they count as open until their expiry, then they are dead
+      if (this.paper || !row.exchange_order_id) {
+        if (exp !== null && now >= exp) this.expire(row.id, 'expired with no fill seen');
+        continue;
+      }
+      if (row.exchange !== 'polymarket' || !this.bot.polymarket) continue;
+
+      let ex: Awaited<ReturnType<PolymarketAdapter['getOrder']>>;
       try {
-        const ex = await this.bot.polymarket.getOrder(row.exchange_order_id!);
-        if (ex) this.applyExchangeState(row, ex);
+        ex = await this.bot.polymarket.getOrder(row.exchange_order_id);
       } catch (err) {
         logger.warning(`[OrderService] sync of order ${row.id} failed: ${err instanceof Error ? err.message : err}`);
+        continue;
+      }
+      if (ex) this.applyExchangeState(row.id, ex);
+      if (exp === null) continue;
+      // Past the exchange-side expiry (expires_at + GTD buffer), after this final fill check;
+      // or the exchange no longer returns the order once it is past expires_at
+      if (now >= exp + EXPIRY_GRACE_MS || (!ex && now >= exp)) {
+        this.expire(row.id, ex ? 'past GTD expiry' : 'not returned by exchange after expiry');
       }
     }
   }
 
-  private applyExchangeState(row: OrderRow, ex: { status: string; sizeMatched: number; originalSize: number; price: number }): void {
-    const matched = Math.min(ex.sizeMatched, row.size);
-    const delta = matched - row.filled_size;
-    const s = ex.status.toLowerCase();
-    let status: OrderStatus;
-    if (matched >= row.size - QTY_EPS || s === 'matched') status = 'filled';
-    else if (s === 'live') status = matched > QTY_EPS ? 'partially_filled' : 'open';
-    else if (s.startsWith('cancel')) {
-      const expired = row.expires_at !== null && Date.parse(row.expires_at) <= this.now();
-      status = expired ? 'expired' : 'cancelled';
-    } else return; // unknown status: leave as is
+  /** Mark an order expired if it is still open. */
+  private expire(orderId: string, why: string): void {
+    const fresh = this.deps.orderRepo.findById(orderId);
+    if (!fresh || !OPEN_STATUSES.includes(fresh.status)) return;
+    this.deps.orderRepo.update(orderId, { status: 'expired' });
+    logger.info(`[OrderService] ${this.bot.botName}: order ${orderId} expired (${why})`);
+  }
 
-    if (status === row.status && delta <= QTY_EPS) return;
-    this.deps.db.transaction(() => {
+  /**
+   * Apply the exchange's view of an order. The row is re-read inside the transaction so a
+   * fill is recorded exactly once even if two syncs saw the same exchange state.
+   */
+  private applyExchangeState(orderId: string, ex: { status: string; sizeMatched: number; originalSize: number; price: number }): void {
+    const filled = this.deps.db.transaction((): boolean => {
+      const row = this.deps.orderRepo.findById(orderId);
+      if (!row || !OPEN_STATUSES.includes(row.status)) return false;
+
+      const matched = Math.min(ex.sizeMatched, row.size);
+      const delta = matched - row.filled_size;
+      const s = ex.status.toLowerCase();
+      let status: OrderStatus;
+      if (matched >= row.size - QTY_EPS || s === 'matched') status = 'filled';
+      else if (s === 'live') status = matched > QTY_EPS ? 'partially_filled' : 'open';
+      else if (s === 'unmatched') status = 'cancelled';
+      else if (s.startsWith('cancel')) {
+        const expired = row.expires_at !== null && Date.parse(row.expires_at) <= this.now();
+        status = expired ? 'expired' : 'cancelled';
+      } else return false; // unknown status: leave as is
+
       if (delta > QTY_EPS) {
         // Resting fills happen at the order's price
         const prevNotional = row.filled_size * (row.avg_fill_price ?? row.price);
         const addNotional = delta * row.price;
         this.recordFill(row, { size: delta, notional: addNotional }, 0, null, null);
-        this.deps.orderRepo.update(row.id, {
-          filledSize: matched,
-          avgFillPrice: (prevNotional + addNotional) / matched,
-        });
+        this.deps.orderRepo.update(row.id, { filledSize: matched, avgFillPrice: (prevNotional + addNotional) / matched });
       }
-      this.deps.orderRepo.update(row.id, { status });
+      if (status !== row.status) this.deps.orderRepo.update(row.id, { status });
+      return delta > QTY_EPS;
     })();
+    if (filled) this.deps.provider.invalidateCash();
   }
 
   private ownOpenOrder(orderId: string): OrderRow {
@@ -837,41 +909,47 @@ export class OrderService {
     if (!row || row.bot_id !== this.bot.botId || row.simulated !== (this.paper ? 1 : 0)) {
       throw new Error(`Order not found: ${orderId}`);
     }
-    if (!['submitted', 'open', 'partially_filled'].includes(row.status)) {
+    if (!OPEN_STATUSES.includes(row.status)) {
       throw new Error(`Order ${orderId} is not open (status ${row.status})`);
     }
     return row;
   }
 
   /** Cancel one of this bot's orders. Throws if not found, not this bot's, or not cancellable. */
-  async cancel(orderId: string): Promise<void> {
-    const row = this.ownOpenOrder(orderId);
-    if (this.paper) {
-      this.deps.orderRepo.update(row.id, { status: 'cancelled' });
-      return;
-    }
-    if (row.exchange !== 'polymarket' || !row.exchange_order_id) {
-      throw new Error(`Order ${orderId} has no exchange order id (outcome unknown); it cannot be cancelled from here`);
-    }
-    await this.cancelRows([row]);
-    const after = this.deps.orderRepo.findById(row.id);
-    if (after && ['submitted', 'open', 'partially_filled'].includes(after.status)) {
-      throw new Error(`Exchange did not confirm cancellation of order ${orderId}`);
-    }
+  cancel(orderId: string): Promise<void> {
+    return this.botLock(async () => {
+      const row = this.ownOpenOrder(orderId);
+      if (this.paper) {
+        this.deps.orderRepo.update(row.id, { status: 'cancelled' });
+        return;
+      }
+      if (row.exchange !== 'polymarket' || !row.exchange_order_id) {
+        throw new Error(`Order ${orderId} has no exchange order id (outcome unknown); it cannot be cancelled from here`);
+      }
+      await this.cancelRows([row]);
+      const after = this.deps.orderRepo.findById(row.id);
+      if (after && OPEN_STATUSES.includes(after.status)) {
+        throw new Error(`Exchange did not confirm cancellation of order ${orderId}`);
+      }
+    });
   }
 
   /** Cancel all of this bot's open orders (never other bots'). */
-  async cancelAll(): Promise<{ cancelled: number; failed: number }> {
-    const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper);
-    if (this.paper) {
-      for (const row of open) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
-      return { cancelled: open.length, failed: 0 };
-    }
-    const cancellable = open.filter((o) => o.exchange === 'polymarket' && o.exchange_order_id);
-    const cancelled = await this.cancelRows(cancellable);
-    return { cancelled, failed: open.length - cancelled };
+  cancelAll(): Promise<CancelAllResult> {
+    return this.botLock(async () => {
+      const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper);
+      if (this.paper) {
+        for (const row of open) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
+        return { cancelled: open.length, failed: 0, unknownOutcome: 0 };
+      }
+      const cancellable = open.filter((o) => o.exchange === 'polymarket' && o.exchange_order_id);
+      const unknownOutcome = open.filter((o) => !o.exchange_order_id).length;
+      const cancelled = await this.cancelRows(cancellable);
+      return { cancelled, failed: open.length - unknownOutcome - cancelled, unknownOutcome };
+    });
   }
 
+  /** Caller holds botLock. */
   private async cancelRows(rows: OrderRow[]): Promise<number> {
     if (rows.length === 0) return 0;
     const adapter = this.requirePolymarket();
@@ -881,16 +959,16 @@ export class OrderService {
       // Pick up any fills that happened before the cancel
       try {
         const ex = await adapter.getOrder(row.exchange_order_id!);
-        if (ex) this.applyExchangeState(row, ex);
+        if (ex) this.applyExchangeState(row.id, ex);
       } catch {
         /* keep going */
       }
-      const current = this.deps.orderRepo.findById(row.id);
-      if (confirmed.has(row.exchange_order_id!) && current && ['submitted', 'open', 'partially_filled'].includes(current.status)) {
-        this.deps.orderRepo.update(row.id, { status: 'cancelled' });
+      if (confirmed.has(row.exchange_order_id!)) {
+        const current = this.deps.orderRepo.findById(row.id);
+        if (current && OPEN_STATUSES.includes(current.status)) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
       }
       const final = this.deps.orderRepo.findById(row.id);
-      if (final && !['submitted', 'open', 'partially_filled'].includes(final.status)) n++;
+      if (final && !OPEN_STATUSES.includes(final.status)) n++;
     }
     return n;
   }

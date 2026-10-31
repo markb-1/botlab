@@ -234,6 +234,22 @@ export class BotTradeRepository {
     `).all(...values) as RiskPositionRow[];
   }
 
+  /**
+   * Live positions built only from trades without an order_id (recorded before OrderService
+   * existed, or by scripts). The risk engine ignores these; listed at startup as a warning.
+   */
+  findUnlinkedLivePositions(): Array<{ bot_id: string; bot_name: string | null; exchange: string; symbol: string; net_quantity: number }> {
+    return this.db.prepare(`
+      SELECT bot_id, MAX(bot_name) AS bot_name, exchange, symbol,
+        SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS net_quantity
+      FROM bot_trades
+      WHERE order_id IS NULL AND COALESCE(simulated, 0) = 0 AND exchange IS NOT NULL AND symbol IS NOT NULL
+        AND quantity IS NOT NULL
+      GROUP BY bot_id, exchange, symbol
+      HAVING net_quantity > 1e-9
+    `).all() as Array<{ bot_id: string; bot_name: string | null; exchange: string; symbol: string; net_quantity: number }>;
+  }
+
   /** OrderService fills of one bot in one symbol, oldest first (for position open time). */
   findRiskFills(botId: string, symbol: string, simulated: boolean): Array<{ side: string; quantity: number; executed_at: string }> {
     return this.db.prepare(`

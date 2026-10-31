@@ -109,6 +109,25 @@ describe.skipIf(!sqliteAvailable)('DbRiskStateProvider', () => {
     expect(await provider().getSnapshot(order({ botId: 'bot-2', side: 'sell' }))).toMatchObject({ position: null });
   });
 
+  it('lists live positions that have no order-linked fills (startup warning)', () => {
+    t.tradeRepo.create({ botId: 'bot-1', botName: 'Old', exchange: 'polymarket', side: 'BUY', symbol: 't1', price: 0.5, quantity: 10, quoteAmount: 5 });
+    t.tradeRepo.create({ botId: 'bot-2', exchange: 'polymarket', side: 'BUY', symbol: 't2', price: 0.5, quantity: 10, quoteAmount: 5, simulated: 1 });
+    fill('bot-2', 't1', 'BUY', 10, 0.5);
+    expect(t.tradeRepo.findUnlinkedLivePositions()).toEqual([
+      { bot_id: 'bot-1', bot_name: 'Old', exchange: 'polymarket', symbol: 't1', net_quantity: 10 },
+    ]);
+  });
+
+  it('sells skip the cash read', async () => {
+    let reads = 0;
+    const snap = await provider(false, async () => {
+      reads++;
+      return 1000;
+    }).getSnapshot(order({ side: 'sell' }));
+    expect(reads).toBe(0);
+    expect(Number.isNaN(snap.equityUsd)).toBe(true);
+  });
+
   it('cash failure ⇒ NaN equity', async () => {
     const snap = await provider(false, async () => {
       throw new Error('rpc down');

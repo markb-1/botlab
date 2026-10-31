@@ -13,8 +13,9 @@
  * looks only at the ordering bot's paper orders and fills, so each paper bot behaves like
  * a live bot with the same limits; its `paper` stage is treated as `full`.
  *
- * Equity = cash (from `getCashUsd`, cached) + cost basis of open positions in scope.
- * If cash cannot be read the equity is NaN, which the engine rejects as `state_invalid`.
+ * Equity = cash (from `getCashUsd`, cached until the next fill) + cost basis of open positions
+ * in scope; computed for buys only. If cash cannot be read the equity is NaN, which the engine
+ * rejects as `state_invalid` for buys. Sells get NaN equity and the engine ignores it.
  */
 
 import type { BotRepository } from '../database/repositories/BotRepository';
@@ -190,6 +191,11 @@ export class DbRiskStateProvider implements RiskStateProvider {
     return total;
   }
 
+  /** Forget the cached cash balance (call after any fill: cash moved into a position). */
+  invalidateCash(): void {
+    this.cashCache.clear();
+  }
+
   /** Cash for equity, cached; NaN when unavailable. */
   async getCash(exchange: Exchange): Promise<number> {
     const ttl = this.deps.cashCacheMs ?? (this.deps.simulated ? 0 : DEFAULT_CASH_CACHE_MS);
@@ -256,7 +262,8 @@ export class DbRiskStateProvider implements RiskStateProvider {
     const longHorizonUsd =
       order.exchange === 'polymarket' && order.side === 'buy' ? await this.computeLongHorizon(exposure, now) : 0;
 
-    const cash = await this.getCash(order.exchange);
+    // Equity only matters for buys (total-exposure cap); sells never wait on or fail for a balance read
+    const cash = order.side === 'buy' ? await this.getCash(order.exchange) : NaN;
     const positionCost = exposure.positions.reduce((sum, p) => sum + p.cost_basis, 0);
 
     return {

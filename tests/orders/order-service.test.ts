@@ -55,6 +55,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
   let poly: ReturnType<typeof fakePolymarket>;
   let binance: BinanceAdapter & Record<string, ReturnType<typeof vi.fn>>;
   let cash: () => Promise<number>;
+  let clock = NOW;
 
   const engine = new RiskEngine({ limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}) });
 
@@ -68,7 +69,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       simulated,
       getCashUsd: simulated ? async () => paperState!.getBalance() : () => cash(),
       getEndDate: async () => MARKET.endDate,
-      now: () => NOW,
+      now: () => clock,
     });
     const bot: BotOrderContext = {
       botId,
@@ -91,7 +92,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
         quality: PlaceholderMarketQualityProvider,
         getBook: async () => BOOK,
         getBinanceBook: async () => ({ bids: [{ price: '49990', quantity: '1' }], asks: [{ price: '50000', quantity: '1' }] }),
-        now: () => NOW,
+        now: () => clock,
       },
       bot
     );
@@ -105,6 +106,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       marketSell: vi.fn(),
     } as never;
     cash = async () => 1000;
+    clock = NOW;
     t.addBot('bot-1');
     t.addBot('bot-2');
   });
@@ -260,6 +262,141 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     // Paper fills never count toward live exposure
     expect(t.tradeRepo.getRiskPositions({ simulated: false })).toHaveLength(0);
     expect(t.orderRepo.countByBotSince('paper-bot', new Date(0).toISOString(), false)).toBe(0);
+  });
+
+  it('records a resting fill once when syncs run concurrently', async () => {
+    const svc = makeService('bot-1');
+    const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+    poly.getOrder.mockImplementation(async () => {
+      await new Promise((res) => setTimeout(res, 1));
+      return { status: 'LIVE', sizeMatched: 5, originalSize: 20, price: 0.45 };
+    });
+    const other = makeService('bot-1'); // e.g. a restarted runner for the same bot
+    await Promise.all([
+      svc.getOpenOrders(),
+      svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.44, size: 10 }),
+      other.getOpenOrders(),
+      svc.cancel(r.orderId!).catch(() => undefined),
+    ]);
+    const fills = t.db.prepare('SELECT SUM(quantity) AS q FROM bot_trades WHERE order_id = ?').get(r.orderId) as { q: number };
+    expect(fills.q).toBeCloseTo(5);
+    expect(t.orderRepo.findById(r.orderId!)!.filled_size).toBeCloseTo(5);
+  });
+
+  it('re-reads cash after a fill instead of double-counting it as equity', async () => {
+    let balance = 1000;
+    let reads = 0;
+    cash = async () => {
+      reads++;
+      return balance;
+    };
+    const svc = makeService('bot-1');
+    poly.postMarketOrder.mockImplementation(async (a: { amount: number; price: number }) => {
+      balance -= a.amount; // cash leaves the wallet when the order fills
+      return { kind: 'accepted', exchangeOrderId: 'ex', status: 'matched', filledSize: a.amount / a.price, filledNotional: a.amount };
+    });
+    const snapshots: number[] = [];
+    const getSnapshot = (svc as unknown as { deps: { provider: DbRiskStateProvider } }).deps.provider.getSnapshot.bind(
+      (svc as unknown as { deps: { provider: DbRiskStateProvider } }).deps.provider
+    );
+    vi.spyOn((svc as unknown as { deps: { provider: DbRiskStateProvider } }).deps.provider, 'getSnapshot').mockImplementation(async (o) => {
+      const snap = await getSnapshot(o);
+      snapshots.push(snap.equityUsd);
+      return snap;
+    });
+    for (const tokenId of ['t1', 't1', 't2']) await svc.placeMarketable({ tokenId, side: 'buy', amount: 10 });
+    expect(reads).toBe(3);
+    expect(snapshots).toEqual([1000, 1000, 1000]); // cash + cost basis stays 1000
+  });
+
+  it('sells (incl. risk exits) do not need a readable balance', async () => {
+    const svc = makeService('bot-1');
+    await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+    cash = async () => {
+      throw new Error('rpc down');
+    };
+    const sell = await svc.placeMarketable({ tokenId: 't1', side: 'sell', amount: 10, riskExit: true });
+    expect(sell).toMatchObject({ ok: true, status: 'filled' });
+    // Buys still fail closed (fresh read after the fill invalidated the cache)
+    expect(await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 5 })).toMatchObject({ failedCheck: 'state_invalid' });
+  });
+
+  describe('orders that never close do not accumulate', () => {
+    it('GTD order past expiry + 60s: final fill check, then expired', async () => {
+      const svc = makeService('bot-1');
+      const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10 });
+      poly.getOrder.mockResolvedValue({ status: 'LIVE', sizeMatched: 2, originalSize: 20, price: 0.45 });
+      clock = NOW + 10 * 60_000 + 30_000; // past expires_at, within the grace period
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('partially_filled');
+      clock = NOW + 11 * 60_000 + 1;
+      expect(await svc.getOpenOrders()).toEqual([]);
+      const row = t.orderRepo.findById(r.orderId!)!;
+      expect(row).toMatchObject({ status: 'expired', filled_size: 2 });
+      expect(t.orderRepo.sumOpenBuyNotional({})).toBe(0);
+    });
+
+    it('order not returned by the exchange after expiry ⇒ expired', async () => {
+      const svc = makeService('bot-1');
+      const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10 });
+      poly.getOrder.mockResolvedValue(null);
+      clock = NOW + 5 * 60_000;
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('open'); // not yet expired: stays open
+      clock = NOW + 10 * 60_000 + 1;
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('expired');
+    });
+
+    it('lookup errors keep the order open', async () => {
+      const svc = makeService('bot-1');
+      const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10 });
+      poly.getOrder.mockRejectedValue(new Error('down'));
+      clock = NOW + 60 * 60_000;
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('open');
+    });
+
+    it('FOK returned unmatched ⇒ cancelled with no fill', async () => {
+      poly.postMarketOrder.mockResolvedValueOnce({ kind: 'accepted', exchangeOrderId: 'ex-u', status: 'unmatched', filledSize: null, filledNotional: null });
+      const r = await makeService('bot-1').placeMarketable({ tokenId: 't1', side: 'buy', amount: 10 });
+      expect(r).toMatchObject({ ok: false, status: 'cancelled', filledSize: 0, feeUsd: 0 });
+      expect(t.tradeRepo.getRiskPositions({ simulated: false })).toHaveLength(0);
+      expect(t.orderRepo.sumOpenBuyNotional({})).toBe(0);
+    });
+
+    it('unknown-outcome FOK: counted for 5 minutes, reported (not failed) by cancelAll, then dead', async () => {
+      const svc = makeService('bot-1');
+      poly.postMarketOrder.mockRejectedValueOnce(new Error('socket hang up'));
+      const r = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 10 });
+      expect(r.status).toBe('submitted');
+      expect(r.feeUsd).toBe(0);
+      expect(await svc.cancelAll()).toEqual({ cancelled: 0, failed: 0, unknownOutcome: 1 });
+      expect(t.orderRepo.sumOpenBuyNotional({})).toBeCloseTo(10);
+
+      clock = NOW + 4 * 60_000;
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.sumOpenBuyNotional({})).toBeCloseTo(10);
+      clock = NOW + 5 * 60_000;
+      await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('expired');
+      expect(t.orderRepo.sumOpenBuyNotional({})).toBe(0);
+    });
+  });
+
+  it('partial paper fills are partially_filled and the rest dies', async () => {
+    t.addBot('paper-bot', { stage: 'paper' });
+    const ps = new PaperTradingState('paper-bot', 1000, t.storageRepo);
+    const svc = makeService('paper-bot', 'paper', ps);
+    // The simulator only takes the top level; a book thin enough for that would fail top_of_book,
+    // so stub a partial fill ($15 of $20) and check the price limit is passed through
+    const spy = vi.spyOn(ps, 'simulateBuy').mockReturnValue({ success: true, executedAmount: 15, price: 0.5, tokenAmount: 30 });
+    const r = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+    expect(spy).toHaveBeenCalledWith('t1', 20, expect.anything(), { maxPrice: 0.5 });
+    expect(r).toMatchObject({ status: 'partially_filled', filledSize: 30 });
+    await svc.syncOpenOrders();
+    expect(t.orderRepo.findById(r.orderId!)!.status).toBe('expired');
+    expect(t.orderRepo.sumOpenBuyNotional({ simulated: true })).toBe(0);
   });
 
   it('routes Binance orders through the risk engine with the order id as client id', async () => {

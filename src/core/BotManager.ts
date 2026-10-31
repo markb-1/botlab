@@ -101,7 +101,31 @@ export class BotManager extends EventEmitter {
       this.configError = err instanceof Error ? err.message : String(err);
       logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
     }
+    this.warnUnlinkedPositions();
     logger.info('BotManager initialized');
+  }
+
+  /**
+   * Live positions recorded before OrderService (no order-linked fills) are invisible to the
+   * risk engine: not counted as exposure and not sellable by bots. Say so at startup.
+   */
+  private warnUnlinkedPositions(): void {
+    try {
+      const rows = this.tradeRepo.findUnlinkedLivePositions();
+      if (rows.length === 0) return;
+      const byBot = new Map<string, string[]>();
+      for (const r of rows) {
+        const key = `${r.bot_name ?? r.bot_id} (${r.bot_id})`;
+        byBot.set(key, [...(byBot.get(key) ?? []), `${r.exchange}:${r.symbol} ${r.net_quantity}`]);
+      }
+      logger.warning(
+        `Live positions without order-linked fills are ignored by the risk engine (not counted as exposure, ` +
+          `not sellable by bots; close them manually): ` +
+          [...byBot].map(([bot, pos]) => `${bot}: ${pos.join(', ')}`).join('; ')
+      );
+    } catch (err) {
+      logger.error(`Could not check for unlinked positions: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   /**

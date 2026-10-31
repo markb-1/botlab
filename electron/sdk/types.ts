@@ -162,8 +162,12 @@ export interface PolymarketContext {
   placeLimit(tokenId: string, side: 'buy' | 'sell', price: number, size: number, opts?: LimitOrderOpts): Promise<OrderResult>;
   /** Cancel one of this bot's orders; throws if not found or not cancellable */
   cancel(orderId: string): Promise<void>;
-  /** Cancel all of this bot's open orders */
-  cancelAll(): Promise<void>;
+  /**
+   * Cancel all of this bot's open orders. Throws if the exchange did not confirm some cancels.
+   * Orders whose placement outcome is unknown cannot be cancelled; they are counted in
+   * `unknownOutcome` and expire on their own.
+   */
+  cancelAll(): Promise<{ cancelled: number; failed: number; unknownOutcome: number }>;
   /** This bot's open orders */
   getOpenOrders(): Promise<OpenOrder[]>;
   getFee(tokenId: string): Promise<FeeRates>;
