@@ -93,6 +93,8 @@ export interface IpcScript {
   source: string;
   configSchema: Record<string, unknown>;
   isTemplate: boolean;
+  /** template | custom (agent templates are kind template but not isTemplate, which marks builtin ones) */
+  kind?: string;
   origin?: string;
   /** Integer source version (spec §2.1) */
   revision?: number;

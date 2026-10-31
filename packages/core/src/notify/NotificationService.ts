@@ -175,6 +175,25 @@ export class NotificationService implements OrderEventSink {
     this.guard(() => this.send(`[RECONCILIATION] Mismatch: ${short(summary, 1500)}`, { priority: 'high' }));
   }
 
+  /** Agent run report (spec §7.2 step 7, §11): sent when the agent calls finish_run */
+  agentRunFinished(run: { status: string; trigger: string; toolCalls: number; costUsd: number; summaryMd: string | null }, overBudget: boolean): void {
+    this.guard(() =>
+      this.send(
+        `[AGENT RUN] ${run.trigger} run ${run.status}: ${run.toolCalls} tool call(s), $${run.costUsd.toFixed(2)}${overBudget ? ' (over agent.max_run_cost_usd)' : ''}\n${short((run.summaryMd ?? '').trim(), 3000)}`,
+        { keepSeparate: true, priority: run.status === 'ok' && !overBudget ? 'normal' : 'high' }
+      )
+    );
+  }
+
+  /** The agent (or a human) asked the position manager to exit a position (spec §7.3 flag_position_exit) */
+  positionExitFlagged(f: { botId: string; botName: string | null; tokenId: string; simulated: boolean; reason: string; createdBy: string }): void {
+    this.guard(() =>
+      this.send(`[EXIT FLAG] ${f.botName ?? f.botId}${f.simulated ? ' (paper)' : ''}: token ${f.tokenId.slice(0, 12)}… flagged for exit by ${f.createdBy}: ${short(f.reason, 500)}`, {
+        priority: f.simulated ? 'normal' : 'high',
+      })
+    );
+  }
+
   /** Reconciler state changes: clock skew (blocks live orders), outage after 5 failed runs, recovery. */
   reconcilerAlert(text: string): void {
     this.guard(() => this.send(`[RECONCILER] ${short(text, 800)}`, { priority: 'high' }));

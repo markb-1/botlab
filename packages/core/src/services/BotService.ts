@@ -24,6 +24,7 @@ import type { BotStage } from '../risk/types';
 import logger from '../utils/logger';
 import { ServiceError, conflict, notFound } from './errors';
 import type { BotCreateInput, BotUpdateInput } from './schemas';
+import type { LimitsConfig } from '../config/schema';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -352,6 +353,26 @@ export interface BotServiceDeps {
   botManager: () => Pick<BotManager, 'startBot' | 'stopBot' | 'restartBot'> | null;
   /** The WalletManager once the core is unlocked, else null */
   walletManager: () => Pick<WalletManager, 'createPaperWallet' | 'deletePaperWallet'> | null;
+  /** Limits in force (agent bot caps); null = config unavailable ⇒ the agent may not create bots */
+  getLimits?: () => LimitsConfig | null;
+  /** Cached market question / outcome of a token (positions and orders views) */
+  describeToken?: (tokenId: string) => { marketId: string; question: string; outcome: string | null } | null;
+  now?: () => number;
+}
+
+/** A position from the order-linked fills the risk engine uses (spec §7.3 get_positions) */
+export interface RiskPositionView {
+  botId: string;
+  botName: string | null;
+  exchange: string;
+  /** Polymarket token id / Binance symbol */
+  symbol: string;
+  marketId: string | null;
+  question: string | null;
+  outcome: string | null;
+  netQuantity: number;
+  costBasisUsd: number;
+  simulated: boolean;
 }
 
 /** 24h P&L: realized trades in the last 24 hours (sells − buys) */
@@ -388,6 +409,40 @@ export class BotService {
     return botRowToIpc(row, this.deps.walletRepo, this.deps.scriptRepo);
   }
 
+  /** Agent creates whose paper wallet is still being made (counted toward the caps) */
+  private pendingAgentCreates = 0;
+
+  /**
+   * Agent bot rules (spec §7.3 create_bot, Decisions R109/R133): only from a template (`kind = template`),
+   * at most `agent.max_bots_created_per_day` in the last 24 h and `agent.max_active_bots` not retired.
+   * Unreadable limits ⇒ refused (fail closed). Denials are audited.
+   */
+  private checkAgentCreate(data: BotCreateInput): void {
+    const { botRepo, scriptRepo, audit } = this.deps;
+    const deny = (why: string, code: 'forbidden' | 'conflict' = 'forbidden'): never => {
+      audit?.record('agent', 'bot.create', null, { name: data.name, scriptId: data.scriptId }, `denied: ${why}`);
+      throw new ServiceError(code, `bots.create: ${why}`);
+    };
+    const script = scriptRepo.findById(data.scriptId);
+    if (!script) throw notFound('Script not found');
+    if (script.kind !== 'template') deny('the agent can only create bots from templates (list_templates)');
+    const limits = this.deps.getLimits?.() ?? null;
+    if (!limits) deny('limits unavailable (config invalid)', 'conflict');
+    const { max_bots_created_per_day: perDay, max_active_bots: maxActive } = limits!.agent;
+    const since = new Date((this.deps.now ?? Date.now)() - 86_400_000).toISOString();
+    const createdToday = botRepo.countCreatedSince('agent', since) + this.pendingAgentCreates;
+    if (createdToday >= perDay) deny(`agent bot limit reached: ${createdToday} created in the last 24 h (agent.max_bots_created_per_day = ${perDay})`, 'conflict');
+    const active = botRepo.countActiveCreatedBy('agent') + this.pendingAgentCreates;
+    if (active >= maxActive) deny(`agent bot limit reached: ${active} agent bots not retired (agent.max_active_bots = ${maxActive}); retire one first`, 'conflict');
+  }
+
+  /** The agent acts on its own bots only for start / config / retire (Decision R134); denial audited */
+  private requireAgentOwned(row: { id: string; created_by: string }, action: string): void {
+    if (row.created_by === 'agent') return;
+    this.deps.audit?.record('agent', action, row.id, undefined, 'denied: bot not created by the agent');
+    throw new ServiceError('forbidden', `${action}: the agent may only do this for bots it created (pause_bot works on any bot)`);
+  }
+
   list(filter?: { scriptId?: string; status?: string }): IpcBot[] {
     const rows = this.deps.botRepo.findAll({
       scriptId: filter?.scriptId,
@@ -412,14 +467,20 @@ export class BotService {
       audit?.record(actor, 'bot.create', null, { name: data.name, mode: data.mode, walletId: data.walletId }, 'denied: agent bots are paper bots without a wallet choice');
       throw new ServiceError('forbidden', 'bots.create: the agent can only create paper bots (no walletId, mode paper)');
     }
+    if (who.kind === 'agent') this.checkAgentCreate(data);
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
     const mode = data.mode ?? 'paper';
 
-    // Auto-generate a throwaway wallet for paper bots
-    if (mode === 'paper' && !walletId) {
-      const paperWallet = await this.wallets().createPaperWallet(data.name);
-      walletId = paperWallet.id;
+    // Auto-generate a throwaway wallet for paper bots. Agent creates in flight count toward its caps.
+    if (who.kind === 'agent') this.pendingAgentCreates++;
+    try {
+      if (mode === 'paper' && !walletId) {
+        const paperWallet = await this.wallets().createPaperWallet(data.name);
+        walletId = paperWallet.id;
+      }
+    } finally {
+      if (who.kind === 'agent') this.pendingAgentCreates--;
     }
 
     if (!walletId) {
@@ -438,6 +499,8 @@ export class BotService {
       mode,
       stage,
       templateVersion: script?.revision ?? null,
+      createdBy: who.kind,
+      marketIds: data.marketIds ?? null,
     });
     audit?.record(actor, 'bot.create', row.id, {
       name: data.name,
@@ -446,6 +509,7 @@ export class BotService {
       trust: script?.trust ?? null,
       mode,
       stage,
+      ...(data.marketIds ? { marketIds: data.marketIds } : {}),
     });
     return this.toView(row);
   }
@@ -467,6 +531,7 @@ export class BotService {
     }
     const before = botRepo.findById(id);
     if (!before) throw notFound('Bot not found');
+    if (who.kind === 'agent') this.requireAgentOwned(before, 'bot.update');
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {
       const blocked = walletChangeBlocker(id, tradeRepo, orderRepo);
       if (blocked) {
@@ -518,15 +583,109 @@ export class BotService {
   }
 
   async start(id: string, by: Actor): Promise<void> {
-    await this.manager().startBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.start')));
+    const who = requireActor(by, ['human', 'agent', 'system'], 'bots.start');
+    if (who.kind === 'agent') {
+      const row = this.deps.botRepo.findById(id);
+      if (!row) throw notFound('Bot not found');
+      this.requireAgentOwned(row, 'bot.start');
+    }
+    await this.manager().startBot(id, auditActorOf(who));
+    this.deps.botRepo.setPausedBy?.(id, null);
   }
 
   async stop(id: string, by: Actor): Promise<void> {
     await this.manager().stopBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.stop')));
   }
 
+  /** Stop a bot and record who paused it (spec §7.3 pause_bot). Anyone may pause any bot (it reduces risk). */
+  async pause(id: string, by: Actor): Promise<IpcBot> {
+    const who = requireActor(by, ['human', 'agent', 'system'], 'bots.pause');
+    if (!this.deps.botRepo.findById(id)) throw notFound('Bot not found');
+    await this.manager().stopBot(id, auditActorOf(who));
+    this.deps.botRepo.setPausedBy(id, who.kind);
+    return this.get(id);
+  }
+
+  /**
+   * Retire a bot (spec §2.1, §7.3 retire_bot): stops it, sets the terminal stage `retired` with the reason
+   * and disables it. Only a human can un-retire (§4.6; there is no un-retire path in the app). The agent
+   * may retire only bots it created.
+   */
+  async retire(id: string, reason: unknown, by: Actor): Promise<IpcBot> {
+    const who = requireActor(by, ['human', 'agent'], 'bots.retire');
+    const actor = auditActorOf(who);
+    const { botRepo, audit } = this.deps;
+    const why = typeof reason === 'string' ? reason.trim().slice(0, 1000) : '';
+    if (!why) throw new ServiceError('invalid_input', 'reason is required');
+    const row = botRepo.findById(id);
+    if (!row) throw notFound('Bot not found');
+    if (who.kind === 'agent') this.requireAgentOwned(row, 'bot.retire');
+    if (row.stage === 'retired') throw conflict('Bot is already retired');
+    if (row.status !== 'stopped') await this.manager().stopBot(id, actor);
+    botRepo.retire(id, why);
+    botRepo.setPausedBy(id, null);
+    audit?.record(actor, 'bot.stage', id, { from: row.stage, to: 'retired', reason: why });
+    return this.get(id);
+  }
+
   async restart(id: string, by: Actor): Promise<void> {
     await this.manager().restartBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.restart')));
+  }
+
+  /** Open positions from order-linked fills (paper and/or live), optionally one bot / market (spec §7.3 get_positions) */
+  riskPositions(filter: { botId?: string; marketId?: string; simulated?: boolean } = {}): RiskPositionView[] {
+    const { botRepo, tradeRepo } = this.deps;
+    const modes = filter.simulated === undefined ? [false, true] : [filter.simulated];
+    const names = new Map<string, string | null>();
+    const nameOf = (id: string) => {
+      if (!names.has(id)) names.set(id, botRepo.findById(id)?.name ?? null);
+      return names.get(id) ?? null;
+    };
+    return modes.flatMap((simulated) =>
+      tradeRepo
+        .getRiskPositions({ simulated, ...(filter.botId ? { botId: filter.botId } : {}) })
+        .map((p) => {
+          const info = p.exchange === 'polymarket' ? (this.deps.describeToken?.(p.symbol) ?? null) : null;
+          return {
+            botId: p.bot_id,
+            botName: nameOf(p.bot_id),
+            exchange: p.exchange,
+            symbol: p.symbol,
+            marketId: p.condition_id ?? info?.marketId ?? null,
+            question: info?.question ?? null,
+            outcome: info?.outcome ?? null,
+            netQuantity: p.net_quantity,
+            costBasisUsd: p.cost_basis,
+            simulated,
+          };
+        })
+        .filter((p) => !filter.marketId || p.marketId === filter.marketId)
+    );
+  }
+
+  /** Open orders (paper and/or live), optionally one bot / market (spec §7.3 get_open_orders) */
+  openOrders(filter: { botId?: string; marketId?: string; simulated?: boolean } = {}): Array<BotOrderView & { botId: string }> {
+    const { orderRepo } = this.deps;
+    if (!orderRepo) return [];
+    const modes = filter.simulated === undefined ? [false, true] : [filter.simulated];
+    return modes.flatMap((simulated) =>
+      orderRepo
+        .findOpen(filter.botId, simulated)
+        .filter((o) => !filter.marketId || o.market_id === filter.marketId)
+        .map((o) => ({ botId: o.bot_id, ...orderRowToView(o) }))
+    );
+  }
+
+  /** Trades (fills) newest first, optionally one bot / market (spec §7.3 get_trades) */
+  recentTrades(filter: { botId?: string; marketId?: string; hours?: number; limit?: number } = {}): IpcBotTrade[] {
+    const { tradeRepo } = this.deps;
+    const hours = filter.hours && filter.hours > 0 ? filter.hours : 24 * 7;
+    const rows = filter.botId ? tradeRepo.findByBotId(filter.botId, { hoursAgo: hours }) : tradeRepo.findRecent(hours);
+    const limit = clampLimit(filter.limit, 500);
+    return rows
+      .filter((r) => !filter.marketId || (r as { condition_id?: string | null }).condition_id === filter.marketId)
+      .slice(0, limit)
+      .map(tradeRowToIpc);
   }
 
   /** Recent log lines of a bot, oldest first (the last 500 kept in memory since the server started) */

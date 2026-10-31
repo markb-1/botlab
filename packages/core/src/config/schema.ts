@@ -102,6 +102,9 @@ export const LimitsSchema = z.strictObject({
       monthly_llm_budget_usd: usd.default(50),
       max_bots_created_per_day: count.default(10),
       max_active_bots: count.default(25),
+      // Per agent run (spec §7.1): the runner stops a run above this cost; the server refuses tool calls beyond the count
+      max_run_cost_usd: usd.default(1.5),
+      max_tool_calls_per_run: count.default(200),
     })
     .prefault({}),
   approvals: z

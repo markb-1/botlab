@@ -11,8 +11,12 @@
 // ============================================================================
 
 export interface BotContext {
-  /** User-defined config values (from UI form, driven by script's configSchema) */
-  readonly config: Readonly<Record<string, unknown>>;
+  /**
+   * User-defined config values (from UI form, driven by script's configSchema). Typed `any` per key: the
+   * values are whatever the bot's JSON config holds, so check / convert them (`Number(ctx.config.x)`).
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  readonly config: Readonly<Record<string, any>>;
 
   /** Bot metadata */
   readonly botId: string;

@@ -127,6 +127,9 @@ export interface GammaSearchHit {
   cached: boolean;
   /** Effective ambiguity when cached and assessed */
   ambiguityScore: number | null;
+  /** Outcome tokens and Gamma's last prices (same order) */
+  tokens: MarketToken[];
+  outcomePrices: string[] | null;
 }
 
 export interface MarketCacheDeps {
@@ -462,6 +465,8 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
         feeRate: p.feeSchedule ? p.feeSchedule.rate : null,
         cached: !!cached,
         ambiguityScore: cached ? toMarketView(cached, now).ambiguityScore : null,
+        tokens: p.tokens,
+        outcomePrices: p.outcomePrices,
       });
       if (out.length >= limit) break;
     }
@@ -660,6 +665,28 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
    * raise the stored score (never lower it). Returns whether the stored score changed.
    */
   async recordForecastAmbiguity(marketId: string, score: number, actor: AuditActor, forecastId: string): Promise<boolean> {
+    return (await this.recordMachineAssessment(marketId, score, actor, 'forecast', `forecast ${forecastId}`, { forecastId })).changed;
+  }
+
+  /**
+   * The agent's own assessment without a forecast (MCP assess_market, Decision R136): same rule as a
+   * forecast — ignored when a human assessed the market, otherwise it can only set a first score or raise
+   * the stored one. Source `agent`, the rationale is kept as the note.
+   */
+  async recordAgentAmbiguity(marketId: string, score: number, actor: AuditActor, rationale: string): Promise<{ changed: boolean; result: string; market: MarketView }> {
+    const note = `agent: ${rationale.trim().slice(0, 1990)}`;
+    const r = await this.recordMachineAssessment(marketId, score, actor, 'agent', note, { rationale: rationale.slice(0, 500) });
+    return { ...r, market: toMarketView(this.deps.repo.get(marketId)!, this.now()) };
+  }
+
+  private async recordMachineAssessment(
+    marketId: string,
+    score: number,
+    actor: AuditActor,
+    source: 'forecast' | 'agent',
+    note: string,
+    extra: Record<string, unknown>
+  ): Promise<{ changed: boolean; result: string }> {
     if (!Number.isInteger(score) || score < 0 || score > 3) throw new Error('ambiguity score must be an integer 0-3');
     const row = await this.requireRow(marketId);
     let result: string;
@@ -667,14 +694,14 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
     if (row.ambiguity_source === 'human') {
       result = 'kept: human assessment';
     } else if (row.market_ambiguity !== null && score <= row.market_ambiguity) {
-      result = 'kept: forecasts can only raise the score';
+      result = `kept: ${source === 'forecast' ? 'forecasts' : 'the agent'} can only raise the score`;
     } else {
-      this.deps.repo.setAmbiguity(marketId, score, 'forecast', `forecast ${forecastId}`, new Date(this.now()).toISOString());
+      this.deps.repo.setAmbiguity(marketId, score, source, note, new Date(this.now()).toISOString());
       result = 'ok';
       changed = true;
     }
-    this.deps.audit?.record(actor, 'market.ambiguity', marketId, { from: row.market_ambiguity, fromSource: row.ambiguity_source, proposed: score, source: 'forecast', forecastId }, result);
-    return changed;
+    this.deps.audit?.record(actor, 'market.ambiguity', marketId, { from: row.market_ambiguity, fromSource: row.ambiguity_source, proposed: score, source, ...extra }, result);
+    return { changed, result };
   }
 
   /** Scorer bookkeeping: the resolution first seen (null clears it). */

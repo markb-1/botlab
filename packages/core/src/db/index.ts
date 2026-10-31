@@ -556,6 +556,46 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     )`,
     // Mac test round: each market's own Gamma fee schedule (JSON; PROGRESS R125)
     'ALTER TABLE market_cache ADD COLUMN fee_schedule TEXT',
+    // 4a: agent run history and memory (spec §2.2, §7). actions = JSON array of tool calls in the run.
+    `CREATE TABLE IF NOT EXISTS agent_runs (
+      id TEXT PRIMARY KEY,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      trigger TEXT NOT NULL CHECK(trigger IN ('schedule','manual','event')),
+      status TEXT NOT NULL CHECK(status IN ('running','ok','error','aborted','timeout')),
+      tokens_in INTEGER NOT NULL DEFAULT 0,
+      tokens_out INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      summary_md TEXT,
+      actions TEXT NOT NULL DEFAULT '[]',
+      tool_calls INTEGER NOT NULL DEFAULT 0,
+      principal TEXT
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_agent_runs_started ON agent_runs(started_at)',
+    `CREATE TABLE IF NOT EXISTS agent_notes (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body_md TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_agent_notes_scope ON agent_notes(scope)',
+    // 4a: exits the agent asks for (spec §7.3 flag_position_exit); the Phase 5 position manager acts on open flags
+    `CREATE TABLE IF NOT EXISTS position_exit_flags (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      token_id TEXT NOT NULL,
+      market_id TEXT,
+      simulated INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','done','cancelled')),
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      handled_at TEXT,
+      handled_note TEXT
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_position_exit_flags_status ON position_exit_flags(status)',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

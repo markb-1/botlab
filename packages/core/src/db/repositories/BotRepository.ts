@@ -90,6 +90,11 @@ export class BotRepository {
     /** Ramp stage (spec §4.5); callers derive it from the script's trust. Default paper (fail closed). */
     stage?: BotStage;
     templateVersion?: number | null;
+    /** Who created it (spec §2.1); default human */
+    createdBy?: 'human' | 'agent';
+    /** Condition ids the bot is scoped to (null = unscoped) */
+    marketIds?: string[] | null;
+    strategy?: string | null;
   }): BotRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -97,8 +102,8 @@ export class BotRepository {
     this.db
       .prepare(
         `INSERT INTO bots (id, name, script_id, wallet_id, config, enabled, mode, stage, template_version,
-           stage_changed_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           stage_changed_at, created_by, market_ids, strategy, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -111,6 +116,9 @@ export class BotRepository {
         data.stage ?? 'paper',
         data.templateVersion ?? null,
         now,
+        data.createdBy ?? 'human',
+        data.marketIds ? JSON.stringify(data.marketIds) : null,
+        data.strategy ?? null,
         now,
         now
       );
@@ -176,6 +184,30 @@ export class BotRepository {
       .prepare('SELECT COUNT(*) AS n FROM bots WHERE script_id = ? AND template_version = ? AND reached_full_at IS NOT NULL')
       .get(scriptId, templateVersion) as { n: number };
     return row.n;
+  }
+
+  /** Terminal stage (spec §2.1): retired, with the reason; disabled so nothing restarts it */
+  retire(id: string, reason: string): BotRow | undefined {
+    const now = new Date().toISOString();
+    this.db
+      .prepare("UPDATE bots SET stage = 'retired', retire_reason = ?, enabled = 0, stage_changed_at = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(reason, now, id);
+    return this.findById(id);
+  }
+
+  /** Who paused the bot (null when it is started again) */
+  setPausedBy(id: string, pausedBy: string | null): void {
+    this.db.prepare("UPDATE bots SET paused_by = ?, updated_at = datetime('now') WHERE id = ?").run(pausedBy, id);
+  }
+
+  /** Bots created by `createdBy` since an ISO time (agent daily cap) */
+  countCreatedSince(createdBy: 'human' | 'agent', sinceIso: string): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM bots WHERE created_by = ? AND created_at >= ?').get(createdBy, sinceIso) as { n: number }).n;
+  }
+
+  /** Bots created by `createdBy` that are not retired (agent active cap) */
+  countActiveCreatedBy(createdBy: 'human' | 'agent'): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM bots WHERE created_by = ? AND stage <> 'retired'").get(createdBy) as { n: number }).n;
   }
 
   setTemplateVersion(id: string, templateVersion: number | null): void {

@@ -36,6 +36,9 @@ import {
   ForecastRepository,
   CategoryRightsRepository,
   OrderbookSnapshotRepository,
+  AgentRunRepository,
+  AgentNoteRepository,
+  PositionExitFlagRepository,
 } from './db/repositories/index';
 import { keyManager } from './security/keyManager';
 import { migrateSecretsToV2 } from './security/migrateSecrets';
@@ -78,6 +81,7 @@ import { ReconcileService } from './services/ReconcileService';
 import { MarketService } from './services/MarketService';
 import { OverviewService } from './services/OverviewService';
 import { AuditLogService } from './services/AuditLogService';
+import { AgentService } from './services/AgentService';
 import { PublicError, publicLookupError } from './services/redact';
 import { getBalance } from './exchange/polymarket/trading';
 import { getBinanceBalance } from './exchange/binance/client';
@@ -134,6 +138,8 @@ export interface CoreServices {
   overview: OverviewService;
   /** Audit log queries (Audit page, halt history) */
   auditLog: AuditLogService;
+  /** Agent runs, notes, budget and exit flags (spec §7) */
+  agent: AgentService;
 }
 
 export interface Core {
@@ -396,9 +402,14 @@ export function createCore(options: CoreOptions): Core {
       activity,
       botManager: () => botManager,
       walletManager: () => walletManager,
+      getLimits: () => configService.getConfig()?.limits ?? null,
+      describeToken: (tokenId) => {
+        const m = marketCache.getCachedByToken(tokenId);
+        return m ? { marketId: m.marketId, question: m.question, outcome: m.tokens.find((t) => t.tokenId === tokenId)?.outcome ?? null } : null;
+      },
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),
-    scripts: new ScriptService({ scriptRepo, audit }),
+    scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null }),
     settings: new SettingsService({ settingsRepo }),
     backtests: new BacktestService({
       db,
@@ -413,7 +424,14 @@ export function createCore(options: CoreOptions): Core {
     risk: new RiskService({ halts, killSwitch, botRepo }),
     config: new ConfigFileService(configService),
     ledger,
-    markets: new MarketService(marketCache),
+    markets: new MarketService(marketCache, Date.now, {
+      clobUrl: () => settingsRepo.get().clob_http_url,
+      snapshotRepo,
+      auditRepo: repos.auditRepo,
+      feeRatesFor,
+      getMandate: () => configService.getConfig()?.mandate ?? null,
+      getLimits: () => configService.getConfig()?.limits ?? null,
+    }),
     reconcile: new ReconcileService({ getReconciler: () => reconciler, snapshotRepo, audit }),
     audit,
     overview: new OverviewService({
@@ -462,6 +480,19 @@ export function createCore(options: CoreOptions): Core {
       },
     }),
     auditLog: new AuditLogService(repos.auditRepo),
+    agent: new AgentService({
+      runRepo: new AgentRunRepository(db),
+      noteRepo: new AgentNoteRepository(db),
+      flagRepo: new PositionExitFlagRepository(db),
+      botRepo,
+      tradeRepo,
+      audit,
+      getLimits: () => configService.getConfig()?.limits ?? null,
+      notify: {
+        agentRunFinished: (run, overBudget) => notifications.agentRunFinished(run, overBudget),
+        positionExitFlagged: (flag) => notifications.positionExitFlagged(flag),
+      },
+    }),
   };
 
   // ── Lifecycle ─────────────────────────────────────────────────────

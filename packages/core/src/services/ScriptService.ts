@@ -9,8 +9,35 @@ import type { IpcScript } from './types';
 import type { AuditService } from '../audit/AuditService';
 import { auditActorOf, requireActor, type Actor } from './actors';
 import { compileScript } from '../runtime/compileScript';
-import { conflict, notFound } from './errors';
+import { typecheckScript, type ScriptDiagnostic } from '../runtime/typecheckScript';
+import { conflict, notFound, ServiceError } from './errors';
 import type { ScriptCreateInput, ScriptImportFile, ScriptUpdateInput } from './schemas';
+import type { MandateConfig } from '../config/schema';
+
+/** compile + typecheck (spec §5.3, §7.3 validate_script) */
+export interface ScriptValidation {
+  ok: boolean;
+  compiled: boolean;
+  compileError: string | null;
+  diagnostics: ScriptDiagnostic[];
+  /** Diagnostics left out (only the first 50 are returned) */
+  truncated: number;
+}
+
+/** Template summary for list_templates (no source) */
+export interface TemplateSummary {
+  id: string;
+  name: string;
+  description: string;
+  origin: string;
+  revision: number;
+  trust: string;
+  builtin: boolean;
+  configSchema: Record<string, unknown>;
+  updatedAt: string;
+}
+
+export const MAX_SCRIPT_SOURCE_CHARS = 200_000;
 
 /** .botlab file format */
 export interface BotLabScriptFile {
@@ -41,6 +68,7 @@ function scriptRowToIpc(row: any): IpcScript {
     source: row.source,
     configSchema: JSON.parse(row.config_schema || '{}'),
     isTemplate: row.is_template === 1,
+    kind: row.kind,
     origin: row.origin,
     revision: row.revision,
     trust: row.trust,
@@ -52,7 +80,11 @@ function scriptRowToIpc(row: any): IpcScript {
 export interface ScriptServiceDeps {
   scriptRepo: ScriptRepository;
   audit?: AuditService;
+  /** Mandate in force (`strategies.allow_custom_templates` gates agent templates); null = config unavailable */
+  getMandate?: () => MandateConfig | null;
 }
+
+const originOf = (actor: Actor): 'human' | 'agent' => (actor.kind === 'agent' ? 'agent' : 'human');
 
 export class ScriptService {
   constructor(private deps: ScriptServiceDeps) {}
@@ -99,7 +131,7 @@ export class ScriptService {
   }
 
   async create(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
-    requireActor(actor, ['human', 'agent'], 'scripts.create');
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.create');
     // Compile TypeScript to JavaScript
     let compiled: string | undefined;
     const compileResult = await compileScript(data.source);
@@ -116,13 +148,100 @@ export class ScriptService {
       compiled,
       configSchema: data.configSchema,
       isTemplate: false,
+      origin: originOf(who),
     });
     this.auditScript(actor, 'script.create', row, { compiled: compiled !== undefined });
     return scriptRowToIpc(row);
   }
 
+  /** Compile (esbuild, imports rejected) and typecheck against botlab-sdk.d.ts; saves nothing */
+  async validate(source: unknown): Promise<ScriptValidation> {
+    if (typeof source !== 'string' || !source.trim()) throw new ServiceError('invalid_input', 'source is required');
+    if (source.length > MAX_SCRIPT_SOURCE_CHARS) throw new ServiceError('invalid_input', `source is longer than ${MAX_SCRIPT_SOURCE_CHARS} characters`);
+    const compiled = await compileScript(source);
+    const tc = typecheckScript(source);
+    const compileError = 'error' in compiled ? compiled.error : null;
+    return { ok: compileError === null && tc.ok, compiled: compileError === null, compileError, diagnostics: tc.diagnostics, truncated: tc.truncated };
+  }
+
+  /** Scripts of kind template (builtin, human or agent), without source (spec §7.3 list_templates) */
+  templates(): TemplateSummary[] {
+    return this.deps.scriptRepo.findByKind('template').map((r) => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      origin: r.origin,
+      revision: r.revision,
+      trust: r.trust,
+      builtin: r.is_template === 1,
+      configSchema: JSON.parse(r.config_schema || '{}') as Record<string, unknown>,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  private requireValid(v: ScriptValidation, by: Actor, action: string, target: string | null): void {
+    if (v.ok) return;
+    const first = v.compileError ?? v.diagnostics.filter((d) => d.category === 'error').slice(0, 5).map((d) => `${d.line}:${d.column} ${d.message}`).join('; ');
+    this.deps.audit?.record(auditActorOf(by), action, target, { compiled: v.compiled, errors: v.diagnostics.length }, 'denied: script does not compile / typecheck');
+    throw new ServiceError('invalid_input', `Script does not compile or typecheck (run validate_script): ${first}`);
+  }
+
+  /**
+   * A new template (spec §7.3 create_template): kind template, trust new, origin = the actor. It must compile
+   * and typecheck. The agent may write templates only while the mandate allows custom templates.
+   */
+  async createTemplate(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.createTemplate');
+    const { scriptRepo } = this.deps;
+    if (who.kind === 'agent') {
+      const mandate = this.deps.getMandate?.() ?? null;
+      if (!mandate || !mandate.strategies.allow_custom_templates) {
+        this.deps.audit?.record('agent', 'script.create', null, { name: data.name }, 'denied: mandate does not allow custom templates');
+        throw new ServiceError('forbidden', 'scripts.createTemplate: the mandate does not allow custom templates (mandate.strategies.allow_custom_templates)');
+      }
+    }
+    const name = data.name.trim().slice(0, 100);
+    if (!name) throw new ServiceError('invalid_input', 'name is required');
+    const version = data.version || '1.0.0';
+    if (scriptRepo.findByNameAndVersion(name, version)) throw conflict(`A script named "${name}" version ${version} already exists`);
+    const v = await this.validate(data.source);
+    this.requireValid(v, actor, 'script.create', null);
+    const compiled = await compileScript(data.source);
+    const row = scriptRepo.create({
+      name,
+      description: data.description,
+      version,
+      author: data.author || (who.kind === 'agent' ? 'agent' : ''),
+      source: data.source,
+      compiled: 'code' in compiled ? compiled.code : undefined,
+      configSchema: data.configSchema,
+      isTemplate: false,
+      kind: 'template',
+      origin: originOf(who),
+      trust: 'new',
+    });
+    this.auditScript(actor, 'script.create', row, { kind: 'template', origin: row.origin });
+    return scriptRowToIpc(row);
+  }
+
+  /**
+   * New version of a template (spec §7.3 update_template): trust back to new and every bot on it back to paper
+   * (ScriptRepository.update). Builtin templates cannot be edited; the agent may edit only agent templates.
+   */
+  async updateTemplate(id: string, input: ScriptUpdateInput, actor: Actor): Promise<IpcScript> {
+    requireActor(actor, ['human', 'agent'], 'scripts.updateTemplate');
+    const existing = this.deps.scriptRepo.findById(id);
+    if (!existing) throw notFound('Script not found');
+    if (existing.kind !== 'template') throw conflict('Not a template (update_template edits templates only)');
+    if (input.source !== undefined) {
+      const v = await this.validate(input.source);
+      this.requireValid(v, actor, 'script.update', id);
+    }
+    return this.update(id, input, actor);
+  }
+
   async update(id: string, input: ScriptUpdateInput, actor: Actor): Promise<IpcScript> {
-    requireActor(actor, ['human', 'agent'], 'scripts.update');
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.update');
     const { scriptRepo } = this.deps;
     const data = { ...input };
     // Don't allow editing templates directly
@@ -130,6 +249,11 @@ export class ScriptService {
     if (!existing) throw notFound('Script not found');
     if (existing.is_template) {
       throw conflict('Cannot edit template scripts. Fork it to create a custom copy.');
+    }
+    // The agent edits only what it wrote (Decision R135): never a human's script that live bots may run
+    if (who.kind === 'agent' && existing.origin !== 'agent') {
+      this.deps.audit?.record('agent', 'script.update', id, { name: existing.name, origin: existing.origin }, 'denied: not an agent script');
+      throw new ServiceError('forbidden', 'scripts.update: the agent may only edit scripts it wrote (origin agent)');
     }
 
     // Auto-bump patch version if source code changed and no explicit version provided
@@ -153,7 +277,7 @@ export class ScriptService {
       }
     }
 
-    const row = scriptRepo.update(id, { ...data, ...(compiled !== undefined ? { compiled } : {}) });
+    const row = scriptRepo.update(id, { ...data, ...(compiled !== undefined ? { compiled } : {}) }, originOf(who));
     if (!row) throw notFound('Script not found');
     this.auditScript(actor, 'script.update', row, {
       fields: Object.keys(data),
@@ -180,7 +304,7 @@ export class ScriptService {
 
   /** Copy a script (typically a template) into a new, editable custom script */
   async fork(id: string, newName: string | undefined, actor: Actor): Promise<IpcScript> {
-    requireActor(actor, ['human', 'agent'], 'scripts.fork');
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.fork');
     const { scriptRepo } = this.deps;
     const original = scriptRepo.findById(id);
     if (!original) throw notFound('Script not found');
@@ -201,6 +325,7 @@ export class ScriptService {
       compiled,
       configSchema: original.config_schema,
       isTemplate: false,
+      origin: originOf(who),
     });
     this.auditScript(actor, 'script.create', forkedRow, { forkedFrom: original.id, forkedRevision: original.revision });
 

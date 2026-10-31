@@ -12,6 +12,8 @@ COPY tsconfig.json ./
 COPY packages ./packages
 COPY apps ./apps
 COPY templates ./templates
+# gen-sdk-dts.ts regenerates botlab-sdk.d.ts during the build (spec §5.3)
+COPY scripts/gen-sdk-dts.ts ./scripts/
 RUN npm run build && npm prune --omit=dev
 
 # ── Runtime ──

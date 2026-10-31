@@ -63,6 +63,11 @@ export class ScriptRepository {
       .all() as ScriptRow[];
   }
 
+  /** Every script of kind template: builtin and agent/human templates (spec §2.1) */
+  findByKind(kind: ScriptKind): ScriptRow[] {
+    return this.db.prepare('SELECT * FROM scripts WHERE kind = ? ORDER BY name ASC').all(kind) as ScriptRow[];
+  }
+
   findByNameAndVersion(name: string, version: string): ScriptRow | undefined {
     return this.db
       .prepare('SELECT * FROM scripts WHERE name = ? AND version = ?')
@@ -84,6 +89,8 @@ export class ScriptRepository {
     trust?: ScriptTrust;
     /** Recorded on the script_versions row (default derived from origin) */
     createdBy?: string;
+    /** Default: template for builtin templates (isTemplate), else custom. Agent templates are kind template, not isTemplate. */
+    kind?: ScriptKind;
   }): ScriptRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -93,7 +100,7 @@ export class ScriptRepository {
         : JSON.stringify(data.configSchema || {});
     const origin: ScriptOrigin = data.origin ?? 'human';
     const trust: ScriptTrust = data.trust ?? (origin === 'builtin' ? 'proven' : 'new');
-    const kind: ScriptKind = data.isTemplate ? 'template' : 'custom';
+    const kind: ScriptKind = data.kind ?? (data.isTemplate ? 'template' : 'custom');
     const hash = sourceHash(data.source);
 
     this.db.transaction(() => {

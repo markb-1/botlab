@@ -21,3 +21,8 @@ export { AuditLogService } from './AuditLogService';
 export type { AuditQuery, AuditPage, AuditEntryView } from './AuditLogService';
 export type { BotOrderView } from './BotService';
 export { PublicError, publicLookupError, scrubPublicText } from './redact';
+export { AgentService, RUN_TIMEOUT_MS, TOOLS_EXEMPT_FROM_CAP } from './AgentService';
+export type { AgentRunView, AgentNoteView, AgentBudgetView, PositionExitFlagView } from './AgentService';
+export type { ScriptValidation, TemplateSummary } from './ScriptService';
+export type { AgentSearchHit, MarketServiceExtras } from './MarketService';
+export type { RiskPositionView } from './BotService';

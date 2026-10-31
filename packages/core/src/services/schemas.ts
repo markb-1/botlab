@@ -25,6 +25,8 @@ export const BotCreateSchema = z.object({
   config: jsonObject.optional(),
   enabled: z.boolean().optional(),
   mode: z.enum(['live', 'paper']).optional(),
+  /** Condition ids the bot is scoped to (spec §2.1 market_ids; the recorder records their books) */
+  marketIds: z.array(z.string().min(1).max(100)).max(50).optional(),
 });
 
 export const BotUpdateSchema = z.object({
@@ -147,6 +149,125 @@ export const AdoptPositionsSchema = z.object({
 });
 
 export const WatchlistAddSchema = z.object({ tokenId: z.string(), marketId: z.string().nullish(), note: z.string().nullish() });
+
+// ─── Agent tools (MCP, spec §7.3) ─────────────────────────────────────────────
+// Field descriptions end up in the tool's JSON Schema, which the agent reads.
+
+const tokenIdField = z.string().min(1).max(100).describe('Polymarket token (outcome) id');
+const marketIdField = z.string().min(1).max(100).describe('Polymarket condition id');
+const botIdField = z.string().min(1).max(100).describe('BotLab bot id');
+const modeFilter = z.enum(['paper', 'live']).optional().describe('Only paper or only live (default both)');
+
+export const AgentSearchMarketsSchema = z.object({
+  q: z.string().max(200).optional().describe('Search text; empty ⇒ the most traded open markets'),
+  category: z.string().max(60).optional().describe('BotLab category (categories.yaml), e.g. weather-climate'),
+  minLiquidityUsd: z.number().nonnegative().optional().describe('Minimum 24h volume (USD)'),
+  endWithinDays: z.tuple([z.number().nonnegative(), z.number().nonnegative()]).optional().describe('[min, max] days until the market ends'),
+  minPrice: z.number().min(0).max(1).optional().describe('Minimum YES price'),
+  maxPrice: z.number().min(0).max(1).optional().describe('Maximum YES price'),
+  inMandateOnly: z.boolean().optional().describe('Drop markets the mandate / limits flag (default false: they are returned with flags)'),
+  includeClosed: z.boolean().optional().describe('Include closed markets (default false)'),
+  source: z.enum(['live', 'cache']).optional().describe('live = Polymarket search (default); cache = markets BotLab already knows'),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+
+export const MarketIdInputSchema = z.object({ marketId: marketIdField });
+export const OrderbookInputSchema = z.object({ tokenId: tokenIdField, depth: z.number().int().min(1).max(50).optional().describe('Levels per side (default 10)') });
+export const PriceHistoryInputSchema = z.object({
+  tokenId: tokenIdField,
+  interval: z.enum(['1h', '6h', '1d', '1w', '1m', 'max']).optional().describe('Window (default 1w)'),
+  fidelityMinutes: z.number().int().min(1).max(1440).optional().describe('Polymarket resolution in minutes (default 60)'),
+});
+export const PositionsFilterSchema = z.object({ botId: botIdField.optional(), marketId: marketIdField.optional(), mode: modeFilter });
+export const TradesFilterSchema = z.object({
+  botId: botIdField.optional(),
+  marketId: marketIdField.optional(),
+  hours: z.number().positive().max(24 * 90).optional().describe('History window in hours (default 168)'),
+  limit: z.number().int().min(1).max(500).optional(),
+});
+export const AgentBotListSchema = z.object({
+  status: z.string().max(20).optional().describe('stopped | running | error | …'),
+  createdBy: z.enum(['human', 'agent']).optional(),
+  stage: z.enum(['paper', 'probation', 'full', 'retired']).optional(),
+});
+export const BotIdInputSchema = z.object({ botId: botIdField });
+export const BotLogsInputSchema = z.object({
+  botId: botIdField,
+  limit: z.number().int().min(1).max(500).optional().describe('Lines (default 100), newest first'),
+  offset: z.number().int().min(0).max(500).optional().describe('Skip this many of the newest lines (paging)'),
+});
+export const GetScriptInputSchema = z.object({
+  scriptId: z.string().min(1).max(100),
+  version: z.number().int().positive().optional().describe('A past version (default: current source)'),
+});
+export const AgentForecastFilterSchema = z.object({
+  status: z.enum(['active', 'superseded', 'withdrawn', 'resolved', 'void']).optional(),
+  category: z.string().max(60).optional(),
+  marketId: marketIdField.optional(),
+  tokenId: tokenIdField.optional(),
+  tradeableOnly: z.boolean().optional(),
+  limit: z.number().int().min(1).max(500).optional(),
+});
+export const NotesFilterSchema = z.object({
+  scope: z.string().max(120).optional().describe('Exact scope, or a prefix ending in ":" (e.g. market:)'),
+  query: z.string().max(200).optional().describe('Text in the title or body'),
+  limit: z.number().int().min(1).max(500).optional(),
+});
+export const RunHistorySchema = z.object({ limit: z.number().int().min(1).max(100).optional() });
+export const LeaderboardInputSchema = z.object({
+  period: z.enum(['DAY', 'WEEK', 'MONTH', 'ALL']).optional(),
+  orderBy: z.enum(['PNL', 'VOL']).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe('Also return this wallet’s recent activity'),
+  activityLimit: z.number().int().min(1).max(200).optional(),
+});
+export const ValidateScriptSchema = z.object({ source: z.string().min(1).max(200_000).describe('TypeScript bot script') });
+export const CreateTemplateSchema = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().max(2000).optional(),
+  source: z.string().min(1).max(200_000),
+  configSchema: jsonObject.optional().describe('JSON Schema of the bot config (also exported as meta.configSchema)'),
+});
+export const UpdateTemplateSchema = z.object({
+  templateId: z.string().min(1).max(100),
+  source: z.string().min(1).max(200_000).optional(),
+  description: z.string().max(2000).optional(),
+  configSchema: jsonObject.optional(),
+});
+export const BacktestIdSchema = z.object({ backtestId: z.string().min(1).max(100) });
+/** Strict: an unknown key (walletId, mode, stage…) is an error, not silently dropped */
+export const AgentCreateBotSchema = z.strictObject({
+  templateId: z.string().min(1).max(100).describe('A template id from list_templates'),
+  name: z.string().min(1).max(100),
+  marketIds: z.array(marketIdField).max(50).optional().describe('Markets the bot is scoped to (their books are recorded)'),
+  config: jsonObject.optional().describe('Bot config (see the template configSchema)'),
+});
+export const UpdateBotConfigSchema = z.strictObject({ botId: botIdField, config: jsonObject });
+export const RetireBotSchema = z.object({ botId: botIdField, reason: z.string().min(1).max(1000) });
+export const WithdrawForecastInputSchema = z.object({ forecastId: z.string().min(1).max(100), reason: z.string().min(1).max(1000) });
+export const AssessMarketSchema = z.object({
+  marketId: marketIdField,
+  score: z.number().int().min(0).max(3).describe('Ambiguity 0-3 (spec §7.4)'),
+  rationale: z.string().min(1).max(2000),
+});
+export const FlagPositionExitSchema = z.object({ botId: botIdField, tokenId: tokenIdField, reason: z.string().min(1).max(2000) });
+export const AgentKillSwitchSchema = z.object({ reason: z.string().min(1).max(1000) });
+export const UnwatchInputSchema = z.object({ tokenId: tokenIdField });
+export const WriteNoteSchema = z.object({
+  id: z.string().max(100).optional().describe('Existing note to replace; omit to create'),
+  scope: z.string().min(1).max(120).describe('general | market:<conditionId> | category:<category> | strategy:<key>'),
+  title: z.string().min(1).max(200),
+  body_md: z.string().min(1).max(20_000),
+});
+export const NoteIdSchema = z.object({ id: z.string().min(1).max(100) });
+export const StartRunSchema = z.object({ trigger: z.enum(['manual', 'schedule', 'event']).optional() });
+export const FinishRunSchema = z.object({
+  summary_md: z.string().min(1).max(20_000).describe('Run report (markdown), sent to the owner'),
+  status: z.enum(['ok', 'error', 'aborted']).optional(),
+  tokens_in: z.number().int().nonnegative().optional(),
+  tokens_out: z.number().int().nonnegative().optional(),
+  cost_usd: z.number().nonnegative().optional().describe('LLM cost of this run, if known'),
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
