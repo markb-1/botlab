@@ -2,6 +2,28 @@
 
 Implementation log for `docs/SPEC.md`. Each chunk is implemented, reviewed independently, fixed, then committed.
 
+## Morning summary (overnight run, 2026-10-30 → 31)
+
+**Phases 1–3 are complete.** Every chunk was built, independently reviewed, and all review findings were fixed;
+~950 tests pass and CI is green on macOS, Windows and Ubuntu. Nothing has been run against live Polymarket/Binance.
+
+**Try it on your Mac:** `npm install` → `npm run dev` → open http://localhost:3000 → first-run setup (the one-time
+code is printed in the server log) → everything starts in **paper mode**. See README for Windows/Docker.
+
+**Before any live trading (must-do):**
+1. Verify the items marked VERIFY/unverified against live data: Polymarket fee rates and formula (R13, R79), GTD expiry
+   buffer, Gamma tag slugs and UMA fields (R50, R52, R54), Data API / CLOB `getTrades` / `/time` fields (2b report).
+2. Rate the ambiguity of any market before a bot can buy it (Markets page; R51/R124).
+3. Set real limit values (Risk page), then add `live_trading.enabled: true` to `limits.yaml` (R98).
+4. If you have positions from the old Electron app: adopt them (Settings → Reconciliation; R8, S2 of 2b).
+5. Windows service: check NSSM grants "Log on as a service" for your account (R112).
+
+**Most important decisions to review:** R1 (risk-exit exemptions), R51 (assessment required before buys), R66 (bot
+wallets assumed bot-only — manual trades on them trigger a halt), R98 (live gate), R109 (agent: paper-only bots,
+config-only edits), R110 (setup code). Full list below.
+
+**Not started:** Phase 4 (MCP server + scheduled agent) and Phase 5 (strategy templates).
+
 ## Plan
 
 | chunk | scope | status |
