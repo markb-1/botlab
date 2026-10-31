@@ -74,6 +74,9 @@ export function botRoutes(bots: CoreServices['bots']): RouteDef[] {
     { method: 'get', path: '/api/bots/:id/positions', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.positions(param('id')) },
     { method: 'get', path: '/api/bots/:id/stats', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.stats(param('id')) },
     // Order attempts incl. risk rejections (spec §12 Bot detail; §7.3 get_open_orders)
+    // Recent log lines / ctx.emit events (in memory; the same data SSE /api/events delivers live to any principal)
+    { method: 'get', path: '/api/bots/:id/logs', allow: READ_ALL, handler: ({ param, query }) => bots.logs(param('id'), queryNumber(query('limit'))) },
+    { method: 'get', path: '/api/bots/:id/events', allow: READ_ALL, handler: ({ param, query }) => bots.events(param('id'), queryNumber(query('limit'))) },
     { method: 'get', path: '/api/bots/:id/orders', allow: READ_ALL, handler: ({ param, query }) => bots.orders(param('id'), queryNumber(query('limit'))) },
   ];
 }
@@ -304,6 +307,14 @@ export function ledgerRoutes(ledger: CoreServices['ledger'], markets: CoreServic
         const { category, bucket, state, reason } = parseInput(SetRightsStateSchema, body);
         return ledger.forceRightsState(category, bucket as HorizonBucket, state as CategoryRightsState | 'auto', reason, human());
       },
+    },
+    // Live Polymarket search via Gamma (Markets page): q, active (default true), category (BotLab), limit
+    {
+      method: 'get',
+      path: '/api/markets/search',
+      allow: READ_ALL,
+      handler: ({ query }) =>
+        markets.searchLive({ q: query('q') ?? '', active: queryBool(query('active')) ?? true, category: query('category'), limit: queryNumber(query('limit')) }),
     },
     { method: 'get', path: '/api/markets/:id', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => markets.get(param('id')) },
     {

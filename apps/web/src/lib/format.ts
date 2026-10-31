@@ -39,6 +39,8 @@ export function relTime(iso: string | null | undefined, now = Date.now()): strin
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return iso;
   const s = Math.round((t - now) / 1000);
+  // Within a few seconds, or slightly ahead because the server's clock leads the browser's: not "in 0 s"
+  if (s > -5 && s <= 120) return 'just now';
   const abs = Math.abs(s);
   const v = abs < 60 ? `${abs} s` : abs < 3600 ? `${Math.round(abs / 60)} min` : abs < 86400 ? `${Math.round(abs / 3600)} h` : `${Math.round(abs / 86400)} d`;
   return s < 0 ? `${v} ago` : `in ${v}`;

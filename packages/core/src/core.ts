@@ -46,6 +46,7 @@ import { seedTemplates, getBuiltinTemplates } from './db/seed';
 import { AuditService } from './audit/AuditService';
 import { OrderCanceller } from './orders/OrderCanceller';
 import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/MarketDataService';
+import { BotActivityLog } from './bots/BotActivityLog';
 import { FeeService } from './orders/FeeService';
 import type { FeeRates } from './orders/feeModel';
 import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
@@ -376,6 +377,9 @@ export function createCore(options: CoreOptions): Core {
     },
   });
 
+  // Recent bot logs / custom events for the UI (Logs and Events tabs); filled from bot:event after unlock
+  const activity = new BotActivityLog();
+
   // ── Services ──────────────────────────────────────────────────────
   const services: CoreServices = {
     bots: new BotService({
@@ -387,6 +391,7 @@ export function createCore(options: CoreOptions): Core {
       settingsRepo,
       audit,
       orderRepo,
+      activity,
       botManager: () => botManager,
       walletManager: () => walletManager,
     }),
@@ -675,14 +680,9 @@ export function createCore(options: CoreOptions): Core {
     // Bot events; log events also on the dedicated bot:log channel (UI Logs tab)
     manager.on('bot:event', (event) => {
       events.emit('bot:event', event);
-      if (event.type === 'log' && event.data) {
-        events.emit('bot:log', {
-          botId: event.botId,
-          timestamp: event.timestamp,
-          level: event.data.level,
-          message: event.data.message,
-        });
-      }
+      // Kept for GET /api/bots/:id/logs and /events (history before the tab was opened)
+      const stored = activity.record(event);
+      if (stored.log) events.emit('bot:log', stored.log);
     });
 
     console.log('[Core] Unlocked — all services ready');

@@ -6,6 +6,7 @@
  * unlock those calls throw `ServiceError('locked')`.
  */
 
+import { DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_LINES, type BotActivityLog, type BotCustomEvent, type BotLogLine } from '../bots/BotActivityLog';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { WalletRepository } from '../db/repositories/WalletRepository';
 import type { ScriptRepository } from '../db/repositories/ScriptRepository';
@@ -332,6 +333,10 @@ function orderRowToView(o: OrderRow): BotOrderView {
   };
 }
 
+function clampLimit(limit: number | null | undefined, max: number): number {
+  return typeof limit === 'number' && Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), max) : max;
+}
+
 export interface BotServiceDeps {
   botRepo: BotRepository;
   walletRepo: WalletRepository;
@@ -341,6 +346,8 @@ export interface BotServiceDeps {
   settingsRepo: SettingsRepository;
   audit?: AuditService;
   orderRepo?: Pick<OrderRepository, 'findOpen' | 'findByBot'>;
+  /** Recent log lines / custom events per bot (in memory) */
+  activity?: Pick<BotActivityLog, 'getLogs' | 'getEvents' | 'forget'>;
   /** The BotManager once the core is unlocked, else null */
   botManager: () => Pick<BotManager, 'startBot' | 'stopBot' | 'restartBot'> | null;
   /** The WalletManager once the core is unlocked, else null */
@@ -502,6 +509,7 @@ export class BotService {
     const deleted = botRepo.delete(id);
     if (!deleted) throw conflict('Bot not found or cannot be deleted (must be stopped)');
     audit?.record(actor, 'bot.delete', id, { name: botRow?.name, scriptId: botRow?.script_id, stage: botRow?.stage });
+    this.deps.activity?.forget(id);
 
     // Clean up auto-generated paper wallet
     if (isPaperWallet && paperWalletId) {
@@ -519,6 +527,18 @@ export class BotService {
 
   async restart(id: string, by: Actor): Promise<void> {
     await this.manager().restartBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.restart')));
+  }
+
+  /** Recent log lines of a bot, oldest first (the last 500 kept in memory since the server started) */
+  logs(botId: string, limit?: number): BotLogLine[] {
+    if (!this.deps.botRepo.findById(botId)) throw notFound('Bot not found');
+    return this.deps.activity?.getLogs(botId, clampLimit(limit, DEFAULT_MAX_LOG_LINES)) ?? [];
+  }
+
+  /** Recent custom events (ctx.emit) of a bot, oldest first */
+  events(botId: string, limit?: number): BotCustomEvent[] {
+    if (!this.deps.botRepo.findById(botId)) throw notFound('Bot not found');
+    return this.deps.activity?.getEvents(botId, clampLimit(limit, DEFAULT_MAX_EVENTS)) ?? [];
   }
 
   /** A bot's order attempts, newest first, including risk rejections with the failed check (spec §12 Bot detail) */

@@ -154,7 +154,7 @@ export function Settings() {
       <div>
         <h2 className="text-2xl font-bold text-white">Settings</h2>
         <p className="mt-1 text-sm text-gray-400">
-          Configure global settings for your multi-bot system
+          Exchange connections, notifications, password, API tokens and reconciliation
         </p>
       </div>
 
@@ -323,7 +323,7 @@ export function Settings() {
         </div>
         <p className="text-sm text-gray-400">
           Connect your Binance account to enable spot trading via <code className="text-gray-300">ctx.binance.*</code> in scripts.
-          Credentials are encrypted and never sent to the renderer.
+          Credentials are encrypted at rest with the master key, used only by the server, and never sent to the browser.
         </p>
 
         {binanceMessage && (

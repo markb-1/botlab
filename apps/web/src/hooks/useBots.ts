@@ -2,7 +2,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { botApi } from '../lib/api';
 import type { Bot, BotTrade, BotPosition, BotStats, DashboardBotStats } from '../types';
 
-export function useBots() {
+/** Bot list + mutations. `{ list: false }`: mutations only (no list polling, e.g. on Bot detail). */
+export function useBots(opts: { list?: boolean } = {}) {
   const queryClient = useQueryClient();
 
   const { data: bots = [], isLoading, error } = useQuery({
@@ -10,6 +11,7 @@ export function useBots() {
     queryFn: async () => {
       return (await botApi.list()) as Bot[];
     },
+    enabled: opts.list !== false,
     refetchInterval: 5000,
   });
 

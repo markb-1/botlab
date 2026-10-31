@@ -169,3 +169,23 @@ describe('calibration buckets', () => {
     expect(c.meanSkill).toBeCloseTo(0.1);
   });
 });
+
+describe('relTime / bot activity history', () => {
+  it('never says "in 0 s" for a timestamp slightly ahead of the browser clock', async () => {
+    const { relTime } = await import('../../apps/web/src/lib/format');
+    const now = Date.parse('2026-10-31T10:00:00Z');
+    expect(relTime(new Date(now + 400).toISOString(), now)).toBe('just now');
+    expect(relTime(new Date(now + 90_000).toISOString(), now)).toBe('just now');
+    expect(relTime(new Date(now - 2_000).toISOString(), now)).toBe('just now');
+    expect(relTime(new Date(now - 30_000).toISOString(), now)).toBe('30 s ago');
+    expect(relTime(new Date(now + 3_600_000).toISOString(), now)).toBe('in 1 h');
+  });
+
+  it('merges server history with live lines received while it loaded, without duplicates', async () => {
+    const { mergeHistory } = await import('../../apps/web/src/lib/botActivity');
+    const l = (t: string, m: string) => ({ timestamp: t, level: 'info', message: m });
+    const history = [l('1', 'a'), l('2', 'b')];
+    expect(mergeHistory(history, [l('2', 'b'), l('3', 'c')], 500)).toEqual([l('1', 'a'), l('2', 'b'), l('3', 'c')]);
+    expect(mergeHistory(history, [l('3', 'c')], 2)).toEqual([l('2', 'b'), l('3', 'c')]);
+  });
+});

@@ -14,7 +14,7 @@ import { asHuman } from '../../packages/core/src/services/actors';
 const HUMAN = asHuman('test');
 
 const info = (marketId: string, labels: string[] = ['Economy']): MarketInfo => ({
-  marketId, question: 'q', outcome: 'Yes', tokenIds: [`${marketId}-yes`, `${marketId}-no`], endDate: null, volume24hrUsd: 1, labels, closed: false,
+  marketId, question: 'q', outcome: 'Yes', tokenIds: [`${marketId}-yes`, `${marketId}-no`], endDate: null, volume24hrUsd: 1, labels, closed: false, feeSchedule: null,
 });
 
 describe('parseGammaMarketFull', () => {
@@ -89,6 +89,36 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     expect((await h.cache.refresh('m2'))!.feeSchedule).toMatchObject({ rate: 0, from: 'zero' });
     expect((await h.cache.refresh('m3'))!.feeSchedule).toBeNull();
     expect(h.cache.getCachedByToken('m1-yes')!.feeSchedule!.rate).toBe(0.04);
+  });
+
+  it('live Gamma search: text ⇒ public-search events flattened, categorized and filtered; nothing cached', async () => {
+    h.gamma.set('m1', gammaMarket('m1'));
+    await h.cache.refresh('m1');
+    h.fetchFn.mockImplementationOnce(async (url: string) => {
+      const u = new URL(url);
+      expect(u.pathname).toBe('/public-search');
+      expect(u.searchParams.get('q')).toBe('cpi');
+      expect(u.searchParams.get('events_status')).toBe('active');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          events: [
+            { id: 'e1', title: 'US CPI', tags: [{ slug: 'economy', label: 'Economy' }], markets: [gammaMarket('m1'), gammaMarket('m2', { feeSchedule: { rate: 0.05, exponent: 1 } })] },
+            { id: 'e2', title: 'NBA', tags: [{ slug: 'sports', label: 'Sports' }], markets: [gammaMarket('m3', { question: 'Lakers win?' }), gammaMarket('m4', { closed: true })] },
+          ],
+        }),
+      } as unknown as Response;
+    });
+    const hits = await h.cache.searchGamma({ q: 'cpi', category: 'economics' });
+    expect(hits.map((x) => [x.marketId, x.category, x.cached, x.feeRate])).toEqual([
+      ['m1', 'economics', true, null],
+      ['m2', 'economics', false, 0.05],
+    ]);
+    expect(h.cache.getCached('m2')).toBeNull();
+
+    h.fetchFn.mockImplementationOnce(async () => ({ ok: false, status: 503, json: async () => ({}) }) as unknown as Response);
+    await expect(h.cache.searchGamma({})).rejects.toThrow(/503/);
   });
 
   it('ambiguity: unassessed ⇒ null (buys rejected); assessed; auto-raised to 2 for 7 days after a rules change and on dispute', async () => {

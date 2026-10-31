@@ -234,6 +234,31 @@ describe.skipIf(!sqliteAvailable)('3c UI routes', () => {
     expect(await statuses('GET', '/api/markets?q=election')).toEqual([200, 200, 200]);
   });
 
+  it('bot logs / events history: all scopes (like SSE), in memory, bounded, unknown bot ⇒ 404', async () => {
+    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    const bot = (await req('POST', '/api/bots', { cookie, body: { name: 'p', scriptId: script.id } })).json.data;
+    const mgr = core.botManager!;
+    const at = new Date('2026-10-31T10:00:00Z');
+    mgr.emit('bot:event', { type: 'log', botId: bot.id, botType: 'script', timestamp: at, data: { level: 'info', message: 'onStart ran' } });
+    mgr.emit('bot:event', { type: 'price', botId: bot.id, botType: 'script', timestamp: at, data: { symbol: 'BTCUSDT', price: 70000 } });
+    mgr.emit('bot:event', { type: 'heartbeat', botId: bot.id, botType: 'script', timestamp: at, data: {} });
+    for (let i = 0; i < 600; i++) mgr.emit('bot:event', { type: 'log', botId: bot.id, botType: 'script', timestamp: at, data: { level: 'debug', message: `line ${i}` } });
+
+    expect(await statuses('GET', `/api/bots/${bot.id}/logs`)).toEqual([200, 200, 200]);
+    expect(await statuses('GET', `/api/bots/${bot.id}/events`)).toEqual([200, 200, 200]);
+    const res = await app.request(`/api/bots/${bot.id}/logs`, { headers: { host: HOST } });
+    expect(res.status).toBe(401);
+
+    const logs = (await req('GET', `/api/bots/${bot.id}/logs`, { cookie })).json.data;
+    expect(logs).toHaveLength(500); // ring buffer: the oldest lines dropped
+    expect(logs[499]).toEqual({ botId: bot.id, timestamp: at.toISOString(), level: 'debug', message: 'line 599' });
+    expect((await req('GET', `/api/bots/${bot.id}/logs?limit=2`, { cookie })).json.data.map((l: { message: string }) => l.message)).toEqual(['line 598', 'line 599']);
+    const events = (await req('GET', `/api/bots/${bot.id}/events`, { bearer: readonly })).json.data;
+    expect(events).toEqual([{ botId: bot.id, timestamp: at.toISOString(), type: 'price', data: { symbol: 'BTCUSDT', price: 70000 } }]); // built-in types excluded
+    expect((await req('GET', '/api/bots/nope/logs', { cookie })).status).toBe(404);
+    expect((await req('GET', '/api/bots/nope/events', { cookie })).status).toBe(404);
+  });
+
   it('adoption preview: human admin only; refused for an unknown bot without auditing', async () => {
     expect((await statuses('POST', '/api/reconcile/adopt/preview', { walletId: 'w', botId: 'b' })).slice(1)).toEqual([403, 403]);
     const r = await req('POST', '/api/reconcile/adopt/preview', { cookie, body: { walletId: 'w', botId: 'b' } });

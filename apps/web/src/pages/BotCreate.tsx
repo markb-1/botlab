@@ -6,6 +6,14 @@ import { useWallets } from '../hooks/useWallets';
 import type { Script } from '../types';
 import { useOverview } from '../hooks/useRisk';
 
+/** Which exchanges a script uses, from its source (ctx.binance.* vs Polymarket calls) */
+function scriptExchanges(source: string): { binance: boolean; polymarket: boolean } {
+  return {
+    binance: /ctx\.binance\b/.test(source),
+    polymarket: /ctx\.(polymarket|clob|buy|sell|ledger)\b/.test(source),
+  };
+}
+
 // Trader entry with address and nickname
 interface TraderEntry {
   address: string;
@@ -43,6 +51,11 @@ export function BotCreate() {
 
   const { schema } = useScriptSchema(scriptId || '');
   const selectedScript = scripts.find((s) => s.id === scriptId);
+  const defaultName = selectedScript ? `${selectedScript.name} Bot` : '';
+  const venues = scriptExchanges(selectedScript?.source ?? '');
+  // Paper balances: USDC for Polymarket, USDT for Binance (USDT-quoted pairs only)
+  const quoteCurrency = venues.binance && !venues.polymarket ? 'USDT' : venues.polymarket && !venues.binance ? 'USDC' : 'USDC / USDT';
+  const exchangeLabel = venues.binance && !venues.polymarket ? 'Binance' : venues.polymarket && !venues.binance ? 'Polymarket' : 'Polymarket / Binance';
   const availableWallets = wallets.filter((w) => !w.currentBotId);
 
   // Auto-advance to step 2 if scriptId is set from URL
@@ -51,7 +64,7 @@ export function BotCreate() {
       const script = scripts.find((s) => s.id === searchParams.get('scriptId'));
       if (script) {
         setStep(2);
-        setName(`${script.name} Bot`);
+        setName('');
       }
     }
   }, [searchParams, scripts]);
@@ -91,7 +104,7 @@ export function BotCreate() {
 
   const handleSelectScript = (script: Script) => {
     setScriptId(script.id);
-    setName(`${script.name} Bot`);
+    setName(''); // the suggested name is the placeholder, so typing does not append to it
     setStep(2);
   };
 
@@ -99,7 +112,8 @@ export function BotCreate() {
     e.preventDefault();
     setError(null);
 
-    if (!name.trim()) { setError('Name is required'); return; }
+    const finalName = name.trim() || defaultName;
+    if (!finalName) { setError('Name is required'); return; }
     if (!scriptId) { setError('Script is required'); return; }
     if (effectiveMode === 'live' && !walletId) { setError('Wallet is required'); return; }
 
@@ -107,7 +121,7 @@ export function BotCreate() {
       const finalConfig = effectiveMode === 'paper' ? { ...config, paperBalance } : config;
       await createBot({
         scriptId,
-        name: name.trim(),
+        name: finalName,
         walletId: effectiveMode === 'paper' ? undefined : walletId,
         config: finalConfig,
         mode: effectiveMode,
@@ -301,7 +315,8 @@ export function BotCreate() {
               <h3 className="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wider">Templates</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {scripts.filter((s) => s.isTemplate).map((script) => (
-                  <button key={script.id} onClick={() => handleSelectScript(script)}
+                  <button key={script.id} type="button" onClick={() => handleSelectScript(script)}
+                    aria-label={`Use template ${script.name}`} title={script.description || script.name}
                     className="text-left bg-surface border border-[#2a2a2a] rounded-xl p-4 hover:border-accent/50 transition-colors group">
                     <h4 className="text-base font-medium text-white group-hover:text-accent transition-colors">{script.name}</h4>
                     <p className="text-sm text-gray-400 mt-1 line-clamp-2">{script.description}</p>
@@ -317,7 +332,8 @@ export function BotCreate() {
                 <h3 className="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wider">Custom Scripts</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {scripts.filter((s) => !s.isTemplate).map((script) => (
-                    <button key={script.id} onClick={() => handleSelectScript(script)}
+                    <button key={script.id} type="button" onClick={() => handleSelectScript(script)}
+                      aria-label={`Use script ${script.name}`} title={script.description || script.name}
                       className="text-left bg-surface border border-[#2a2a2a] rounded-xl p-4 hover:border-accent/50 transition-colors group">
                       <h4 className="text-base font-medium text-white group-hover:text-accent transition-colors">{script.name}</h4>
                       <p className="text-sm text-gray-400 mt-1 line-clamp-2">{script.description || 'No description'}</p>
@@ -364,9 +380,9 @@ export function BotCreate() {
         <div className="bg-surface border border-[#2a2a2a] rounded-xl p-6 space-y-4">
           <h3 className="text-lg font-medium text-white">Basic Information</h3>
           <div>
-            <label className="block text-sm font-medium text-gray-300">Name</label>
-            <input type="text" value={name} onChange={(e) => setName(e.target.value)}
-              placeholder="My Trading Bot"
+            <label htmlFor="bot-name" className="block text-sm font-medium text-gray-300">Name</label>
+            <input id="bot-name" type="text" value={name} onChange={(e) => setName(e.target.value)}
+              placeholder={defaultName || 'My Trading Bot'}
               className="mt-1 block w-full rounded-md border-[#2a2a2a] bg-[#111] text-white shadow-sm focus:border-accent focus:ring-accent sm:text-sm" />
           </div>
           {/* Mode toggle */}
@@ -394,7 +410,7 @@ export function BotCreate() {
             <p className="text-xs text-gray-500 mt-1.5">
               {effectiveMode === 'paper'
                 ? 'Simulates trades with virtual funds using real market data. A wallet is auto-generated.'
-                : 'Executes real trades on Polymarket.'}
+                : `Executes real trades on ${exchangeLabel}.`}
             </p>
             {liveDisabled && (
               <p className="text-xs text-yellow-400 mt-1.5">
@@ -412,12 +428,15 @@ export function BotCreate() {
           {/* Paper balance */}
           {effectiveMode === 'paper' && (
             <div>
-              <label className="block text-sm font-medium text-gray-300">Starting Balance (USDC)</label>
-              <input type="number" value={paperBalance}
+              <label htmlFor="paper-balance" className="block text-sm font-medium text-gray-300">Starting Balance ({quoteCurrency})</label>
+              <input id="paper-balance" type="number" value={paperBalance}
                 onChange={(e) => setPaperBalance(Math.max(1, parseFloat(e.target.value) || 0))}
                 min={1} step="any"
                 className="mt-1 block w-full rounded-md border-[#2a2a2a] bg-[#111] text-white shadow-sm focus:border-amber-500 focus:ring-amber-500 sm:text-sm" />
-              <p className="text-xs text-gray-500 mt-1">Virtual USDC balance for paper trading.</p>
+              <p className="text-xs text-gray-500 mt-1">
+                Virtual {quoteCurrency} balance for paper trading. Orders are also capped by the bot&apos;s stage allocation
+                (risk limits), which is usually the smaller number.
+              </p>
             </div>
           )}
 
@@ -458,7 +477,7 @@ export function BotCreate() {
             className="px-4 py-2 border border-[#333] rounded-xl text-sm font-medium text-gray-300 hover:bg-surface-light">
             Cancel
           </button>
-          <button type="submit" disabled={isCreating || !name || !scriptId || (effectiveMode === 'live' && !walletId)}
+          <button type="submit" disabled={isCreating || !(name.trim() || defaultName) || !scriptId || (effectiveMode === 'live' && !walletId)}
             className="px-4 py-2 border border-transparent rounded-xl shadow-sm text-sm font-medium text-white bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed">
             {isCreating ? 'Creating...' : 'Create Bot'}
           </button>

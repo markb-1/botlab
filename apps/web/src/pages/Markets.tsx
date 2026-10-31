@@ -5,7 +5,7 @@ import { marketApi, reconcileApi } from '../lib/api';
 import { useConfig } from '../hooks/useRisk';
 import { Badge, Card, ConfirmDialog, Empty, ErrorBox, Facts, Notice, PageHeader, btnPrimary, btnSecondary, inputCls, tdCls, thCls } from '../components/ui';
 import { dateOnly, dateTime, errorMessage, shortId, usd } from '../lib/format';
-import type { MarketSearchRow, MarketView, WatchlistEntry } from '../types';
+import type { GammaSearchHit, MarketSearchRow, MarketView, WatchlistEntry } from '../types';
 
 /**
  * Markets (spec §6, §7.4, §10): search the market cache, view rules / category / ambiguity / rules
@@ -56,9 +56,12 @@ export function Markets() {
           </button>
         </form>
         <p className="mt-2 text-xs text-gray-500">
-          Search covers markets already in the cache (held, ordered, forecast or opened before). Paste a condition id to fetch any market from Gamma.
+          Searches markets already in the cache (held, ordered, forecast or opened before). Use “Search Polymarket” below for
+          any live market, or paste a condition id to open it.
         </p>
       </Card>
+
+      <LiveSearch onOpen={select} />
 
       {selected && <MarketDetail id={selected} onClose={() => select(null)} />}
 
@@ -105,9 +108,107 @@ export function Markets() {
   );
 }
 
+/** Live Polymarket search through the server (Gamma): text, BotLab category, open markets only */
+function LiveSearch({ onOpen }: { onOpen: (id: string) => void }) {
+  const { data: cfg } = useConfig();
+  const categories = ((cfg?.config?.categories as { rules?: Array<{ name: string }> } | undefined)?.rules ?? [])
+    .map((r) => r.name)
+    .filter((n, i, all) => all.indexOf(n) === i);
+  const [q, setQ] = useState('');
+  const [category, setCategory] = useState('');
+  const [activeOnly, setActiveOnly] = useState(true);
+  const [filter, setFilter] = useState<{ q: string; category: string; active: boolean } | null>(null);
+  const { data: hits = [], error, isFetching } = useQuery({
+    queryKey: ['gammaSearch', filter],
+    enabled: filter !== null,
+    staleTime: 30_000,
+    queryFn: async () =>
+      (await marketApi.searchLive({ q: filter!.q, active: filter!.active, ...(filter!.category ? { category: filter!.category } : {}), limit: 50 })) as GammaSearchHit[],
+  });
+  return (
+    <Card title={`Search Polymarket${isFetching ? ' …' : ''}`}>
+      <form
+        className="flex flex-col sm:flex-row sm:flex-wrap gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          setFilter({ q: q.trim(), category, active: activeOnly });
+        }}
+      >
+        <input
+          type="text"
+          aria-label="Search text"
+          className={`${inputCls} sm:flex-1`}
+          placeholder="Search live markets (empty = most traded)"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        <select aria-label="Category" className={`${inputCls} sm:w-48`} value={category} onChange={(e) => setCategory(e.target.value)}>
+          <option value="">Any category</option>
+          {categories.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+          <option value="other">other</option>
+        </select>
+        <label className="flex items-center gap-2 text-sm text-gray-300">
+          <input type="checkbox" checked={activeOnly} onChange={(e) => setActiveOnly(e.target.checked)} /> Open markets only
+        </label>
+        <button type="submit" className={btnPrimary}>
+          Search
+        </button>
+      </form>
+      <ErrorBox>{error ? errorMessage(error) : null}</ErrorBox>
+      {filter !== null && hits.length === 0 && !isFetching && !error && <Empty>No market matches.</Empty>}
+      {hits.length > 0 && (
+        <div className="mt-3 overflow-x-auto -mx-4 sm:mx-0">
+          <table className="min-w-full divide-y divide-[#2a2a2a]">
+            <thead>
+              <tr>
+                <th className={thCls}>Question</th>
+                <th className={thCls}>Category</th>
+                <th className={thCls}>Ends</th>
+                <th className={thCls}>24 h volume</th>
+                <th className={thCls}>Taker fee</th>
+                <th className={thCls}>Ambiguity</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#2a2a2a]">
+              {hits.map((m) => (
+                <tr key={m.marketId} className="hover:bg-surface-light cursor-pointer" onClick={() => onOpen(m.marketId)}>
+                  <td className={`${tdCls} max-w-md`}>
+                    {m.question}
+                    {m.eventTitle && m.eventTitle !== m.question && <span className="block text-xs text-gray-500">{m.eventTitle}</span>}
+                  </td>
+                  <td className={tdCls}>{m.category}</td>
+                  <td className={`${tdCls} whitespace-nowrap`}>{dateOnly(m.endDate)}</td>
+                  <td className={`${tdCls} tabular-nums`}>{m.volume24hUsd === null ? '—' : usd(m.volume24hUsd)}</td>
+                  <td className={`${tdCls} tabular-nums`}>{m.feeRate === null ? 'table' : m.feeRate === 0 ? 'none' : `${+(m.feeRate * 100).toFixed(2)} %`}</td>
+                  <td className={tdCls}>
+                    {m.ambiguityScore !== null ? m.ambiguityScore : <Badge tone="yellow">{m.cached ? 'not assessed' : 'not cached'}</Badge>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-2 text-xs text-gray-500">Click a market to open it (this adds it to the cache, where it can be assessed).</p>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function MarketDetail({ id, onClose }: { id: string; onClose: () => void }) {
   const qc = useQueryClient();
-  const { data: m, error, isLoading } = useQuery({ queryKey: ['market', id], queryFn: async () => (await marketApi.get(id)) as MarketView | null });
+  const { data: m, error, isLoading } = useQuery({
+    queryKey: ['market', id],
+    queryFn: async () => {
+      const view = (await marketApi.get(id)) as MarketView | null;
+      // Opening a market fetches it into the cache: refresh the cached list
+      qc.invalidateQueries({ queryKey: ['marketSearch'] });
+      return view;
+    },
+  });
   const { data: watch = [] } = useQuery({ queryKey: ['watchlist'], queryFn: async () => (await reconcileApi.watchlistList()) as WatchlistEntry[] });
   const watched = new Set(watch.map((w) => w.token_id));
   const toggleWatch = async (tokenId: string) => {

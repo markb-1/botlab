@@ -148,6 +148,10 @@ export const botApi = {
   getDashboardStats: () => call('GET', '/dashboard/stats'),
   /** Order attempts incl. risk rejections, newest first */
   getOrders: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/orders${qs({ limit })}`),
+  /** Recent log lines (server ring buffer, oldest first) */
+  getLogs: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/logs${qs({ limit })}`),
+  /** Recent custom ctx.emit events (oldest first) */
+  getEvents: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/events${qs({ limit })}`),
 };
 
 // ── Wallets ───────────────────────────────────────────────────────────────
@@ -321,6 +325,8 @@ export const ledgerApi = {
 export const marketApi = {
   /** Search cached markets (question, event, slug, market id or token id) */
   search: (q: string, limit?: number) => call('GET', `/markets${qs({ q, limit })}`),
+  /** Live Polymarket search via Gamma (not only the cache) */
+  searchLive: (filter: { q?: string; active?: boolean; category?: string; limit?: number }) => call('GET', `/markets/search${qs(filter)}`),
   get: (marketId: string) => call('GET', `/markets/${enc(marketId)}`),
   setAmbiguity: (marketId: string, score: number, note?: string) => call('POST', `/markets/${enc(marketId)}/ambiguity`, { score, note }),
 };

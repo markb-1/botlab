@@ -91,6 +91,26 @@ export interface MarketView {
   updatedAt: string;
 }
 
+/** One market from a live Gamma search (MarketCacheService.searchGamma) */
+export interface GammaSearchHit {
+  marketId: string;
+  question: string;
+  eventTitle: string | null;
+  slug: string | null;
+  /** BotLab category from categories.yaml */
+  category: string;
+  endDate: string | null;
+  closed: boolean;
+  volume24hUsd: number | null;
+  liquidityUsd: number | null;
+  /** The market's own taker fee rate; null ⇒ none published (category table) */
+  feeRate: number | null;
+  /** Already in the market cache */
+  cached: boolean;
+  /** Effective ambiguity when cached and assessed */
+  ambiguityScore: number | null;
+}
+
 export interface MarketCacheDeps {
   repo: MarketCacheRepository;
   getCategories: () => CategoriesConfig;
@@ -361,6 +381,73 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       return { category: view.category, ambiguityScore: null, rulesChangedAt: view.rulesChangedAt };
     }
     return { category: view.category, ambiguityScore: view.ambiguityScore, rulesChangedAt: view.rulesChangedAt };
+  }
+
+  // ── Live search (Markets page) ───────────────────────────────────
+
+  /**
+   * Search Polymarket via Gamma (not the cache): text ⇒ `/public-search` (events with their markets),
+   * no text ⇒ the most traded open markets (`/markets?order=volume24hr`). Each market is categorized
+   * with categories.yaml; `category` filters on that BotLab category, `active` drops closed markets.
+   * Nothing is written to the cache (opening a market does that). Throws on network / HTTP errors.
+   */
+  async searchGamma(opts: { q?: string; active?: boolean; category?: string; limit?: number } = {}): Promise<GammaSearchHit[]> {
+    const q = (opts.q ?? '').trim().slice(0, 200);
+    const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 100);
+    const active = opts.active !== false;
+    let raws: unknown[];
+    if (q) {
+      const params = new URLSearchParams({ q, limit_per_type: String(Math.min(limit, 50)), search_tags: 'false', search_profiles: 'false' });
+      if (active) params.set('events_status', 'active');
+      const resp = await this.fetchFn(`${this.baseUrl}/public-search?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!resp.ok) throw new Error(`Gamma search HTTP ${resp.status}`);
+      const body = (await resp.json()) as { events?: unknown };
+      const events = Array.isArray(body?.events) ? (body.events as Array<Record<string, unknown>>) : [];
+      raws = events.flatMap((e) => {
+        if (!e || typeof e !== 'object' || !Array.isArray(e.markets)) return [];
+        const { markets, ...event } = e;
+        return (markets as unknown[]).map((m) => (m && typeof m === 'object' ? { ...(m as object), events: [event] } : m));
+      });
+    } else {
+      const params = new URLSearchParams({ limit: String(limit), order: 'volume24hr', ascending: 'false', include_tag: 'true' });
+      if (active) {
+        params.set('active', 'true');
+        params.set('closed', 'false');
+      }
+      const resp = await this.fetchFn(`${this.baseUrl}/markets?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!resp.ok) throw new Error(`Gamma HTTP ${resp.status}`);
+      const body = (await resp.json()) as unknown;
+      raws = Array.isArray(body) ? body : [];
+    }
+    const cfg = this.deps.getCategories();
+    const now = this.now();
+    const out: GammaSearchHit[] = [];
+    const seen = new Set<string>();
+    for (const raw of raws) {
+      const p = parseGammaMarketFull(raw);
+      if (!p || seen.has(p.marketId)) continue;
+      if (active && (p.closed || !p.active)) continue;
+      const { category } = categorize({ question: p.question, tags: p.tags, eventTitle: p.eventTitle }, cfg);
+      if (opts.category && category !== opts.category) continue;
+      seen.add(p.marketId);
+      const cached = this.deps.repo.get(p.marketId);
+      out.push({
+        marketId: p.marketId,
+        question: p.question,
+        eventTitle: p.eventTitle,
+        slug: p.slug,
+        category,
+        endDate: p.endDate,
+        closed: p.closed,
+        volume24hUsd: p.volume24hUsd,
+        liquidityUsd: p.liquidityUsd,
+        feeRate: p.feeSchedule ? p.feeSchedule.rate : null,
+        cached: !!cached,
+        ambiguityScore: cached ? toMarketView(cached, now).ambiguityScore : null,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   // ── Refreshing ───────────────────────────────────────────────────

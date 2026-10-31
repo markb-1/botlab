@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useBot, useBots, useBotPositions, useBotStats } from '../hooks/useBots';
 import { useScript, useScriptSchema } from '../hooks/useScripts';
 import { useWallets } from '../hooks/useWallets';
-import { events } from '../lib/api';
+import { useBotActivity } from '../hooks/useBotActivity';
 import { ScriptEditor } from '../components/ScriptEditor';
 import type { Bot, BotOrder, Forecast, ScriptVersionInfo } from '../types';
 import { useQuery } from '@tanstack/react-query';
@@ -36,13 +36,13 @@ function StatusBadge({ status }: { status: Bot['status'] }) {
   );
 }
 
-type Tab = 'overview' | 'config' | 'code' | 'orders' | 'logs' | 'trades';
+type Tab = 'overview' | 'config' | 'code' | 'orders' | 'logs' | 'events' | 'trades';
 
 export function BotDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { bot, isLoading } = useBot(id!);
-  const { updateBot, startBot, stopBot, restartBot, deleteBot } = useBots();
+  const { updateBot, startBot, stopBot, restartBot, deleteBot } = useBots({ list: false });
   const { wallets } = useWallets();
   const { script } = useScript(bot?.scriptId || '');
   const { schema } = useScriptSchema(bot?.scriptId || '');
@@ -54,7 +54,7 @@ export function BotDetail() {
   const [isEditing, setIsEditing] = useState(false);
   const [editConfig, setEditConfig] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
-  const [logs, setLogs] = useState<Array<{ timestamp: string; level: string; message: string }>>([]);
+  const { logs, customEvents, historyError, clearLogs, clearEvents } = useBotActivity(id);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   const [pnlPeriod, setPnlPeriod] = useState<'allTime' | '24h'>('allTime');
@@ -62,20 +62,6 @@ export function BotDetail() {
   const wallet = wallets.find((w) => w.id === bot?.walletId);
   const { positions } = useBotPositions(id!);
   const { stats } = useBotStats(id!);
-
-  // Subscribe to bot logs
-  useEffect(() => {
-    const cleanup = events.onBotLog((log: any) => {
-      if (log.botId === id) {
-        setLogs((prev) => [...prev.slice(-500), {
-          timestamp: log.timestamp || new Date().toISOString(),
-          level: log.level || 'info',
-          message: log.message || JSON.stringify(log),
-        }]);
-      }
-    });
-    return cleanup;
-  }, [id]);
 
   // Auto-scroll logs
   useEffect(() => {
@@ -169,6 +155,7 @@ export function BotDetail() {
     { id: 'code', label: 'Code' },
     { id: 'orders', label: 'Orders' },
     { id: 'logs', label: 'Logs' },
+    { id: 'events', label: `Events${customEvents.length ? ` (${customEvents.length})` : ''}` },
     { id: 'trades', label: 'Trades' },
   ];
 
@@ -253,6 +240,13 @@ export function BotDetail() {
                     </>
                   ) : (
                     '—'
+                  )}
+                  {bot.mode === 'paper' && (
+                    <span className="block text-xs text-gray-500 mt-1">
+                      This is the limit: paper orders pass the same risk checks as live ones, so the stage allocation caps
+                      the bot&apos;s exposure (it grows as the bot is promoted). The paper balance is only simulated cash
+                      {bot.config.paperBalance ? ` (${usd(Number(bot.config.paperBalance))})` : ''}; a buy needs room in both.
+                    </span>
                   )}
                 </dd>
               </div>
@@ -524,9 +518,12 @@ export function BotDetail() {
         <div className="bg-[#111] border border-[#2a2a2a] rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-4 py-2 border-b border-[#2a2a2a]">
             <span className="text-sm text-gray-400">
-              {logs.length > 0 ? `${logs.length} log entries` : 'No logs yet. Start the bot to see output.'}
+              {logs.length > 0
+                ? `${logs.length} log entries (the server keeps the last 500 since it started)`
+                : bot.status === 'running' ? 'No log output yet.' : 'No logs yet. Start the bot to see output.'}
+              {historyError && <span className="text-red-400"> · history unavailable: {historyError}</span>}
             </span>
-            <button onClick={() => setLogs([])} className="text-xs text-gray-500 hover:text-gray-300">Clear</button>
+            <button onClick={clearLogs} className="text-xs text-gray-500 hover:text-gray-300">Clear</button>
           </div>
           <div className="h-[calc(100vh-350px)] overflow-y-auto p-4 font-mono text-sm space-y-0.5">
             {logs.length === 0 ? (
@@ -552,6 +549,28 @@ export function BotDetail() {
               })
             )}
             <div ref={logsEndRef} />
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'events' && (
+        <div className="bg-[#111] border border-[#2a2a2a] rounded-xl overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-2 border-b border-[#2a2a2a]">
+            <span className="text-sm text-gray-400">
+              {customEvents.length > 0
+                ? `${customEvents.length} recent events from ctx.emit (newest first; the server keeps the last 100)`
+                : 'No custom events yet. Scripts send them with ctx.emit(type, data).'}
+            </span>
+            <button onClick={clearEvents} className="text-xs text-gray-500 hover:text-gray-300">Clear</button>
+          </div>
+          <div className="max-h-[calc(100vh-350px)] overflow-y-auto p-4 font-mono text-sm space-y-1">
+            {[...customEvents].reverse().map((ev, i) => (
+              <div key={`${ev.timestamp}-${i}`} className="flex flex-wrap gap-x-3">
+                <span className="text-gray-600 flex-shrink-0">{new Date(ev.timestamp).toLocaleTimeString()}</span>
+                <span className="text-accent flex-shrink-0">{ev.type}</span>
+                <span className="text-gray-300 break-all">{ev.data === null || ev.data === undefined ? '' : JSON.stringify(ev.data)}</span>
+              </div>
+            ))}
           </div>
         </div>
       )}

@@ -6,7 +6,8 @@
 
 import type { MarketCacheService } from '../ledger/MarketCacheService';
 import type { HumanActor } from './actors';
-import { invalidInput } from './errors';
+import { invalidInput, ServiceError } from './errors';
+import { publicLookupError } from './redact';
 
 export class MarketService {
   constructor(private markets: MarketCacheService) {}
@@ -48,6 +49,18 @@ export class MarketService {
         disputed: m.disputed,
         updatedAt: m.updatedAt,
       }));
+  }
+
+  /** Live Polymarket search via Gamma (text, open markets only by default, BotLab category filter) */
+  async searchLive(input: { q?: unknown; active?: unknown; category?: unknown; limit?: unknown }) {
+    const q = typeof input.q === 'string' ? input.q : '';
+    const category = typeof input.category === 'string' && input.category.trim() ? input.category.trim() : undefined;
+    const limit = typeof input.limit === 'number' && input.limit > 0 ? input.limit : 50;
+    try {
+      return await this.markets.searchGamma({ q, active: input.active !== false, ...(category ? { category } : {}), limit });
+    } catch (err) {
+      throw new ServiceError('unavailable', publicLookupError(err, 'Polymarket search'));
+    }
   }
 
   /** Ambiguity 0–3 (buys need an assessed market, R51). Human only (agents assess through forecasts). */

@@ -5,6 +5,8 @@
  * - reconciler: `risk_state.reconciled_at` (set when a reconciler run fully succeeded) is < 3 min old;
  *   during the first 3 minutes after unlock "starting" counts as healthy
  * - workers: no running bot is in the `error` state
+ * - halted: the global trading halt is active. Reported, but still HTTP 200: a halt is the safety system
+ *   working, not the server failing, and a 503 would make Docker / service managers restart it (R129).
  */
 
 import type { Core } from '../../../../packages/core/src/core';
@@ -17,6 +19,8 @@ export interface HealthReport {
   unlocked: boolean;
   reconciler: 'ok' | 'starting' | 'stale' | 'locked';
   workers: { running: number; failed: number };
+  /** Global trading halt active (kill switch, loss limit, unclean shutdown, …) */
+  halted: boolean;
 }
 
 export function healthReport(core: Core, unlockedAt: number | null, now = Date.now()): HealthReport {
@@ -37,6 +41,14 @@ export function healthReport(core: Core, unlockedAt: number | null, now = Date.n
   }
   const health = core.botManager?.getAllHealthInfo() ?? [];
   const workers = { running: health.filter((h) => h.status === 'running').length, failed: health.filter((h) => h.status === 'error').length };
+  let halted = false;
+  if (db === 'ok') {
+    try {
+      halted = core.repos.riskStateRepo.getGlobal()?.halted === 1;
+    } catch {
+      halted = false;
+    }
+  }
   const ok = db === 'ok' && unlocked && (reconciler === 'ok' || reconciler === 'starting') && workers.failed === 0;
-  return { ok, db, unlocked, reconciler, workers };
+  return { ok, db, unlocked, reconciler, workers, halted };
 }

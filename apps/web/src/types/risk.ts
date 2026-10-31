@@ -205,6 +205,22 @@ export interface MarketSearchRow {
   updatedAt: string;
 }
 
+/** Live Gamma search result (GET /api/markets/search) */
+export interface GammaSearchHit {
+  marketId: string;
+  question: string;
+  eventTitle: string | null;
+  slug: string | null;
+  category: string;
+  endDate: string | null;
+  closed: boolean;
+  volume24hUsd: number | null;
+  liquidityUsd: number | null;
+  feeRate: number | null;
+  cached: boolean;
+  ambiguityScore: number | null;
+}
+
 export interface AuditEntry {
   id: number;
   ts: string;

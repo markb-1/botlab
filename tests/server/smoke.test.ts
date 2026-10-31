@@ -78,7 +78,13 @@ describe.skipIf(!sqliteAvailable)('server smoke test', () => {
     expect(server!.masterKey.source).toBe('env');
     const h = await api('GET', '/healthz');
     expect(h.status).toBe(200);
-    expect(h.json).toMatchObject({ ok: true, db: 'ok', unlocked: true, reconciler: 'starting', workers: { failed: 0 } });
+    expect(h.json).toMatchObject({ ok: true, db: 'ok', unlocked: true, reconciler: 'starting', workers: { failed: 0 }, halted: false });
+    // A global halt is visible to monitoring but stays HTTP 200 (R129)
+    server!.core.repos.riskStateRepo.setHalted('global', true, 'test halt');
+    const halted = await api('GET', '/healthz');
+    expect(halted.status).toBe(200);
+    expect(halted.json).toMatchObject({ ok: true, halted: true });
+    server!.core.repos.riskStateRepo.setHalted('global', false);
   });
 
   it('first-run setup → session cookie → API calls', async () => {
