@@ -11,53 +11,57 @@ replacing Electron. Follow the spec's phases and decisions. Hard requirements fo
 - **Safety:** every live order goes through the risk engine (spec §4); the agent can never change limits,
   wallets or credentials.
 
-The sections below describe the current (pre-v3) Electron codebase.
+Electron is gone (chunk 3b): a Node server (`apps/server`) serves the HTTP API and the React UI (`apps/web`).
 
 ## Project Overview
 
-Electron desktop app for automated trading on Polymarket (prediction markets) and Binance (crypto spot). TypeScript throughout: Electron main process + React renderer. Users write or pick bot scripts that run in sandboxed worker threads with access to trading APIs via an RPC layer.
+Self-hosted trading lab for Polymarket (prediction markets) and Binance (crypto spot). TypeScript throughout: one Node 22 server process (Hono HTTP API + SSE, bot workers, schedulers, SQLite) and a React SPA in the browser. Users write or pick bot scripts that run in sandboxed worker threads with access to trading APIs via an RPC layer; every order passes the risk engine.
 
 ## Commands
 
 ### Development
 ```bash
-npm run electron:dev       # Compile + launch Electron with Vite dev server (hot reload)
-npm run electron:compile   # Compile electron/ TypeScript only
-npm run electron:preview   # Compile + launch Electron (no Vite dev server)
+npm run dev                # server (tsx watch, :3780) + Vite UI with /api proxy (http://localhost:3000)
+npm run dev:server         # server only
+npm run cli -- <command>   # migrate-key | gen-key | set-password | token create/list/revoke (add --prod for npm start paths)
 ```
 
-### Build & Package
+### Build & Run
 ```bash
-npm run electron:build     # Compile + bundle + package with electron-builder
+npm run build              # tsc (apps/server/tsconfig.build.json) → dist/, vite build → apps/web/dist
+npm start                  # node dist/apps/server/src/main.js --production (OS app-data dir, master key required)
+npm run service:install    # Windows service via NSSM (prints launchd/systemd instructions elsewhere)
+docker compose up -d --build
 ```
 
 ### Testing
 ```bash
-npm test                   # Run all tests (vitest)
+npm test                   # Run all tests (vitest); SKIP_NETWORK_TESTS=1 skips live-API tests
 npm run test:watch         # Watch mode
-npm run test:electron      # Electron-layer tests (IPC, RPC, paper trading, Binance)
+npm run test:server        # HTTP server: smoke test, auth/scopes, master key, bot routes
 npm run test:copy          # Copy trading bot tests
 npm run test:resilience    # Error handling / network failure tests
-vitest run tests/electron/rpc-handler.test.ts  # Single test file
+npx vitest run tests/runtime/rpc-handler.test.ts  # Single test file
 ```
 
 ### Code Quality
 ```bash
-npm run typecheck          # tsc for packages/core and electron
-npm run lint               # ESLint check
+npm run typecheck          # tsc for packages/core, apps/server and apps/web
+npm run lint               # ESLint check (0 errors required; many pre-existing prettier warnings)
 npm run lint:fix           # Auto-fix
 npm run format             # Prettier format
 ```
 
+All npm scripts must stay cross-platform (no `VAR=x cmd`, `rm -rf`, `cp`; use Node scripts in `scripts/*.mjs`).
+
 ## Architecture
 
 ### Layout
-All domain logic lives in a transport-free core (`packages/core`, imported by relative path; no npm
-workspaces yet). `electron/` is a thin shell over it (window, IPC); chunk 3b replaces it with an
-HTTP server + MCP that call the same services.
-1. **Core** (`packages/core/src/`) — DB, risk, orders, exchanges, bot runtime, ledger, services, `createCore()`
-2. **Electron main** (`electron/`) — single-instance lock, window, IPC handlers (validate → service → `{success, data}`)
-3. **Renderer** (`web/client/`) — React SPA loaded via Vite, communicates with main via IPC
+All domain logic lives in a transport-free core (`packages/core`, imported by relative path; one npm
+package, no workspaces). Transports are thin.
+1. **Core** (`packages/core/src/`) — DB, risk, orders, exchanges, bot runtime, ledger, services, backups, `createCore()`
+2. **Server** (`apps/server/src/`) — Hono HTTP API mirroring the old IPC channels, auth, SSE, `/healthz`, static UI, CLI
+3. **Web** (`apps/web/`) — React SPA (Vite); `src/lib/api.ts` is the fetch + EventSource client
 
 ### Directory Structure
 
@@ -67,7 +71,7 @@ packages/core/src/
   core.ts                  # Composition root: createCore({ dataDir, configDir? }) → start() / unlock(key) / shutdown() / close()
   services/                # BotService, WalletService, ScriptService, SettingsService, BacktestService,
                            # RiskService, ConfigFileService, ReconcileService, MarketService;
-                           # schemas.ts (zod inputs shared by IPC/HTTP/MCP), errors.ts (ServiceError), types.ts (DTOs)
+                           # schemas.ts (zod inputs shared by HTTP/MCP), errors.ts (ServiceError), types.ts (DTOs)
   db/                      # SQLite via better-sqlite3, migrations (index.ts), repositories/, seed.ts
   bots/                    # BotManager, BaseBotRunner, WalletManager
   runtime/                 # Bot execution engine
@@ -83,27 +87,33 @@ packages/core/src/
   risk/                    # RiskEngine, halts, kill switch, RiskMonitor, ramp, startup recovery
   config/                  # limits/mandate/fees/server/categories YAML: schema, loader, ConfigService (hot reload)
   ledger/                  # Forecast ledger, scoring, market cache
-  reconcile/ recorder/ backtest/ audit/ notify/ security/ utils/
+  reconcile/ recorder/ backtest/ audit/ notify/ utils/
+  security/                # crypto (AES-256-GCM), masterKey (key check), adminAuth (password, sessions, tokens), migrateSecrets
+  ops/                     # BackupJob (nightly SQLite .backup, 14 kept)
   sdk/                     # types.ts (ctx API types), guide.ts (script-writing guide)
 
 templates/                 # Built-in bot script templates (seeded by db/seed.ts)
 
-electron/
-  main.ts                  # Single-instance lock, window, createCore, IPC registration, quit handling
-  preload.ts               # Context bridge (exposes IPC to renderer)
-  ipc/respond.ts           # { success, data } wrapping + sender check type
-  ipc/handlers/            # Thin IPC handlers over core services (+ auth, AI assistant until 3b)
-  ai/claude.ts             # AI script assistant client (removed in 3b)
+apps/server/src/
+  main.ts                  # Entrypoint: signals (SIGINT/SIGTERM/SIGBREAK/SIGHUP) → graceful shutdown
+  server.ts                # startServer(): data dir lock → master key → createCore → start → unlock → listen
+  app.ts                   # Hono app: host check, /healthz, /api (principal, CSRF, routes, SSE), static UI
+  routes/api.ts            # One route per former IPC channel; scopes + recentAuth per route
+  routes/auth.ts           # setup / login / logout / reauth / password / API tokens
+  http/                    # principal + actor derivation, route helper, envelope, SSE hub, hosts, static, health
+  masterKey.ts migrateKey.ts cli.ts paths.ts instanceLock.ts
 
-web/client/src/            # React renderer
-  pages/                   # Route pages (Dashboard, Bots, Scripts, Wallets, Settings, etc.)
-  hooks/                   # React Query hooks wrapping IPC calls via electronApi
-  lib/electronApi.ts       # IPC call wrappers (settingsApi, botsApi, etc.)
-  types/                   # TypeScript types (Settings, electron.d.ts)
+apps/web/src/              # React UI
+  pages/                   # Dashboard, Bots, Scripts, Wallets, Settings, LoginScreen
+  hooks/                   # React Query hooks over lib/api.ts
+  lib/api.ts               # fetch client (same exports as the old electronApi) + EventSource events
+  components/ReauthDialog.tsx  # password prompt for human-only actions (reauth_required)
+
+scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 ```
 
 ### Bot Script Execution Flow
-1. User creates/starts a bot → IPC handler calls `BotService.start()` → `BotManager.startBot()`
+1. User creates/starts a bot → `POST /api/bots/:id/start` → `BotService.start()` → `BotManager.startBot()`
 2. `BotManager` creates a `ScriptBotRunner` with compiled script code
 3. `ScriptBotRunner` spawns a `ScriptRunner` which creates a worker thread
 4. Worker thread runs the script with a `ctx` object (built by `BotContextProxy`)
@@ -111,26 +121,28 @@ web/client/src/            # React renderer
 6. `RpcHandler` dispatches RPC calls; every order goes through `packages/core/src/orders/OrderService` → `RiskEngine` → exchange adapter (live) or `PaperTradingState` (paper). Only `packages/core/src/exchange/polymarket/orders.ts` and `packages/core/src/exchange/binance/client.ts` may hit order endpoints (enforced by `tests/orders/choke-point.test.ts`)
 
 ### Key Patterns
-- **IPC Handlers** (`electron/ipc/handlers/`): Each module registers `ipcMain.handle()` handlers that parse input with `services/schemas.ts`, call a core service (actor `human`) and wrap the result with `respond()`. Human-only writes also check the sender is the main window. Renderer calls via `window.electronAPI.*`
+- **HTTP routes** (`apps/server/src/routes/`): declarative `RouteDef`s (method, path, allowed scopes, `recentAuth`) → parse input with `services/schemas.ts` → call a core service with the actor derived from the principal → `{ success, data }`. Admin = session cookie (human), agent / readonly = bearer token. Mutations with the cookie need the `X-BotLab: 1` header. `ServiceError` codes map to HTTP statuses (`http/respond.ts`)
 - **RPC Dispatch**: Worker scripts send `{ method, params }` messages. `RpcHandler` pattern-matches on method name (`binance:buy`, `clob:getPrice`, `storage:get`, etc.)
 - **Paper Trading**: `PaperTradingState` tracks simulated balances for both Polymarket and Binance. Persisted via `BotStorageRepository`
 - **Script Compilation**: User TypeScript scripts are compiled with esbuild at save time, stored in SQLite
-- **Credential Security**: Wallet private keys and Binance API credentials are AES-encrypted (CryptoJS) at rest. Decrypted only in main process, never sent to renderer
+- **Credential Security**: Wallet private keys and Binance API credentials are AES-256-GCM encrypted with the master key (`BOTLAB_MASTER_KEY` / `_FILE` / `<data dir>/master.key`; key check in `security/masterKey.ts`). Decrypted only in the server, never sent to the UI
+- **Live trading is opt-in**: `limits.yaml` `live_trading.enabled` (default false) gates live bot starts and live orders (`live_disabled`); bots created without a mode are paper bots
 - **Kelly Criterion**: `ctx.kelly.calculate(winRate, sampleSize, marketPrice, bankroll)` — pure math utility running locally in worker (no RPC). Implemented in `packages/core/src/utils/kellyCalculator.ts`, exposed via `BotContextProxy`
 
 ### Database (SQLite via better-sqlite3)
 - **bots**: id, name, scriptId, walletId, config (JSON), mode (live/paper), status
 - **wallets**: id, name, address, proxyAddress, privateKeyEncrypted, currentBotId
-- **settings**: singleton row — rpcUrl, clobHttpUrl, usdcContractAddress, binance credentials (encrypted)
+- **settings**: singleton row — rpcUrl, clobHttpUrl, usdcContractAddress, binance credentials (encrypted), admin_password_hash, key_check
+- **auth_sessions** / **api_tokens**: UI sessions and agent/readonly tokens (SHA-256 of the secret only)
 - **scripts**: id, name, sourceCode, compiledCode, configSchema (JSON)
 - **bot_trades**: historical trade records per bot
 - **bot_storage**: key-value store for bot state persistence
 - Migrations run automatically in `packages/core/src/db/index.ts`
 
-### Web Client Patterns (`web/client/src/`)
-- React 19 + React Router + TanStack React Query + Tailwind CSS
-- Hooks in `hooks/` wrap IPC calls via `electronApi` with React Query (auto-refetch, caching)
-- No HTTP API calls — all communication is via Electron IPC (`window.electronAPI.*`)
+### Web Client Patterns (`apps/web/src/`)
+- React 19 + React Router (hash routes) + TanStack React Query + Tailwind CSS
+- Hooks in `hooks/` wrap `lib/api.ts` calls with React Query; real-time events via `events.onBotEvent/onBotLog/...` (one shared EventSource on `/api/events`)
+- Vite dev server proxies `/api` and `/healthz` to the server (`BOTLAB_PORT`, default 3780)
 
 ## Key Gotchas
 
@@ -141,12 +153,15 @@ web/client/src/            # React renderer
 - **Binance credentials**: Encrypted in settings table, decrypted only in `BotManager.getSettings()`. Only `hasBinanceCredentials: boolean` is ever sent to renderer
 - **Script templates**: Registered in `packages/core/src/db/seed.ts`, source lives in `templates/`
 - **Actors**: services take branded actors from `packages/core/src/services/actors.ts` (`asHuman`/`asAgent`/`asSystem`). Only a transport creates them, from the authenticated principal, never from request data; human-only actions (clear halt, config write/restore, adopt positions, market ambiguity, forced category rights) refuse anything but a minted `HumanActor`
-- **Core is transport-free**: nothing under `packages/core` may import `electron` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not IPC handlers
-- **Data dir**: `createCore({ dataDir })` — Electron passes `app.getPath('userData')`, tests a temp dir; without one the DB defaults to `BOTLAB_DATA_DIR` or `./data`
+- **Core is transport-free**: nothing under `packages/core` may import `hono`, `electron` or `apps/*` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not HTTP handlers
+- **Data dir**: `BOTLAB_DATA_DIR`, else `./data` in dev and the OS app-data dir with `--production` / `NODE_ENV=production` (`apps/server/src/paths.ts`); config dir likewise (`resolveConfigDir`). One server per data dir (`server.lock`)
+- **Worker threads under tsx**: a `.ts` worker entry cannot load through tsx directly; `startWorker()` (`runtime/workerPath.ts`) wraps it in an eval'd shim that registers `tsx/cjs/api` first. Compiled `.js` entries start directly
+- **Shutdown**: an unclean stop (crash, kill, second Ctrl+C after 2 s) ⇒ next start is globally halted (spec §4.3); clear via `POST /api/risk/clear-halt` (human, recent password check)
 
 ## Environment Variables
 
-- `ENCRYPTION_KEY` — AES key for wallet/credential encryption (`openssl rand -hex 32`)
-- `RPC_URL` — Polygon RPC endpoint
-- `CLOB_HTTP_URL` — Polymarket CLOB API (default: https://clob.polymarket.com)
-- `VITE_DEV_SERVER_URL` — Set automatically by `electron:dev` to `http://localhost:3000`
+- `BOTLAB_DATA_DIR`, `BOTLAB_CONFIG_DIR`, `BOTLAB_LOG_DIR` — directories (see above)
+- `BOTLAB_MASTER_KEY` (64 hex) or `BOTLAB_MASTER_KEY_FILE` — master key for secrets at rest
+- `BOTLAB_HOST` (default 127.0.0.1), `BOTLAB_PORT` (3780), `BOTLAB_ALLOWED_HOSTS` — HTTP server (also `http:` in server.yaml)
+- `TELEGRAM_BOT_TOKEN` — overrides server.yaml
+- `SKIP_NETWORK_TESTS=1` — skip tests that call live APIs

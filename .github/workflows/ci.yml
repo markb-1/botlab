@@ -14,8 +14,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [22]
     env:
-      # Electron's postinstall binary download is not needed for lint/typecheck/tests
-      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
       # Skip tests that call live exchange APIs
       SKIP_NETWORK_TESTS: '1'
     steps:
@@ -26,6 +24,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - name: Typecheck (core + electron)
+      - name: Typecheck (core + server + web)
         run: npm run typecheck
       - run: npm test
+      - name: Build (server + web)
+        run: npm run build
+
+  docker:
+    name: Docker image (amd64 + arm64)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

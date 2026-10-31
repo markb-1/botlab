@@ -1,88 +1,181 @@
 # BotLab
 
-Desktop trading bot platform for **Polymarket** prediction markets and **Binance** spot crypto. Write TypeScript bot scripts, run them in paper or live mode, and manage everything from a single app.
+Self-hosted trading lab for **Polymarket** prediction markets (and **Binance** spot). Bots are TypeScript
+scripts that run in sandboxed worker threads; every order goes through a server-side **risk engine**
+with human-set hard limits. One Node server holds the database, the bots and the risk controls; you use
+it from a browser.
 
-Built with Electron, React, and SQLite.
-
----
-
-## Features
-
-- **Script-based bots** — Write trading logic in TypeScript with a full SDK (`ctx.buy()`, `ctx.binance.getPrice()`, `ctx.fetch()`, etc.)
-- **Paper & live trading** — Test strategies with simulated balances before risking real funds
-- **Polymarket integration** — Trade prediction markets via the CLOB API (order books, positions, market data)
-- **Binance integration** — Spot trading on Binance (BTCUSDT, ETHUSDT, and any USDT-quoted pair)
-- **Built-in templates** — Copy Trading, Odds Threshold, Trader Discovery, Binance Spot, and a blank starter
-- **Script editor** — Edit bot scripts in-app with a full API reference
-- **Wallet management** — Import Ethereum wallets with encrypted private key storage
-- **Persistent state** — Bots can save/load state across restarts via key-value storage
-- **Password protection** — App locks behind a password on launch; all secrets encrypted at rest
+Runs natively on **macOS, Windows and Linux** (Node 22), or in **Docker** on a home server.
 
 ---
 
-## Getting Started
+## Quick start
 
-### Prerequisites
+You need **Node.js 22** (LTS, 22.12 or newer) and git. No Docker, Tailscale, Telegram or exchange
+credentials are needed to start: a fresh install runs **paper bots only**.
 
-- **Node.js** 18+
-- **npm** 9+
-- A Polymarket-compatible **Ethereum wallet** (with proxy address for trading)
-- *(Optional)* Binance API credentials for spot trading
-
-### Install
+### macOS / Linux
 
 ```bash
-git clone <repo-url>
-cd polymarket-bot-app
+git clone <repo-url> botlab && cd botlab
 npm install
-npm run electron:rebuild   # Rebuild native modules (better-sqlite3) for Electron
+npm run dev          # server on :3780 (auto-restart) + UI with hot reload on http://localhost:3000
 ```
 
-### Run in Development
+### Windows (PowerShell)
+
+```powershell
+git clone <repo-url> botlab; cd botlab
+npm install
+npm run dev          # then open http://localhost:3000
+```
+
+Open the UI and choose an **admin password** (first-run setup). In dev, data lives in `./data` and the
+config files in `./config` (created with defaults on first start).
+
+**Production mode** (built server serving the built UI, data in the OS app-data dir):
 
 ```bash
-npm run electron:dev
+npm run build
+npm run cli -- gen-key --prod   # once: creates the master key (see "Master key" below)
+npm start                       # http://127.0.0.1:3780
 ```
 
-This compiles the Electron main process, starts the Vite dev server with hot reload, and launches the app.
+| | data dir (`BOTLAB_DATA_DIR`) | config dir (`BOTLAB_CONFIG_DIR`) |
+|---|---|---|
+| `npm run dev` | `./data` | `./config` |
+| `npm start` on macOS | `~/Library/Application Support/BotLab` | `…/BotLab/config` |
+| `npm start` on Windows | `%APPDATA%\BotLab` | `%APPDATA%\BotLab\config` |
+| `npm start` on Linux | `~/.local/share/botlab` | `~/.local/share/botlab/config` |
+| Docker | `/data` (volume `./data`) | `/config` (volume `./config`) |
 
-### Build for Distribution
+The data dir holds `botlab.db`, `backups/` (nightly, 14 kept), `logs/`, `config-history/` and, unless
+you set the variables below, `master.key`.
+
+### Docker (home server)
 
 ```bash
-npm run electron:build
+git clone <repo-url> botlab && cd botlab
+mkdir -p data config secrets
+openssl rand -hex 32 > secrets/master.key        # back this file up!
+sudo chown -R 1000:1000 data config secrets/master.key && chmod 600 secrets/master.key   # container user `node`
+docker compose up -d --build
 ```
 
-Outputs packaged apps to `release/` — DMG/ZIP on macOS, NSIS/portable on Windows, AppImage/deb on Linux.
+The port is published on `127.0.0.1:3780` only. For remote access use **Tailscale** (never port
+forwarding): either install Tailscale on the host and run `tailscale serve --bg 3780`, or use the
+commented Tailscale sidecar in `docker-compose.yml`. `*.ts.net` host names are accepted by default;
+other names go in `BOTLAB_ALLOWED_HOSTS` or `http.allowed_hosts` in `config/server.yaml`.
+The image builds for `linux/amd64` and `linux/arm64` (`docker buildx build --platform linux/amd64,linux/arm64 .`).
+`TZ=Europe/Dublin` is set for schedules and the daily digest; stored timestamps are UTC.
 
 ---
 
-## How It Works
+## First run, paper mode and going live
 
-### App Structure
+1. Open the UI, set the admin password.
+2. Create a bot from a template — new bots are **paper** bots (simulated balance, real market data).
+3. Live trading is **off** until you enable it explicitly: add a wallet (Wallets page), set
+   `live_trading.enabled: true` in `limits.yaml`, and create the bot in **Live** mode. Until then live
+   bots are refused at start and any live order is rejected (`live_disabled`).
+4. All hard limits (exposure, loss limits, order sizes, ramp) are in `config/limits.yaml` and
+   `config/mandate.yaml`; edits are picked up without a restart.
 
-When you launch BotLab, you'll see these pages:
-
-| Page | What it does |
-|------|-------------|
-| **Dashboard** | Overview of all bots — count, status, last heartbeat |
-| **Bots** | Create, start, stop, and monitor bot instances |
-| **Scripts** | Browse templates, write custom scripts, import/export |
-| **Wallets** | Add Ethereum wallets (private keys are AES-encrypted) |
-| **Settings** | Configure RPC endpoint, CLOB URL, and Binance API credentials |
-
-### Creating a Bot
-
-1. Go to **Scripts** and pick a template (or write your own)
-2. Go to **Bots** → **Create Bot**
-3. Choose the script, fill in the config form, pick a wallet, and select **Paper** or **Live** mode
-4. Start the bot — it runs in a background worker thread
-
-### Paper vs Live Mode
-
-- **Paper mode**: Bot uses a virtual USDT balance (default $10,000). Trades execute against real order book data but no real money moves. Great for testing.
-- **Live mode**: Bot executes real trades on Polymarket or Binance using your wallet and API credentials.
+After an unclean stop (crash, power cut, Windows Update reboot, a second Ctrl+C) the server starts with a
+**global halt**; open orders are cancelled. Clear it after checking: `POST /api/risk/clear-halt` (a
+Risk page with a button comes in 3c; until then e.g. from the browser console while logged in:
+`fetch('/api/risk/clear-halt', {method:'POST', headers:{'X-BotLab':'1','Content-Type':'application/json'}, body: JSON.stringify({scope:'global', reason:'checked'})})`).
 
 ---
+
+## Master key
+
+Wallet private keys and Binance credentials are encrypted (AES-256-GCM) with a 32-byte **master key**,
+loaded at boot from, in order:
+
+1. `BOTLAB_MASTER_KEY` — 64 hex characters (`openssl rand -hex 32`);
+2. `BOTLAB_MASTER_KEY_FILE` — path to a file containing them;
+3. `<data dir>/master.key`.
+
+With none of these, `npm run dev` generates `<data dir>/master.key` (and warns); `npm start` refuses to
+start — create one with `npm run cli -- gen-key --prod`. **Back the key up** (password manager): without
+it the encrypted secrets are lost. The admin password only protects the UI; it does not encrypt anything.
+
+### Upgrading from the Electron app
+
+The Electron app derived the encryption key from your unlock password. `npm start` uses the same data
+dir as the Electron app on macOS and Windows, so it finds your database; the server then stays
+**locked** (the login screen says why) until you migrate once:
+
+```bash
+# stop the server first
+npm run migrate-key -- --prod --password "<your old BotLab password>"
+#   (omit --password to be asked; a "skipped password" install needs none; use --data-dir for another location)
+npm start
+```
+
+This re-encrypts every secret with the master key (creating `master.key` if none is configured) and makes
+your old password the admin login password (if it has 8+ characters; otherwise you choose one in the UI).
+If you edited `config/*.yaml` in the repo while using Electron in dev, copy them into the production config
+dir (table above); otherwise defaults are created there.
+
+---
+
+## Windows home server (service)
+
+```powershell
+winget install NSSM.NSSM            # service manager (once)
+npm run build
+npm run service:install             # in an elevated PowerShell (Run as Administrator)
+```
+
+This registers the **BotLab** Windows service (delayed auto-start at boot, no login needed; restart on
+crash; graceful stop via Ctrl+C so the clean-shutdown marker is written; logs in
+`%APPDATA%\BotLab\logs\service.log`). It pins the data/config dirs and the master key file to your
+user's `%APPDATA%\BotLab` (the service runs as LocalSystem). `npm run service:uninstall` removes it.
+After `git pull`: `npm install`, `npm run build`, `nssm restart BotLab`.
+
+Power and updates (spec §15.1): set **Sleep: Never** (Settings → System → Power), keep the PC on a UPS
+if you can, and set Windows Update **active hours**. An update reboot is handled like a power cut:
+resting orders expire on their own (GTD), BotLab restarts **halted**, and you clear the halt after checking.
+Install Tailscale for Windows for remote access. Load is negligible next to gaming.
+
+On macOS and Linux, `npm run service:install` prints a launchd / systemd unit with your paths.
+
+---
+
+## Configuration
+
+| variable | default | |
+|---|---|---|
+| `BOTLAB_DATA_DIR` | see table above | database, backups, logs, master.key |
+| `BOTLAB_CONFIG_DIR` | see table above | limits / mandate / fees / server / categories `.yaml` |
+| `BOTLAB_MASTER_KEY` / `BOTLAB_MASTER_KEY_FILE` | — | master key (above) |
+| `BOTLAB_HOST` | `127.0.0.1` | bind address (`http.host` in server.yaml). Never a public interface; a warning is logged for `0.0.0.0` |
+| `BOTLAB_PORT` | `3780` | `http.port` in server.yaml |
+| `BOTLAB_ALLOWED_HOSTS` | — | extra UI host names, comma-separated (IPs, `localhost`, `*.ts.net` always allowed) |
+| `BOTLAB_LOG_DIR` | `<data dir>/logs` | daily log files |
+| `TELEGRAM_BOT_TOKEN` | — | overrides `notify.telegram.bot_token` in server.yaml |
+| `TZ` | system | e.g. `Europe/Dublin` |
+
+A `.env` file in the working directory is read at start.
+
+## Access, API and tokens
+
+- **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days
+  max). Human-only actions (clear a halt, config writes/restores, position adoption, market ambiguity,
+  forcing category rights, creating API tokens) also need the password entered within the last
+  15 minutes; the UI asks for it when needed.
+- **HTTP API**: `/api/*`, JSON `{ success, data?, error?, code? }`; mutations need the `X-BotLab: 1`
+  header when using the cookie. Events: `GET /api/events` (server-sent events: `bot:event`, `bot:log`,
+  `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`). Health: `GET /healthz`
+  (no auth; 503 when the DB fails, the server is locked, the reconciler is stale > 3 min or a bot
+  worker crashed).
+- **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (for the MCP agent in Phase 4: read,
+  scripts, backtests, bot create/start/stop, forecasts, kill switch — never wallets, credentials,
+  settings, config writes or halt clearing) or `readonly` (GET only).
+  `npm run cli -- token create --scope agent --name mcp` · `token list` · `token revoke <id>`.
+- Forgot the admin password: `npm run cli -- set-password` (add `--prod` for the `npm start` data dir).
 
 ## Writing Bot Scripts
 
@@ -195,79 +288,39 @@ You can **fork** any template to create your own version, or **import/export** s
 
 ---
 
-## Settings
+## Security notes
 
-### Polymarket
-
-- **RPC URL** — Polygon RPC endpoint (for on-chain transactions)
-- **CLOB URL** — Polymarket CLOB API endpoint (default: `https://clob.polymarket.com`)
-- **USDC Contract** — Polygon USDC contract address
-
-### Binance
-
-- **API Key** / **API Secret** — Binance API credentials for spot trading
-- Credentials are AES-encrypted and stored locally — never sent to any external service
-- Use the **Test Connection** button to verify your credentials
-- Paper trading works without Binance credentials (uses simulated balances with real market data)
-
----
-
-## Security
-
-- **Password protection** — The app requires a password on first launch. All wallet private keys and API credentials are encrypted with a key derived from this password.
-- **Encrypted storage** — Private keys and Binance secrets are AES-encrypted in the local SQLite database. They are decrypted only in the main process and never exposed to the renderer.
-- **Worker isolation** — Bot scripts run in sandboxed worker threads. They communicate with the main process via an RPC message channel — no direct access to the filesystem, database, or private keys.
+- Bind to `127.0.0.1` (default) or the Tailscale interface; never expose BotLab to the internet.
+- Binance API key: trading only, **withdrawals disabled**, IP allowlist. Polymarket: a dedicated wallet
+  funded only with risk capital.
+- Bot scripts run in sandboxed worker threads (no filesystem, no environment, bounded heap); they reach
+  trading APIs only through the RPC layer, and every order passes the risk engine.
+- Secrets are decrypted only inside the server process; the UI only ever sees `hasBinanceCredentials`.
 
 ---
 
 ## Development
 
-### Commands
-
 ```bash
-npm run electron:dev       # Dev mode with hot reload
-npm run electron:compile   # Compile TypeScript only
-npm run electron:preview   # Run without Vite dev server
-npm run electron:build     # Package for distribution
-npm test                   # Run all tests
-npm run test:electron      # Electron-layer tests only
-npm run lint               # ESLint
-npm run format             # Prettier
+npm run dev            # server (tsx watch) + Vite UI with /api proxy
+npm run build          # tsc → dist/ (server + core), vite → apps/web/dist
+npm start              # built server serving the built UI (production paths)
+npm run typecheck      # core + server + web
+npm test               # vitest (SKIP_NETWORK_TESTS=1 skips live-API tests)
+npm run lint           # ESLint (0 errors expected)
+npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke
 ```
 
-### Project Structure
-
 ```
-packages/core/src/         # All domain logic, no transport code
-  core.ts                  # createCore(): composition root and lifecycle
-  services/                # Bot, wallet, script, settings, backtest, risk, config, reconcile services
-  db/                      # SQLite database, migrations, repositories
-  bots/                    # BotManager, BaseBotRunner, WalletManager
-  runtime/                 # Bot execution engine (ScriptRunner, RpcHandler, PaperTradingState)
-  orders/ risk/ ledger/    # Order choke point, risk engine, forecast ledger
-  exchange/                # Polymarket and Binance clients
-  sdk/                     # Script API types and guide
-
-templates/                 # Built-in bot script templates
-
-electron/                  # Electron shell over core
-  main.ts                  # App entry, window creation, IPC setup
-  preload.ts               # Context bridge (IPC → renderer)
-  ipc/handlers/            # Thin IPC handlers calling core services
-
-web/client/                # React renderer (Vite)
-  src/pages/               # UI pages (Dashboard, Bots, Scripts, Wallets, Settings)
-  src/hooks/               # React Query hooks wrapping IPC calls
-  src/lib/electronApi.ts   # IPC call wrappers
+packages/core/src/      all domain logic, no transport code (createCore, services, db, risk, orders,
+                        runtime, ledger, reconcile, recorder, exchange, security, ops/backup)
+apps/server/src/        Hono HTTP API, auth, SSE, /healthz, static UI, CLI, entrypoint
+apps/web/               React UI (Vite), fetch + EventSource client in src/lib/api.ts
+templates/              built-in bot templates
+config/*.example.yaml   config defaults (real files are created on first start)
+scripts/service.mjs     Windows service (NSSM) / launchd / systemd helper
+docs/SPEC.md, docs/PROGRESS.md
 ```
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `ENCRYPTION_KEY` | AES key for wallet encryption (`openssl rand -hex 32`) |
-| `RPC_URL` | Polygon RPC endpoint |
-| `CLOB_HTTP_URL` | Polymarket CLOB API URL |
 
 ---
 

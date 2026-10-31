@@ -1,0 +1,53 @@
+# BotLab on the home server (spec §15, §15.1).
+#
+#   1. mkdir -p data config secrets && openssl rand -hex 32 > secrets/master.key   (back this file up!)
+#   2. docker compose up -d --build
+#   3. open http://127.0.0.1:3780 on the server (or via Tailscale, below) and set the admin password
+#
+# The port is published on 127.0.0.1 only: BotLab must never be reachable from the internet. For
+# remote access use Tailscale (host install + `tailscale serve`, or the sidecar below).
+services:
+  botlab:
+    build: .
+    image: botlab:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Europe/Dublin
+      BOTLAB_MASTER_KEY_FILE: /run/secrets/botlab_master_key
+      # Extra host names for the UI (IPs, localhost and *.ts.net always work)
+      # BOTLAB_ALLOWED_HOSTS: botlab.lan
+      # TELEGRAM_BOT_TOKEN: ...                    # or notify.telegram in config/server.yaml
+    secrets:
+      - botlab_master_key
+    volumes:
+      - ./data:/data          # database, nightly backups (data/backups, 14 kept), logs, shutdown marker
+      - ./config:/config      # limits.yaml, mandate.yaml, fees.yaml, server.yaml, categories.yaml
+    ports:
+      - "127.0.0.1:3780:3780"
+    # Graceful shutdown: bots stop, clean-shutdown marker written (otherwise the next start is halted)
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # ── Optional: Tailscale sidecar (UI on https://botlab.<tailnet>.ts.net, nothing on the LAN/router) ──
+  # Uncomment, set TS_AUTHKEY (https://login.tailscale.com/admin/settings/keys), remove `ports:` above,
+  # and add `network_mode: service:tailscale` to the botlab service.
+  # tailscale:
+  #   image: tailscale/tailscale:stable
+  #   hostname: botlab
+  #   restart: unless-stopped
+  #   environment:
+  #     TS_AUTHKEY: tskey-auth-...
+  #     TS_STATE_DIR: /var/lib/tailscale
+  #     TS_SERVE_CONFIG: /config/serve.json   # serve.json: proxy https :443 → http://127.0.0.1:3780
+  #   volumes:
+  #     - ./tailscale/state:/var/lib/tailscale
+  #     - ./tailscale/config:/config
+  #   cap_add: [net_admin, sys_module]
+  #   devices: [/dev/net/tun:/dev/net/tun]
+
+secrets:
+  botlab_master_key:
+    file: ./secrets/master.key
