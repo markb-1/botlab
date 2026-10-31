@@ -52,7 +52,17 @@ function market(over: Record<string, unknown> = {}) {
 function fakeCtx(opts: { config?: Record<string, unknown>; market?: any; book?: any; positions?: any[]; open?: any[]; forecast?: any; flags?: any[]; budget?: any } = {}) {
   const store = new Map<string, unknown>();
   let now = NOW;
-  const state = { market: opts.market ?? market(), book: opts.book ?? book(0.4, 0.6), open: opts.open ?? [], forecast: opts.forecast ?? null, flags: opts.flags ?? [] };
+  const state = {
+    market: opts.market ?? market(),
+    book: opts.book ?? book(0.4, 0.6),
+    open: opts.open ?? [],
+    forecast: opts.forecast ?? null,
+    flags: opts.flags ?? [],
+    history: [] as any[],
+    positions: opts.positions ?? [],
+    // The Position Manager's exit policy as the server publishes it
+    policy: { exitBeforeEndMinutes: 180, ambiguityExitScore: 2, source: 'position-manager' },
+  };
   const placeLimit = vi.fn(async () => ({ ok: true, orderId: 'new', status: 'open', filledSize: 0 }));
   const cancel = vi.fn(async () => undefined);
   const ctx: any = {
@@ -68,15 +78,16 @@ function fakeCtx(opts: { config?: Record<string, unknown>; market?: any; book?: 
       delete: vi.fn(),
     },
     getOrderBook: vi.fn(async () => state.book),
-    getPositions: vi.fn(async () => opts.positions ?? []),
+    getPositions: vi.fn(async () => state.positions),
     sell: vi.fn(),
-    risk: { getBudget: vi.fn(async () => opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }), getExitFlags: vi.fn(async () => state.flags) },
+    risk: { getBudget: vi.fn(async () => opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }), getExitFlags: vi.fn(async () => state.flags), getExitPolicy: vi.fn(async () => state.policy) },
     ledger: { getForecast: vi.fn(async (t: string) => (state.forecast && state.forecast.tokenId === t ? state.forecast : null)) },
     requestRetire: vi.fn(),
     polymarket: {
       getMarket: vi.fn(async () => state.market),
       getFee: vi.fn(async () => FEE),
       getOpenOrders: vi.fn(async () => state.open),
+      getOrderHistory: vi.fn(async () => state.history),
       placeLimit,
       cancel,
     },
@@ -139,6 +150,19 @@ describe('resolution-rule bids', () => {
     expect(full.placeLimit).not.toHaveBeenCalled();
   });
 
+  it('re-reads the holdings after cancelling a stale bid, before sizing the new one', async () => {
+    // A stale bid at 0.38 (competing bid now 0.40 ⇒ plan 0.41); it fills $8.2 while being cancelled
+    const s = fakeCtx({ open: [openBid(0.38, 50)] });
+    s.cancel.mockImplementation(async () => {
+      s.state.positions = [{ tokenId: 'yes', size: 20, avgPrice: 0.41, currentValue: 8 }];
+      return undefined;
+    });
+    const r = await runResolutionCycle(s.ctx);
+    // $20 − $8.20 held = $11.80 ⇒ 28.78 shares, not the 48.78 planned before the cancel
+    expect(r).toMatchObject({ action: 'bid', price: 0.41, size: 28.78 });
+    expect(s.placeLimit).toHaveBeenCalledWith('yes', 'buy', 0.41, 28.78, expect.anything());
+  });
+
   it('no bids while the market is unassessed (the risk engine would refuse them) or during a halt', async () => {
     const u = fakeCtx({ market: market({ ambiguityScore: null }) });
     expect((await runResolutionCycle(u.ctx)).action).toBe('waiting');
@@ -158,7 +182,19 @@ describe('resolution-rule invalidation', () => {
     ['dispute', (s) => (s.state.market = market({ disputed: true }))],
     ['ambiguity above max', (s) => (s.state.market = market({ ambiguityScore: 2 }))],
     ['forecast withdrawn', (s) => (s.state.forecast = null), { forecast_id: 'f1' }],
-    ['forecast below target', (s) => (s.state.forecast = { id: 'f2', tokenId: 'no', probability: 0.6 }), { forecast_id: 'f1' }],
+    ['forecast below target', (s) => (s.state.forecast = { id: 'f1', tokenId: 'no', probability: 0.6 }), { forecast_id: 'f1' }],
+    ['linked forecast superseded', (s) => (s.state.forecast = { id: 'f2', tokenId: 'yes', probability: 0.8 }), { forecast_id: 'f1' }],
+    ['ambiguity at the Position Manager exit score (own max 3)', (s) => (s.state.market = market({ ambiguityScore: 2 })), { max_ambiguity: 3 }],
+    [
+      'ambiguity 1 in the 120–180 min window (manager window 180)',
+      (s) => (s.state.market = market({ ambiguityScore: 1, endDate: new Date(NOW + 10 * MIN + 150 * MIN).toISOString() })),
+      { max_ambiguity: 1, invalidate_before_end_minutes: 120 },
+    ],
+    [
+      'a Position Manager sell in the history',
+      (s) => s.state.history.push({ orderId: 'pm', tokenId: 'yes', side: 'sell', placedBy: 'pm-bot', filledSize: 5, createdAt: new Date(NOW).toISOString() }),
+    ],
+    ['a resting Position Manager sell', (s) => s.state.open.push({ ...openBid(0.5, 20), orderId: 'pm', side: 'sell', placedBy: 'pm-bot' })],
     ['exit flag', (s) => (s.state.flags = [{ id: 'x', tokenId: 'yes', marketId: '0xm1', reason: 'agent: thesis broken', createdBy: 'agent', createdAt: '' }])],
     ['near the end', (s) => (s.state.market = market({ endDate: new Date(NOW + 60 * MIN).toISOString() }))],
   ];
@@ -205,7 +241,7 @@ describe('resolution-rule invalidation', () => {
   it('typechecks against the SDK and never calls a sell API', () => {
     const src = fs.readFileSync(path.join(__dirname, '../../templates/resolution-rule.ts'), 'utf8');
     expect(typecheckScript(src).diagnostics).toEqual([]);
-    expect(src).not.toMatch(/ctx\.sell\(|'sell'/);
+    expect(src).not.toMatch(/ctx\.sell\(|placeLimit\([^)]*'sell'/);
     expect(src).toMatch(/role: 'resolution-rule'/);
   });
 });

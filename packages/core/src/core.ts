@@ -54,7 +54,7 @@ import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/Market
 import { BotActivityLog } from './bots/BotActivityLog';
 import { FeeService } from './orders/FeeService';
 import type { FeeRates } from './orders/feeModel';
-import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
+import { MarketCacheService, MARKET_RULES_CHANGED_EVENT, type MarketView } from './ledger/MarketCacheService';
 import { LedgerService } from './ledger/LedgerService';
 import { defaultCategories } from './config/categoriesSchema';
 import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from './risk/HaltService';
@@ -70,7 +70,7 @@ import type { ClockSkewGuard } from './orders/OrderService';
 import { Reconciler } from './reconcile/Reconciler';
 import { fetchDataApiPositions, fetchDataApiTrades } from './reconcile/dataApi';
 import { Recorder } from './recorder/Recorder';
-import { BotService } from './services/BotService';
+import { BotService, type StrategyMarketInfo } from './services/BotService';
 import { WalletService } from './services/WalletService';
 import { ScriptService } from './services/ScriptService';
 import { SettingsService } from './services/SettingsService';
@@ -182,6 +182,11 @@ export interface Core {
 }
 
 const QTY_EPSILON = 1e-9;
+
+/** The market facts BotService checks for agent strategy bots (5b) */
+function strategyMarketInfo(m: MarketView | null): StrategyMarketInfo | null {
+  return m ? { marketId: m.marketId, eventId: m.eventId, negRisk: m.negRisk, endDate: m.endDate, question: m.question, tokens: m.tokens } : null;
+}
 
 export function createCore(options: CoreOptions): Core {
   const dataDir = path.resolve(options.dataDir);
@@ -481,7 +486,13 @@ export function createCore(options: CoreOptions): Core {
         const m = marketCache.getCachedByToken(tokenId);
         return m ? { marketId: m.marketId, question: m.question, outcome: m.tokens.find((t) => t.tokenId === tokenId)?.outcome ?? null } : null;
       },
-      lookupTokenMarket: async (tokenId) => (await marketCache.getMarketByToken(tokenId))?.marketId ?? null,
+      lookupTokenMarketInfo: async (tokenId) => strategyMarketInfo(await marketCache.getMarketByToken(tokenId)),
+      cachedTokenMarketInfo: (tokenId) => strategyMarketInfo(marketCache.getCachedByToken(tokenId)),
+      eventMarketIds: { fetch: (eventId) => marketCache.getEventMarketIds(eventId), cached: (eventId) => marketCache.getEventMarketIdsCached(eventId) },
+      getForecast: (id) => {
+        const f = forecastRepo.findById(id);
+        return f ? { tokenId: f.token_id, status: f.status } : null;
+      },
       getMandate: () => configService.getConfig()?.mandate ?? null,
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),

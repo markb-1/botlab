@@ -311,6 +311,50 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 0.42 } })).json.config).toMatchObject({ target_entry_price: 0.42 });
   });
 
+  it('5b review: exclusive_sum legs must share an event; exhaustive needs the whole negRisk event; forecast_id must be the token\'s', async () => {
+    const orig = globalThis.fetch;
+    // tokens 555 / 666: negRisk markets of different events; 777 / 888: two of the three markets of event ev-3
+    const extra: Record<string, { conditionId: string; ev: string }> = {
+      '555': { conditionId: '0xd1', ev: 'ev-a' },
+      '666': { conditionId: '0xd2', ev: 'ev-b' },
+      '777': { conditionId: '0xd3', ev: 'ev-3' },
+      '888': { conditionId: '0xd4', ev: 'ev-3' },
+    };
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const hit = Object.entries(extra).find(([tok, x]) => url.includes('/markets?') && (url.includes(tok) || url.includes(x.conditionId)));
+      const gm = (tok: string, x: { conditionId: string; ev: string }) =>
+        gammaMarket({ conditionId: x.conditionId, clobTokenIds: JSON.stringify([tok, `${tok}-no`]), negRisk: true, events: [{ id: x.ev, title: x.ev }] });
+      if (hit) return new Response(JSON.stringify([gm(hit[0], hit[1])]), { status: 200 });
+      if (url.includes('/events/ev-3')) {
+        return new Response(JSON.stringify({ id: 'ev-3', title: 'ev-3', markets: [gm('777', extra['777']), gm('888', extra['888']), gammaMarket({ conditionId: '0xd5', clobTokenIds: '["999","999-no"]' })] }), {
+          status: 200,
+        });
+      }
+      return orig(input, init);
+    });
+    const cons = core.services.scripts.templates().find((t) => t.name === 'Consistency')!;
+    const diff = await call('create_bot', { templateId: cons.id, name: 'x1', config: { constraint: 'exclusive_sum', tokens: ['555', '666'], exhaustive: true }, marketIds: ['0xd1', '0xd2'] });
+    expect(diff.text).toMatch(/same event/);
+    const notAll = await call('create_bot', { templateId: cons.id, name: 'x2', config: { constraint: 'exclusive_sum', tokens: ['777', '888'], exhaustive: true }, marketIds: ['0xd3', '0xd4'] });
+    expect(notAll.text).toMatch(/event has 3 markets but the config has 2 legs/);
+    // Not exhaustive: one event is enough
+    expect((await call('create_bot', { templateId: cons.id, name: 'x3', config: { constraint: 'exclusive_sum', tokens: ['777', '888'] }, marketIds: ['0xd3', '0xd4'] })).isError).toBe(false);
+
+    // forecast_id: must exist, be active and be on the token or its complement
+    const rr = core.services.scripts.templates().find((t) => t.name === 'Resolution Rule')!;
+    const base = { token_id: YES, target_entry_price: 0.4, max_size_usd: 10, thesis: 'BLS first print only.' };
+    expect((await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, forecast_id: 'nope' }, marketIds: [MARKET_ID] })).text).toMatch(/forecast nope not found/);
+    const fc = await call('submit_forecast', { tokenId: YES, probability: 0.62, rationale: 'Base effects.', sources: ['https://www.bls.gov/cpi'], ambiguityScore: 1 });
+    expect(fc.isError).toBe(false);
+    await call('get_market', { marketId: '0xcafe02' });
+    expect(
+      (await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, token_id: '333', forecast_id: fc.json.id }, marketIds: ['0xcafe02'] })).text
+    ).toMatch(/is on token 111111, not 333 or its complement/);
+    const ok = await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, forecast_id: fc.json.id }, marketIds: [MARKET_ID] });
+    expect(ok.isError).toBe(false);
+  });
+
   it('assess_market can set or raise a score, never lower it, never override a human', async () => {
     const first = await call('assess_market', { marketId: MARKET_ID, score: 1, rationale: 'single source (BLS)' });
     expect(first.json).toMatchObject({ changed: true, market: { assessedAmbiguity: 1, ambiguitySource: 'agent' } });

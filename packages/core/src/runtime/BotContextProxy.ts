@@ -35,6 +35,7 @@ import type {
   FeeRates,
   MarketDetail,
   BotExitFlag,
+  ExitPolicy,
   RiskBudget,
   RpcRequest,
   RpcResponse,
@@ -282,11 +283,13 @@ export function createBotContext(params: {
       getOrderHistory: (days?: number) => rpcCall('polymarket:getOrderHistory', days) as Promise<OrderHistoryEntry[]>,
       getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
       getMarket: (idOrTokenId: string) => rpcCall('polymarket:getMarket', idOrTokenId) as Promise<MarketDetail | null>,
+      getEventMarketIds: (eventId: string) => rpcCall('polymarket:getEventMarketIds', eventId) as Promise<string[] | null>,
     } as PolymarketContext,
 
     risk: {
       getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
       getExitFlags: () => rpcCall('risk:getExitFlags') as Promise<BotExitFlag[]>,
+      getExitPolicy: () => rpcCall('risk:getExitPolicy') as Promise<ExitPolicy>,
     } as RiskContext,
 
     // Retire this bot (server-side, audited as the bot); the worker is stopped shortly after

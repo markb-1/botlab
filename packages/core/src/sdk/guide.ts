@@ -116,26 +116,35 @@ YES at a and NO at b costs a + b and pays exactly 1, so the NO token is the shor
   - \`date_ladder\`, tokens ordered by deadline, **earliest first** — e.g. "X by March 31", "X by June 30", "X by
     Dec 31": prices must not fall with a later deadline; any inverted pair (earlier above later) is bought as
     later YES + earlier NO. Ordering is checked against the markets' end dates.
-  - \`exclusive_sum\`, tokens = mutually exclusive outcomes (e.g. the candidates of one race, each its own binary
-    market), \`max_sum\` (1 = at most one wins): if the YES prices sum above \`max_sum\` it buys **NO on every leg**,
+  - \`exclusive_sum\`, tokens = mutually exclusive outcomes **of one event** (e.g. the candidates of one race, each
+    its own binary market; all negRisk when any is), \`max_sum\` (1 = at most one wins): if the YES prices sum above \`max_sum\` it buys **NO on every leg**,
     which pays ≥ n − max_sum; it trades only when Σ NO asks + fees ≤ (n − max_sum) − min_gap. If the YES prices sum
     **below** 1 it does nothing unless you set \`exhaustive: true\` (exactly one outcome must win: no "Other", no
     void, no tie — read the rules; most multi-outcome events are not safely exhaustive); then it buys YES on every
-    leg (pays exactly 1).
+    leg (pays exactly 1). The server and the bot refuse \`exhaustive\` unless the legs are **every** market of one
+    negRisk event (an "Other" market outside \`tokens\` breaks it; \`get_market\` on a leg loads the event list).
+  A date ladder needs every market's end date. The payoff floor holds only if the constraint really holds at
+  resolution: a mis-declared relationship, rules that differ between the markets or a 50-50 / void resolution can
+  make a basket lose.
   Execution: one basket at a time; legs rest post-only one tick inside the ask; a basket is sized so that the legs
   that could fill without their hedge cost ≤ \`max_unhedged_usd\`. If some legs fill and others do not within
   \`hedge_timeout_minutes\`, the missing legs are bought marketable up to their ask at opening + \`max_slippage\`
   (only while the hedged basket still pays at least its cost); otherwise the basket is unhedged, no new baskets
-  open, and the bot sells its own unhedged excess (\`flatten_unhedged\`). The bot page shows the constraint and
-  the current gap.
+  open, and the bot sells its own unhedged excess (\`flatten_unhedged\`). It opens no basket into the Position
+  Manager's triggers (an exit flag, ambiguity ≥ 2 or unassessed, a dispute, a recent rules change, ambiguity ≥ 1
+  inside the manager's \`exit_before_end_minutes\`); once the manager sells one of its tokens it stops for good and
+  asks to be retired. Imbalances under 5 shares are tracked; above \`max_residual_usd\` (2) no new basket opens.
+  The bot page shows the constraint and the current gap.
 - **Resolution Rule** — one market where the resolution rules favour an outcome the price does not reflect (a
   technicality, a resolution source, a date edge). Config: \`token_id\` (the outcome to buy, YES or NO token),
   \`target_entry_price\`, \`max_size_usd\`, \`thesis\` (≤ 2000 chars, shown on the bot page: quote the rule and say
   why it decides the outcome), optional \`forecast_id\`, \`invalidate_on_rules_change\` (true), \`max_ambiguity\`
   (1), \`invalidate_before_end_minutes\` (120). It rests post-only bids at most at the target (one tick over the
-  best other bid), holds to resolution and never sells. It stops buying for good when the rules change, a dispute
-  is recorded, ambiguity rises above \`max_ambiguity\`, the linked forecast is withdrawn or falls below the
-  target, or you flag the position (\`flag_position_exit\`, which also makes the Position Manager exit it). To
+  best other bid), holds to resolution and never sells. \`forecast_id\` must be an active forecast on the token or
+  its complement, and only that forecast keeps the bot valid (superseding it invalidates the bot). It stops buying
+  for good when the rules change, a dispute is recorded, ambiguity rises above \`max_ambiguity\` or reaches the
+  manager's exit score (2), ambiguity is ≥ 1 inside the manager's exit window before the end, the Position Manager
+  sells the token, the linked forecast is withdrawn / superseded or falls below the target, or you flag the position (\`flag_position_exit\`, which also makes the Position Manager exit it). To
   abandon a thesis: flag the position (exit) or \`retire_bot\` (keeps the position).
 
 - \`kill_switch(reason)\` halts everything (all bots stopped, open orders cancelled). Only a human can clear it —
@@ -208,7 +217,9 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
 - Events: \`ctx.events.on('forecast_changed' | 'rules_changed' | 'halt', handler)\` — pushed by the server as hints to
   re-check now; always re-read the current state (they are not replayed after a restart).
 - Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted; \`ctx.risk.getExitFlags()\` → open
-  exit flags on this bot's positions.
+  exit flags on this bot's positions; \`ctx.risk.getExitPolicy()\` → the Position Manager's exit window and ambiguity
+  exit score (from its config) — do not buy what it would sell at once. \`ctx.polymarket.getEventMarketIds(eventId)\`
+  lists every market of an event.
 - \`ctx.requestRetire(reason)\` retires this bot (terminal; the server stops it right after) — for per-opportunity
   bots whose opportunity is over.
 - Binance spot (USDT pairs only in paper): \`ctx.binance.buy(symbol, usdt)\`, \`sell(symbol, qty)\`, \`getPrice\`,

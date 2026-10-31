@@ -109,4 +109,17 @@ describe.skipIf(!sqliteAvailable)('BotManager standing roles', () => {
 
     await expect(manager.getExitOrderService('nope', true)).rejects.toThrow(/Bot not found/);
   });
+
+  it('publishes the Position Manager exit policy from its bots\' config (not a matching default), per mode (5b review)', () => {
+    // pm1 / pm2 are paper Position Manager bots without exit_before_end_minutes; the template schema has no default here
+    expect(manager.getExitPolicy(true)).toEqual({ exitBeforeEndMinutes: 180, ambiguityExitScore: 2, source: 'position-manager' });
+    t.db.prepare('UPDATE bots SET config = ? WHERE id = ?').run(JSON.stringify({ exit_before_end_minutes: 300 }), 'pm1');
+    expect(manager.getExitPolicy(true).exitBeforeEndMinutes).toBe(300);
+    // The template schema's default applies to a PM bot without its own value
+    t.db.prepare('UPDATE scripts SET config_schema = ? WHERE id = ?').run(JSON.stringify({ properties: { exit_before_end_minutes: { default: 400 } } }), pmScript);
+    expect(manager.getExitPolicy(true).exitBeforeEndMinutes).toBe(400);
+    // No PM bot at all: the template default
+    t.db.prepare("UPDATE bots SET stage = 'retired' WHERE id IN ('pm1', 'pm2')").run();
+    expect(manager.getExitPolicy(false)).toEqual({ exitBeforeEndMinutes: 400, ambiguityExitScore: 2, source: 'template-default' });
+  });
 });

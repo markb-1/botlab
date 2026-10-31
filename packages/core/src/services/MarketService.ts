@@ -244,9 +244,11 @@ export class MarketService {
       if (market.eventId && market.eventId !== market.marketId) {
         const ev = await fetchGammaEvent(this.extras.gammaUrl ?? GAMMA_API_URL, market.eventId, this.fetchFn);
         if (ev) {
-          related = ev.markets
-            .map((m) => parseGammaMarketFull(m))
-            .filter((m): m is NonNullable<typeof m> => !!m && m.marketId !== market.marketId)
+          const parsed = ev.markets.map((m) => parseGammaMarketFull(m)).filter((m): m is NonNullable<typeof m> => !!m);
+          // Event membership for the consistency checks (exclusive_sum / exhaustive, 5b)
+          if (parsed.length > 0) this.markets.recordEventMarkets(market.eventId, parsed.map((m) => m.marketId));
+          related = parsed
+            .filter((m) => m.marketId !== market.marketId)
             .map((m) => ({ marketId: m.marketId, question: m.question, endDate: m.endDate, closed: m.closed, outcomePrices: m.outcomePrices, cached: !!this.markets.getCached(m.marketId) }));
           relatedSource = 'gamma';
         }

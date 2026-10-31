@@ -73,6 +73,8 @@ interface Order {
   filledSize: number;
   status: string;
   postOnly: boolean;
+  placedBy?: string | null;
+  createdAt?: string;
 }
 
 /** A fake ctx with stateful storage and a tiny order store; tests fill orders by hand */
@@ -84,6 +86,10 @@ function fakeCtx(opts: { config: Record<string, unknown>; markets: Record<string
   const books = { ...opts.books };
   const markets = { ...opts.markets };
   const positions: Array<{ tokenId: string; size: number; avgPrice: number }> = [];
+  const flags: Array<Record<string, unknown>> = [];
+  // The Position Manager's exit policy as the server would publish it (window from its config, not the default)
+  const policy = { exitBeforeEndMinutes: 180, ambiguityExitScore: 2, source: 'position-manager' };
+  const eventMarkets: { ids: string[] | null } = { ids: null };
   const placeLimit = vi.fn(async (tokenId: string, side: 'buy' | 'sell', price: number, size: number, o: any = {}) => {
     const order: Order = { orderId: `o${++seq}`, tokenId, side, price, size, filledSize: 0, status: 'open', postOnly: o.postOnly !== false };
     orders.push(order);
@@ -107,17 +113,24 @@ function fakeCtx(opts: { config: Record<string, unknown>; markets: Record<string
     },
     getOrderBook: vi.fn(async (t: string) => books[t] ?? book(null, null)),
     getPositions: vi.fn(async () => positions.map((p) => ({ ...p, currentValue: 0 }))),
-    risk: { getBudget: vi.fn(async () => opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }), getExitFlags: vi.fn(async () => []) },
+    risk: {
+      getBudget: vi.fn(async () => opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }),
+      getExitFlags: vi.fn(async () => flags),
+      getExitPolicy: vi.fn(async () => policy),
+    },
     requestRetire: vi.fn(async () => ({ accepted: true })),
     polymarket: {
       getMarket: vi.fn(async (t: string) => markets[t] ?? null),
+      getEventMarketIds: vi.fn(async () => eventMarkets.ids),
       getFee: vi.fn(async () => opts.fee ?? ZERO_FEE),
       placeLimit,
       cancel,
       getOpenOrders: vi.fn(async () =>
-        orders.filter((o) => o.status === 'open').map((o) => ({ ...o, exchange: 'polymarket', marketId: '', orderType: 'limit', expiresAt: null, createdAt: '', forecastId: null, placedBy: null }))
+        orders
+          .filter((o) => o.status === 'open')
+          .map((o) => ({ exchange: 'polymarket', marketId: '', orderType: 'limit', expiresAt: null, createdAt: '', forecastId: null, placedBy: null, ...o }))
       ),
-      getOrderHistory: vi.fn(async () => orders.map((o) => ({ ...o, marketId: '', orderType: 'limit', reason: null, forecastId: null, placedBy: null, createdAt: '' }))),
+      getOrderHistory: vi.fn(async () => orders.map((o) => ({ marketId: '', orderType: 'limit', reason: null, forecastId: null, placedBy: null, createdAt: '', ...o }))),
     },
   };
   const fill = (orderId: string, size?: number) => {
@@ -128,7 +141,7 @@ function fakeCtx(opts: { config: Record<string, unknown>; markets: Record<string
     if (p) p.size += o.side === 'buy' ? o.filledSize : -o.filledSize;
     else positions.push({ tokenId: o.tokenId, size: o.filledSize, avgPrice: o.price });
   };
-  return { ctx, orders, placeLimit, cancel, books, markets, fill, advance: (ms: number) => (now += ms), positions, store };
+  return { ctx, orders, placeLimit, cancel, books, markets, fill, advance: (ms: number) => (now += ms), positions, store, flags, policy, eventMarkets };
 }
 
 /** implies y1 ⇒ y2: y1 YES bid 0.63 (its NO ask 0.37), y2 YES ask 0.55 ⇒ basket "buy y2 YES + y1 NO" costs 0.92 */
@@ -379,5 +392,138 @@ describe('consistency cycle and leg risk', () => {
     expect(typecheckScript(src).diagnostics).toEqual([]);
     expect(src).toMatch(/role: 'consistency'/);
     expect(src).toMatch(/trust: 'new'/);
+  });
+
+  it('opens no basket into the Position Manager’s triggers: exit flag, ambiguity ≥ its exit score, ambiguity 1 inside its exit window', async () => {
+    const flagged = impliesSetup();
+    flagged.flags.push({ id: 'f', tokenId: 'n1', marketId: '0xm1', reason: 'agent', createdBy: 'agent', createdAt: '' });
+    const r1 = await runConsistencyCycle(flagged.ctx);
+    expect(r1).toMatchObject({ action: 'none' });
+    expect(r1.detail).toMatch(/exit flag open on n1/);
+    expect(flagged.placeLimit).not.toHaveBeenCalled();
+
+    // Ambiguity 1, 200 min to the end: the manager's window is 240 here (its config, not the 180 default)
+    const window = impliesSetup();
+    window.policy.exitBeforeEndMinutes = 240;
+    window.markets.y2 = market(2, { ambiguityScore: 1, endDate: new Date(NOW + 200 * MIN).toISOString() });
+    const r2 = await runConsistencyCycle(window.ctx);
+    expect(r2.detail).toMatch(/within 240 min of the end/);
+    expect(window.placeLimit).not.toHaveBeenCalled();
+    // Outside the window it trades
+    window.policy.exitBeforeEndMinutes = 120;
+    expect((await runConsistencyCycle(window.ctx)).action).toBe('opened');
+
+    for (const over of [{ ambiguityScore: 2 }, { ambiguityScore: null }, { disputed: true }, { rulesChangedAt: new Date(NOW - DAY).toISOString() }]) {
+      const s = impliesSetup();
+      s.markets.y1 = market(1, over);
+      expect((await runConsistencyCycle(s.ctx)).action).toBe('none');
+      expect(s.placeLimit).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a leg that fills while it is being cancelled is re-read before the hedge is sized', async () => {
+    const s = impliesSetup({ config: { hedge_timeout_minutes: 15 } });
+    await runConsistencyCycle(s.ctx);
+    s.fill('o1');
+    // The cancel of the NO leg races a fill of 10 shares
+    s.cancel.mockImplementation(async (id: string) => {
+      const o = s.orders.find((x) => x.orderId === id)!;
+      if (id === 'o2' && o.status === 'open') {
+        o.filledSize = 10;
+        s.positions.push({ tokenId: 'n1', size: 10, avgPrice: 0.36 });
+      }
+      if (o.status === 'open') o.status = 'cancelled';
+    });
+    s.advance(16 * MIN);
+    expect((await runConsistencyCycle(s.ctx)).action).toBe('escalated');
+    expect(s.orders[2]).toMatchObject({ tokenId: 'n1', side: 'buy', size: 8.18, postOnly: false });
+
+    // Fully filled during the cancel: level, no escalation at all
+    const t = impliesSetup({ config: { hedge_timeout_minutes: 15 } });
+    await runConsistencyCycle(t.ctx);
+    t.fill('o1');
+    t.cancel.mockImplementation(async (id: string) => {
+      const o = t.orders.find((x) => x.orderId === id)!;
+      if (o.status === 'open') {
+        o.filledSize = o.size;
+        o.status = 'filled';
+      }
+    });
+    t.advance(16 * MIN);
+    expect((await runConsistencyCycle(t.ctx)).action).toBe('hedged');
+    expect(t.placeLimit).toHaveBeenCalledTimes(2);
+  });
+
+  it('a Position Manager sell on a basket token unhedges the basket (flattened like a failed hedge) and stops new baskets', async () => {
+    const s = impliesSetup();
+    await runConsistencyCycle(s.ctx);
+    s.fill('o1');
+    s.fill('o2');
+    // Before the next cycle the manager exits the NO leg as this bot (placedBy set)
+    s.orders.push({ orderId: 'pm1', tokenId: 'n1', side: 'sell', price: 0.3, size: 18.18, filledSize: 18.18, status: 'filled', postOnly: false, placedBy: 'pm-bot', createdAt: new Date(NOW + MIN).toISOString() });
+    s.advance(2 * MIN);
+    // Both legs had filled, but the NO leg is gone: the YES excess is flattened
+    const r = await runConsistencyCycle(s.ctx);
+    expect(r.action).toBe('flattened');
+    const own = s.orders.find((o) => o.side === 'sell' && !o.placedBy)!;
+    expect(own).toMatchObject({ tokenId: 'y2', size: 18.18 });
+    s.fill(own.orderId);
+    s.advance(2 * MIN);
+    expect((await runConsistencyCycle(s.ctx)).action).toBe('abandoned'); // flat: basket closed
+    // No new basket after a manager exit even though the gap is there: the bot asks to be retired instead
+    s.advance(20 * MIN);
+    expect((await runConsistencyCycle(s.ctx)).action).toBe('retire');
+    expect(s.orders.filter((o) => o.side === 'buy')).toHaveLength(2);
+  });
+
+  it('residual imbalances under 5 shares add up across baskets; above max_residual_usd no new basket opens', async () => {
+    const s = impliesSetup({ config: { hedge_timeout_minutes: 15, max_residual_usd: 2 } });
+    for (let i = 0; i < 2; i++) {
+      await runConsistencyCycle(s.ctx);
+      const [yes, no] = s.orders.slice(-2);
+      s.fill(yes.orderId);
+      s.fill(no.orderId, no.size - 4); // 4 shares of YES (0.54) left naked: $2.16 per basket
+      s.advance(16 * MIN);
+      expect((await runConsistencyCycle(s.ctx)).action).toBe('hedged');
+      if (i === 0) {
+        // $2.16 > $2 already, but the 8-share total (≥ 5) is not reached yet: blocked
+        const r = await runConsistencyCycle(s.ctx);
+        expect(r.detail).toMatch(/residual imbalance \$2\.16 > max_residual_usd 2/);
+        // Allow a second basket to build up the residual
+        s.ctx.config.max_residual_usd = 10;
+      }
+    }
+    // 8 residual shares ≥ the order minimum: flattened (own holdings) before anything else
+    s.ctx.config.max_residual_usd = 2;
+    const sellsBefore = s.orders.filter((o) => o.side === 'sell').length;
+    await runConsistencyCycle(s.ctx);
+    const sells = s.orders.filter((o) => o.side === 'sell');
+    expect(sells.length).toBe(sellsBefore + 1);
+    expect(sells[sells.length - 1]).toMatchObject({ tokenId: 'y2', size: 8 });
+  });
+
+  it('exclusivity checks: one event, negRisk for exhaustive with no market outside tokens; ladder end dates required', async () => {
+    const cfgX = consistencyConfig({ constraint: 'exclusive_sum', tokens: ['y1', 'y2'], exhaustive: true }).cfg;
+    const neg = (i: number, over: Record<string, unknown> = {}) => market(i, { negRisk: true, eventId: 'ev', ...over }) as any;
+    expect(checkLegs(cfgX, [neg(1), neg(2, { eventId: 'other' })], ['0xm1', '0xm2']).errors[0]).toMatch(/same event/);
+    expect(checkLegs(cfgX, [neg(1), neg(2)], ['0xm1', '0xm2', '0xm3']).errors[0]).toMatch(/event has 3 markets but 2 legs/);
+    expect(checkLegs(cfgX, [neg(1), neg(2)], null).errors[0]).toMatch(/market list is unknown/);
+    expect(checkLegs(cfgX, [market(1) as any, market(2) as any], ['0xm1', '0xm2']).errors[0]).toMatch(/negRisk event/);
+    expect(checkLegs(cfgX, [neg(1), neg(2)], ['0xm1', '0xm2']).errors).toEqual([]);
+    const cfgS = consistencyConfig({ constraint: 'exclusive_sum', tokens: ['y1', 'y2'] }).cfg;
+    expect(checkLegs(cfgS, [market(1) as any, market(2, { eventId: 'e2' }) as any]).errors[0]).toMatch(/same event/);
+    expect(checkLegs(cfgS, [neg(1), market(2, { eventId: 'ev' }) as any]).errors[0]).toMatch(/mixed negRisk/);
+    const cfgL = consistencyConfig({ constraint: 'date_ladder', tokens: ['y1', 'y2'] }).cfg;
+    expect(checkLegs(cfgL, [market(1) as any, market(2, { endDate: null }) as any]).errors[0]).toMatch(/no known end date/);
+
+    // At start: an exhaustive set whose event has another market refuses to start
+    const s = fakeCtx({
+      config: { constraint: 'exclusive_sum', tokens: ['y1', 'y2'], exhaustive: true },
+      markets: { y1: neg(1), y2: neg(2) },
+      books: {},
+    });
+    s.eventMarkets.ids = ['0xm1', '0xm2', '0xother'];
+    const mod = await import('../../templates/consistency');
+    await expect(mod.onStart(s.ctx)).rejects.toThrow(/event has 3 markets but 2 legs/);
   });
 });

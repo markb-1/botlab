@@ -11,10 +11,15 @@
  *                    voids break it — set it only when the market rules guarantee exactly one winner.
  *
  * Polymarket has no shorting: "selling" the overpriced leg means BUYING ITS COMPLEMENT (the market's NO token,
- * read from ctx.polymarket.getMarket). Every trade is a basket of buys whose payoff is guaranteed by the constraint:
- *   - implies A ⇒ B violated (A priced above B):   buy B YES + A NO — pays ≥ 1 in every outcome
+ * read from ctx.polymarket.getMarket). Every trade is a basket of buys whose payoff floor follows from the constraint
+ * — IF THE CONSTRAINT ACTUALLY HOLDS at resolution:
+ *   - implies A ⇒ B violated (A priced above B):   buy B YES + A NO — pays ≥ 1
  *   - exclusive_sum violated (Σ YES > max_sum):      buy NO on all n legs — pays ≥ n − max_sum
  *   - exhaustive sum < 1:                            buy YES on all legs — pays exactly 1
+ * The floor is not a guarantee: a wrongly declared constraint, rules that differ between the markets, or a 50-50 /
+ * void ("unknown") resolution of any leg pays a fraction and can turn the basket into a loss. Declare only constraints
+ * the resolution rules make certain. exclusive_sum legs must be markets of one event (all negRisk when any is);
+ * `exhaustive` needs a negRisk event whose markets are exactly the configured legs.
  * The gap is payoff − Σ(best ask + taker fee at the ask) per share of each leg (fees per R125, on every leg), i.e.
  * measured at executable prices as if every leg were taken. A basket trades only when gap ≥ `min_gap`.
  *
@@ -30,11 +35,19 @@
  *      the bot sells the excess of the filled legs it holds (its own holdings, marketable at best bid −
  *      `max_slippage`; the risk engine's hold time may delay it); otherwise it keeps retrying the hedge and the
  *      Position Manager handles any risk exit (rules change, ambiguity, flags). No risk exits from this bot.
+ * Before opening a basket it checks every leg against the Position Manager's risk triggers (ctx.risk.getExitPolicy):
+ * an open exit flag, ambiguity ≥ its exit score (2) or unassessed, a dispute, a rules change in the last 7 days, or
+ * ambiguity ≥ 1 inside its `exit_before_end_minutes` ⇒ no basket (the manager would sell a leg at once). A sell the
+ * Position Manager placed on any constraint token (`placedBy` in the bot's orders) stops new baskets for good and
+ * turns an open basket unhedged (handled as a failed hedge); the bot then asks to be retired once no basket is open.
+ * Leftover imbalances under the 5-share order minimum are tracked across baskets; above `max_residual_usd` of naked
+ * cost no new basket opens until they are flattened.
  * Retirement: the bot asks the server to retire it (ctx.requestRetire) when any market is closed (resolved) or the
  * gap stayed below `min_gap` for `idle_days` with no basket open. Every order passes the risk engine (markets must be
  * assessed for ambiguity, in the bot's market_ids, in allowed categories).
  * A config error (tokens not distinct, not YES tokens of binary markets, outside the bot's market_ids, ladder not
- * ordered by end date) is logged and the bot does not start.
+ * ordered by end date or with an unknown end date, exclusive_sum legs not one event) is logged and the bot does not
+ * start.
  */
 
 export const meta = {
@@ -123,6 +136,13 @@ export const meta = {
         description: 'Sell the unhedged excess this bot holds (else keep retrying the hedge; the Position Manager handles risk exits)',
         default: true,
       },
+      max_residual_usd: {
+        type: 'number',
+        title: 'Max residual imbalance (USD)',
+        description: 'Leftover unhedged legs below the 5-share minimum, summed across baskets: above this no new basket opens',
+        default: 2,
+        minimum: 0,
+      },
       idle_days: {
         type: 'number',
         title: 'Retire after idle (days)',
@@ -173,6 +193,7 @@ export interface ConsistencyConfig {
   hedgeTimeoutMinutes: number;
   maxSlippage: number;
   flattenUnhedged: boolean;
+  maxResidualUsd: number;
   idleDays: number;
   checkMinutes: number;
 }
@@ -215,27 +236,39 @@ export function consistencyConfig(raw: Record<string, any>): { cfg: ConsistencyC
     hedgeTimeoutMinutes: Math.max(num(raw.hedge_timeout_minutes, 15), 3),
     maxSlippage: Math.min(Math.max(num(raw.max_slippage, 0.02), 0), 0.1),
     flattenUnhedged: bool(raw.flatten_unhedged, true),
+    maxResidualUsd: Math.max(num(raw.max_residual_usd, 2), 0),
     idleDays: Math.max(num(raw.idle_days, 7), 1),
     checkMinutes: Math.max(num(raw.check_minutes, 2), 1),
   };
   return { cfg, errors };
 }
 
-/** One market of the constraint: its YES token (from the config) and NO token (its complement). */
+/** One market of the constraint: its YES token (from the config) and NO token (its complement), and its risk state. */
 export interface LegMarket {
   marketId: string;
+  eventId: string;
+  negRisk: boolean;
   yes: string;
   no: string;
   question: string;
   endDate: string | null;
   closed: boolean;
+  ambiguityScore: number | null;
+  disputed: boolean;
+  rulesChangedAt: string | null;
 }
 
 /**
  * Resolve the config's tokens to markets and check them: each must be the YES token of a binary market the bot is
- * scoped to, all in distinct markets; a date ladder must be ordered by end date (earliest first) where known.
+ * scoped to, all in distinct markets; a date ladder needs every end date, ordered (earliest first); exclusive_sum legs
+ * must be markets of one event (all negRisk when any is); `exhaustive` needs a negRisk event whose markets
+ * (`eventMarkets`, every market of the event) are exactly the legs — an "Other" or sibling outcome breaks it.
  */
-export function checkLegs(cfg: ConsistencyConfig, markets: Array<MarketDetail | null>): { legs: LegMarket[]; errors: string[] } {
+export function checkLegs(
+  cfg: ConsistencyConfig,
+  markets: Array<MarketDetail | null>,
+  eventMarkets: string[] | null = null
+): { legs: LegMarket[]; errors: string[] } {
   const errors: string[] = [];
   const legs: LegMarket[] = [];
   cfg.tokens.forEach((t, i) => {
@@ -244,17 +277,69 @@ export function checkLegs(cfg: ConsistencyConfig, markets: Array<MarketDetail | 
     if (m.tokens.length !== 2 || !m.complementTokenId) return errors.push(`token ${t}: not a binary market (${m.tokens.length} outcomes)`);
     if (!/^yes$/i.test(m.outcome ?? '')) return errors.push(`token ${t}: outcome "${m.outcome}" is not the YES token of "${m.question}"`);
     if (!m.inScope) return errors.push(`token ${t}: market ${m.marketId} is not in the bot's market_ids`);
-    legs.push({ marketId: m.marketId, yes: t, no: m.complementTokenId, question: m.question, endDate: m.endDate, closed: m.closed });
+    legs.push({
+      marketId: m.marketId,
+      eventId: m.eventId,
+      negRisk: m.negRisk,
+      yes: t,
+      no: m.complementTokenId,
+      question: m.question,
+      endDate: m.endDate,
+      closed: m.closed,
+      ambiguityScore: m.ambiguityScore,
+      disputed: m.disputed,
+      rulesChangedAt: m.rulesChangedAt,
+    });
   });
   if (new Set(legs.map((l) => l.marketId)).size !== legs.length) errors.push('every token must be in a different market');
-  if (cfg.constraint === 'date_ladder' && legs.length === cfg.tokens.length) {
+  if (legs.length !== cfg.tokens.length) return { legs, errors };
+  if (cfg.constraint === 'date_ladder') {
+    for (const l of legs) if (!l.endDate || !Number.isFinite(Date.parse(l.endDate))) errors.push(`date_ladder: "${l.question}" has no known end date (the order cannot be checked)`);
     for (let i = 1; i < legs.length; i++) {
       const a = legs[i - 1].endDate ? Date.parse(legs[i - 1].endDate as string) : NaN;
       const b = legs[i].endDate ? Date.parse(legs[i].endDate as string) : NaN;
       if (Number.isFinite(a) && Number.isFinite(b) && a > b) errors.push(`date_ladder tokens must be ordered by deadline: "${legs[i - 1].question}" ends after "${legs[i].question}"`);
     }
   }
+  if (cfg.constraint === 'exclusive_sum') {
+    if (new Set(legs.map((l) => l.eventId)).size !== 1) errors.push('exclusive_sum: every token must be a market of the same event (mutually exclusive outcomes)');
+    else if (legs.some((l) => l.negRisk) && !legs.every((l) => l.negRisk)) errors.push('exclusive_sum: mixed negRisk and plain markets in one event');
+    if (cfg.exhaustive) {
+      if (!legs.every((l) => l.negRisk)) errors.push('exhaustive: the legs must be the markets of one negRisk event');
+      else if (!eventMarkets) errors.push('exhaustive: the event\'s market list is unknown (cannot check that the legs cover every outcome)');
+      else {
+        const legSet = new Set(legs.map((l) => l.marketId));
+        const outside = eventMarkets.filter((id) => !legSet.has(id));
+        if (outside.length > 0 || eventMarkets.length !== legs.length) {
+          errors.push(`exhaustive: the event has ${eventMarkets.length} markets but ${legs.length} legs (an outcome outside tokens, e.g. "Other", would break exhaustiveness)`);
+        }
+      }
+    }
+  }
   return { legs, errors };
+}
+
+/**
+ * Why no basket may open now because the Position Manager would exit a leg at once (5b review), or null: an open
+ * exit flag on a constraint token, ambiguity unassessed or ≥ its exit score, a dispute, a rules change in the last
+ * 7 days (also when the risk engine refuses buys), or ambiguity ≥ 1 inside its exit window before the end.
+ */
+export function openBlocker(legs: LegMarket[], policy: ExitPolicy, flags: BotExitFlag[], now: number): string | null {
+  const tokens = new Set(legs.flatMap((l) => [l.yes, l.no]));
+  const flag = flags.find((f) => tokens.has(f.tokenId));
+  if (flag) return `exit flag open on ${flag.tokenId}`;
+  for (const l of legs) {
+    if (l.ambiguityScore === null) return `"${l.question}" is not assessed for ambiguity`;
+    if (l.ambiguityScore >= policy.ambiguityExitScore) return `"${l.question}" ambiguity ${l.ambiguityScore} ≥ ${policy.ambiguityExitScore}`;
+    if (l.disputed) return `"${l.question}" is disputed`;
+    const changed = l.rulesChangedAt ? Date.parse(l.rulesChangedAt) : NaN;
+    if (Number.isFinite(changed) && now - changed < 7 * DAY_MS) return `"${l.question}" rules changed ${l.rulesChangedAt}`;
+    const end = l.endDate ? Date.parse(l.endDate) : NaN;
+    if (l.ambiguityScore >= 1 && Number.isFinite(end) && (end - now) / MIN_MS <= policy.exitBeforeEndMinutes) {
+      return `"${l.question}" ambiguity ${l.ambiguityScore} within ${policy.exitBeforeEndMinutes} min of the end (Position Manager exit window)`;
+    }
+  }
+  return null;
 }
 
 /** A basket of buys whose payoff (per share of every leg) the constraint guarantees. */
@@ -420,10 +505,14 @@ export interface BotState {
   lastGap: number | null;
   lastLabel: string | null;
   lastEmit: { gap: number | null; phase: string; at: number } | null;
+  /** Set (for good) when the Position Manager sold a constraint token of this bot: no new baskets */
+  pmExit?: string | null;
+  /** Leftover imbalances under the order minimum, per token: shares and cost per share (naked exposure) */
+  residual?: Record<string, { shares: number; price: number }>;
 }
 
 export function freshState(now: number): BotState {
-  return { startedAt: now, lastActiveAt: now, basket: null, retryAfter: 0, baskets: 0, hedged: 0, lastGap: null, lastLabel: null, lastEmit: null };
+  return { startedAt: now, lastActiveAt: now, basket: null, retryAfter: 0, baskets: 0, hedged: 0, lastGap: null, lastLabel: null, lastEmit: null, pmExit: null, residual: {} };
 }
 
 /**
@@ -481,7 +570,16 @@ export async function loadLegs(ctx: BotContext, cfg: ConsistencyConfig): Promise
       markets.push(null);
     }
   }
-  return checkLegs(cfg, markets);
+  let eventMarkets: string[] | null = null;
+  const first = markets[0];
+  if (cfg.constraint === 'exclusive_sum' && cfg.exhaustive && first) {
+    try {
+      eventMarkets = await ctx.polymarket.getEventMarketIds(first.eventId);
+    } catch {
+      eventMarkets = null;
+    }
+  }
+  return checkLegs(cfg, markets, eventMarkets);
 }
 
 async function priceTokens(ctx: BotContext, tokens: string[]): Promise<Record<string, LegPrice>> {
@@ -497,18 +595,43 @@ async function priceTokens(ctx: BotContext, tokens: string[]): Promise<Record<st
   return out;
 }
 
-/** Sync the basket's fills from this bot's order history; returns the ids of its still-open orders. */
-async function syncBasket(ctx: BotContext, basket: BasketState): Promise<Set<string>> {
-  const open = await ctx.polymarket.getOpenOrders();
-  const history = await ctx.polymarket.getOrderHistory(30);
-  const openIds = new Set(open.filter((o) => !o.placedBy).map((o) => o.orderId));
+/** This bot's orders: open ones and the last 30 days of history (fills, Position Manager sells). */
+interface OrderView {
+  open: OpenOrder[];
+  history: OrderHistoryEntry[];
+}
+
+async function readOrders(ctx: BotContext): Promise<OrderView> {
+  return { open: await ctx.polymarket.getOpenOrders(), history: await ctx.polymarket.getOrderHistory(30) };
+}
+
+/** Sells the Position Manager placed on this bot's positions (`placedBy` set) in any of `tokens`. */
+export function pmSells(view: OrderView, tokens: Set<string>): Array<{ orderId: string; tokenId: string; filled: number; createdAt: number }> {
+  const out = new Map<string, { orderId: string; tokenId: string; filled: number; createdAt: number }>();
+  for (const o of [...view.history, ...view.open]) {
+    if (!o.placedBy || o.side !== 'sell' || !tokens.has(o.tokenId)) continue;
+    const prev = out.get(o.orderId);
+    const at = Date.parse(o.createdAt);
+    out.set(o.orderId, { orderId: o.orderId, tokenId: o.tokenId, filled: Math.max(prev?.filled ?? 0, o.filledSize), createdAt: Number.isFinite(at) ? at : 0 });
+  }
+  return [...out.values()];
+}
+
+/**
+ * Set each leg's net filled shares (bought − own flattening sells − Position Manager sells since the basket opened)
+ * and return the ids of the basket's still-open buy orders and whether the Position Manager sold one of its legs.
+ */
+export function applyFills(basket: BasketState, view: OrderView): { openIds: Set<string>; pmHit: boolean } {
+  const openIds = new Set(view.open.filter((o) => !o.placedBy).map((o) => o.orderId));
+  const filledOf = (id: string) => Math.max(view.history.find((x) => x.orderId === id)?.filledSize ?? 0, view.open.find((x) => x.orderId === id)?.filledSize ?? 0);
+  const pm = pmSells(view, new Set(basket.legs.map((l) => l.tokenId))).filter((x) => x.createdAt >= basket.openedAt - 1000);
   for (const leg of basket.legs) {
-    const filledOf = (id: string) => Math.max(history.find((x) => x.orderId === id)?.filledSize ?? 0, open.find((x) => x.orderId === id)?.filledSize ?? 0);
     const bought = leg.orderIds.reduce((n, id) => n + filledOf(id), 0);
     const sold = (leg.sellIds ?? []).reduce((n, id) => n + filledOf(id), 0);
-    leg.filled = round6(Math.max(bought - sold, 0));
+    const pmSold = pm.filter((x) => x.tokenId === leg.tokenId).reduce((n, x) => n + x.filled, 0);
+    leg.filled = round6(Math.max(bought - sold - pmSold, 0));
   }
-  return new Set(basket.legs.flatMap((l) => l.orderIds).filter((id) => openIds.has(id)));
+  return { openIds: new Set(basket.legs.flatMap((l) => l.orderIds).filter((id) => openIds.has(id))), pmHit: pm.length > 0 };
 }
 
 /** One cycle (exported for tests; the lifecycle below calls it). State is read from and saved to ctx.storage. */
@@ -549,15 +672,55 @@ export async function runConsistencyCycle(ctx: BotContext): Promise<CycleResult>
     return result('halted');
   }
 
+  // A sell the Position Manager placed on any constraint token: it is exiting on a risk trigger — stop for good
+  let view = await readOrders(ctx);
+  const constraintTokens = new Set(legs.flatMap((l) => [l.yes, l.no]));
+  const pmAny = pmSells(view, constraintTokens);
+  if (pmAny.length > 0 && !state.pmExit) {
+    state.pmExit = `position manager sold ${pmAny[0].tokenId}`;
+    ctx.log.warn(`consistency: ${state.pmExit}; no new baskets`);
+  }
+  state.residual = state.residual ?? {};
+
+  /** Record what is left unbalanced below the order minimum as naked residual, and close the basket */
+  const acceptDust = (bk: BasketState): number => {
+    const min = Math.min(...bk.legs.map((l) => l.filled));
+    let shares = 0;
+    for (const l of bk.legs) {
+      const excess = round6(l.filled - min);
+      if (excess <= EPS) continue;
+      const r = state.residual![l.tokenId] ?? { shares: 0, price: 0 };
+      const total = r.shares + excess;
+      state.residual![l.tokenId] = { shares: round6(total), price: round6((r.shares * r.price + excess * l.price) / total) };
+      shares += excess;
+    }
+    state.basket = null;
+    if (min > EPS) state.hedged++;
+    return round6(shares);
+  };
+
   const b = state.basket;
   if (b) {
     state.lastActiveAt = now;
-    const openIds = await syncBasket(ctx, b);
-    const maxF = Math.max(...b.legs.map((l) => l.filled));
-    const minF = Math.min(...b.legs.map((l) => l.filled));
+    let fills = applyFills(b, view);
+    let openIds = fills.openIds;
     const cancelOpen = async () => {
       for (const id of openIds) await cancelQuietly(ctx, id);
     };
+    const refresh = async () => {
+      view = await readOrders(ctx);
+      fills = applyFills(b, view);
+      openIds = fills.openIds;
+    };
+    // The Position Manager sold a leg of this basket: it is no longer hedged — handle it as a failed hedge
+    if (fills.pmHit && b.phase !== 'unhedged') {
+      await cancelOpen();
+      await refresh();
+      b.phase = 'unhedged';
+      ctx.log.warn(`consistency: position manager exit on ${b.label}; basket unhedged`);
+    }
+    let maxF = Math.max(...b.legs.map((l) => l.filled));
+    let minF = Math.min(...b.legs.map((l) => l.filled));
 
     // Every leg filled to the target, or every leg level after the timeout: hedged
     if (minF >= b.target - EPS || (b.phase !== 'resting' && maxF - minF < EPS && maxF > EPS)) {
@@ -593,19 +756,27 @@ export async function runConsistencyCycle(ctx: BotContext): Promise<CycleResult>
       state.basket = null;
       state.retryAfter = now + OPEN_RETRY_MS;
       await save();
-      return result('abandoned', `${b.label}: no leg filled within ${cfg.hedgeTimeoutMinutes} min`);
+      return result('abandoned', b.phase === 'resting' ? `${b.label}: no leg filled within ${cfg.hedgeTimeoutMinutes} min` : `${b.label}: nothing held any more`);
     }
     if (maxF - minF < MIN_SHARES) {
-      // Imbalance below the exchange minimum order size: cannot be traded either way, keep it as dust
+      // Imbalance below the exchange minimum order size: cannot be traded either way, keep it as tracked residual
       await cancelOpen();
-      state.basket = null;
-      state.hedged++;
+      const dust = acceptDust(b);
       await save();
-      return result('hedged', `${b.label}: ${minF} hedged, ${round6(maxF - minF)} shares of residual imbalance (below the minimum order)`);
+      return result('hedged', `${b.label}: ${minF} hedged, ${dust} shares of residual imbalance (below the minimum order)`);
     }
 
     if (b.phase === 'resting' || (b.phase === 'unhedged' && !cfg.flattenUnhedged)) {
       await cancelOpen();
+      // A leg may have filled while it was being cancelled: re-read the fills before sizing the hedge
+      await refresh();
+      maxF = Math.max(...b.legs.map((l) => l.filled));
+      minF = Math.min(...b.legs.map((l) => l.filled));
+      if (maxF - minF < MIN_SHARES) {
+        const dust = acceptDust(b);
+        await save();
+        return result('hedged', `${b.label}: legs level after the cancel (${minF} per leg${dust > 0 ? `, ${dust} shares residual` : ''})`);
+      }
       const limits = escalationLimits(b, prices, cfg);
       if (!limits) {
         b.phase = 'unhedged';
@@ -668,20 +839,53 @@ export async function runConsistencyCycle(ctx: BotContext): Promise<CycleResult>
       if (r.ok && r.orderId && r.filledSize < size) await cancelQuietly(ctx, r.orderId);
     }
     if (Math.max(...b.legs.map((l) => l.filled)) - minF < MIN_SHARES) {
-      state.basket = null;
-      if (minF > EPS) state.hedged++;
+      acceptDust(b);
       state.retryAfter = now + OPEN_RETRY_MS;
     }
     await save();
     return result('flattened', `${b.label}: sold ${sold} leg(s)`);
   }
 
-  // No basket open: look for a violation
+  // No basket open. After a Position Manager exit this bot is done: ask to be retired
+  if (state.pmExit) {
+    await save();
+    return result('retire', `${state.pmExit}: stopped opening baskets`);
+  }
+
+  // Residual imbalances: flatten what reaches the order minimum (own holdings), refuse new baskets above the cap
+  if (cfg.flattenUnhedged) {
+    let positions: Position[] | null = null;
+    for (const [tokenId, r] of Object.entries(state.residual)) {
+      if (r.shares < MIN_SHARES) continue;
+      positions = positions ?? (await ctx.getPositions());
+      const held = positions.find((p) => p.tokenId === tokenId)?.size ?? 0;
+      const size = Math.floor(Math.min(r.shares, held) * 100) / 100;
+      const top = prices[tokenId]?.top;
+      if (size < MIN_SHARES || !top || top.bestBid === null) continue;
+      const price = Math.max(floorTick(top.bestBid - cfg.maxSlippage, top.tick), MIN_PRICE);
+      const res = await ctx.polymarket.placeLimit(tokenId, 'sell', price, size, { postOnly: false, ttlMinutes: ESCALATE_TTL_MINUTES, reason: 'consistency: flatten residual imbalance' });
+      if (res.ok && res.filledSize > 0) r.shares = round6(Math.max(r.shares - res.filledSize, 0));
+      if (res.ok && res.orderId && res.filledSize < size) await cancelQuietly(ctx, res.orderId);
+    }
+    for (const [tokenId, r] of Object.entries(state.residual)) if (r.shares <= EPS) delete state.residual[tokenId];
+  }
+  const residualUsd = Object.values(state.residual).reduce((n, r) => n + r.shares * r.price, 0);
+
   if (best && best.gap !== null && best.gap + 1e-9 >= cfg.minGap) {
     state.lastActiveAt = now;
     if (now < state.retryAfter) {
       await save();
       return result('none', 'waiting after a failed basket');
+    }
+    if (residualUsd > cfg.maxResidualUsd + 1e-9) {
+      await save();
+      return result('none', `residual imbalance $${residualUsd.toFixed(2)} > max_residual_usd ${cfg.maxResidualUsd}: flatten it first`);
+    }
+    // Do not buy what the Position Manager would sell at once (its triggers, its exit window)
+    const blocker = openBlocker(legs, await ctx.risk.getExitPolicy(), await ctx.risk.getExitFlags(), now);
+    if (blocker) {
+      await save();
+      return result('none', `no basket: ${blocker}`);
     }
     const shares = basketSize(best, cfg, budget);
     if (shares <= 0) {

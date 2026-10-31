@@ -62,6 +62,10 @@ export interface ScriptBotRunnerDeps {
   exitFlags?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitFlags']>>;
   /** ctx.requestRetire */
   requestRetire?: RpcHandlerDeps['requestRetire'];
+  /** The Position Manager's exit thresholds; the runner passes its mode */
+  exitPolicy?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitPolicy']>>;
+  /** ctx.polymarket.getEventMarketIds */
+  eventMarketIds?: RpcHandlerDeps['eventMarketIds'];
 }
 
 export const DEFAULT_PAPER_BALANCE = 10_000;
@@ -111,6 +115,8 @@ export class ScriptBotRunner extends BaseBotRunner {
       marketScope: this.deps.marketScope,
       ...(this.deps.exitFlags ? { exitFlags: () => this.deps.exitFlags!(this.deps.mode === 'paper') } : {}),
       requestRetire: this.deps.requestRetire,
+      ...(this.deps.exitPolicy ? { exitPolicy: () => this.deps.exitPolicy!(this.deps.mode === 'paper') } : {}),
+      eventMarketIds: this.deps.eventMarketIds,
     };
 
     // Create paper trading state if in paper mode

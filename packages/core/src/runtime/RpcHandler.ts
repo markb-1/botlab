@@ -10,7 +10,7 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, MarketDetail } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail } from '../sdk/types';
 import type { MarketView } from '../ledger/MarketCacheService';
 import type { ForecastView } from '../ledger/LedgerService';
 import type { PaperTradingState } from './PaperTradingState';
@@ -107,8 +107,21 @@ export interface RpcHandlerDeps {
   marketScope?: () => string[] | null;
   /** Open exit flags on this bot's positions in its mode (ctx.risk.getExitFlags) */
   exitFlags?: () => BotExitFlag[];
+  /** The Position Manager's exit thresholds in this bot's mode (ctx.risk.getExitPolicy) */
+  exitPolicy?: () => ExitPolicy;
+  /** Every market of an event (ctx.polymarket.getEventMarketIds) */
+  eventMarketIds?: (eventId: string) => Promise<string[] | null>;
   /** Retire this bot (ctx.requestRetire): BotManager runs it after the reply, outside the RPC */
   requestRetire?: (reason: string) => void;
+}
+
+/** Ambiguity at or above which the Position Manager exits (its `ambiguity` trigger); the template reads it from here */
+export const POSITION_MANAGER_AMBIGUITY_EXIT = 2;
+/** Last-resort exit window when neither a Position Manager bot nor its template schema says (its template default) */
+export const POSITION_MANAGER_EXIT_WINDOW_FALLBACK = 180;
+
+export function defaultExitPolicy(): ExitPolicy {
+  return { exitBeforeEndMinutes: POSITION_MANAGER_EXIT_WINDOW_FALLBACK, ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT, source: 'template-default' };
 }
 
 /** A market cache row as a bot sees it (ctx.polymarket.getMarket). */
@@ -291,6 +304,15 @@ export class RpcHandler {
 
       case 'risk:getExitFlags':
         return this.deps.exitFlags ? this.deps.exitFlags() : [];
+
+      case 'risk:getExitPolicy':
+        return this.deps.exitPolicy ? this.deps.exitPolicy() : defaultExitPolicy();
+
+      case 'polymarket:getEventMarketIds': {
+        const eventId = args[0];
+        if (typeof eventId !== 'string' || !eventId.trim() || eventId.length > 100) throw new Error('getEventMarketIds: an event id is required');
+        return this.deps.eventMarketIds ? this.deps.eventMarketIds(eventId.trim()) : null;
+      }
 
       case 'polymarket:getMarket': {
         const id = args[0];

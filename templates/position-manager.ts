@@ -10,7 +10,9 @@
  *   - flag:         an open exit flag (agent / human flag_position_exit, R140); acknowledged when the
  *                   position is closed
  *   - rules:        the market's rules changed after the position was opened
- *   - ambiguity:    ambiguity ≥ 2 (after the server raise) or a UMA dispute
+ *   - ambiguity:    ambiguity ≥ 2 (after the server raise; the threshold comes from ctx.risk.getExitPolicy) or a
+ *                   UMA dispute. Its `exit_before_end_minutes` is published to other bots by the same call, so the
+ *                   consistency / resolution-rule bots do not buy what this bot would exit at once
  *   - end:          ambiguity ≥ 1 and less than `exit_before_end_minutes` to the market end
  *   Ledger positions (bought with a forecast) also:
  *   - withdrawn:    no active forecast prices the token any more (withdrawn, resolved, not replaced)
@@ -183,7 +185,9 @@ export function exitDecision(
   cfg: ManagerConfig,
   now: number,
   /** Best edge per day the executor could not fund (fresh), or null: low_edge needs a better use queued */
-  demandEdgePerDay: number | null = null
+  demandEdgePerDay: number | null = null,
+  /** Ambiguity at or above which a position is exited (server value, ctx.risk.getExitPolicy; shared with the strategy bots) */
+  ambiguityExitScore = 2
 ): ExitDecision | null {
   const m = p.market;
   const openedAt = p.openedAt ? Date.parse(p.openedAt) : NaN;
@@ -203,7 +207,7 @@ export function exitDecision(
   if (m?.rulesChangedAt && Number.isFinite(openedAt) && Date.parse(m.rulesChangedAt) > openedAt) {
     return risk('rules', `rules changed ${m.rulesChangedAt}`);
   }
-  if (m && ((m.ambiguityScore ?? 0) >= 2 || m.disputed)) {
+  if (m && ((m.ambiguityScore ?? 0) >= ambiguityExitScore || m.disputed)) {
     return risk('ambiguity', m.disputed ? 'UMA dispute' : `ambiguity ${m.ambiguityScore}`);
   }
   if (m && (m.ambiguityScore ?? 0) >= 1 && minutesToEnd !== null && minutesToEnd <= cfg.exitBeforeEndMinutes) {
@@ -259,6 +263,14 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
   const demandEdgePerDay =
     demand.bestUnmetEdgePerDay !== null && demand.at !== null && now - Date.parse(demand.at) <= DEMAND_MAX_AGE_MS ? demand.bestUnmetEdgePerDay : null;
 
+  // The ambiguity exit threshold is the server's (also read by the consistency / resolution-rule bots, 5b review)
+  let ambiguityExitScore = 2;
+  try {
+    if (ctx.risk && typeof ctx.risk.getExitPolicy === 'function') ambiguityExitScore = (await ctx.risk.getExitPolicy()).ambiguityExitScore;
+  } catch {
+    /* keep 2 */
+  }
+
   // Flags on positions that no longer exist were handled (position closed): acknowledge them
   const held = new Set(positions.filter((p) => p.size > 1e-9).map((p) => `${p.botId}|${p.tokenId}`));
   for (const f of await ctx.portfolio.getExitFlags()) {
@@ -281,7 +293,7 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
       ctx.log.warn(`position manager: no book for ${p.tokenId}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    const decision = exitDecision(p, top, cfg, now, demandEdgePerDay);
+    const decision = exitDecision(p, top, cfg, now, demandEdgePerDay, ambiguityExitScore);
     const key = stateKey(p);
 
     if (!decision) {

@@ -361,11 +361,27 @@ export interface BotServiceDeps {
   guardAgentRun?: (by: unknown, action: string) => void;
   /** Cached market question / outcome of a token (positions and orders views) */
   describeToken?: (tokenId: string) => { marketId: string; question: string; outcome: string | null } | null;
-  /** Condition id of a token, refreshing the market cache from Gamma when needed (agent strategy-bot creates) */
-  lookupTokenMarket?: (tokenId: string) => Promise<string | null>;
+  /** A token's market, refreshing the market cache from Gamma when needed (agent strategy-bot creates) */
+  lookupTokenMarketInfo?: (tokenId: string) => Promise<StrategyMarketInfo | null>;
+  /** A token's market from the cache only (agent strategy-bot config updates) */
+  cachedTokenMarketInfo?: (tokenId: string) => StrategyMarketInfo | null;
+  /** Every market of an event: `fetch` may call Gamma (creates), `cached` does not (updates) */
+  eventMarketIds?: { fetch: (eventId: string) => Promise<string[] | null>; cached: (eventId: string) => string[] | null };
+  /** A ledger forecast by id (resolution-rule `forecast_id`) */
+  getForecast?: (id: string) => { tokenId: string; status: string } | null;
   /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
   getMandate?: () => MandateConfig | null;
   now?: () => number;
+}
+
+/** What BotService needs to know about a strategy bot's market (from the market cache) */
+export interface StrategyMarketInfo {
+  marketId: string;
+  eventId: string;
+  negRisk: boolean;
+  endDate: string | null;
+  question: string;
+  tokens: Array<{ tokenId: string; outcome: string }>;
 }
 
 /** Mandate `strategies.allow` key of each builtin strategy role */
@@ -485,7 +501,8 @@ export class BotService {
     marketIds: string[] | null | undefined,
     action: string,
     target: string | null,
-    resolve: (tokenId: string) => string | null
+    resolve: (tokenId: string) => StrategyMarketInfo | null,
+    eventMarkets: (eventId: string) => string[] | null
   ): void {
     const role = builtinRoleOf(script);
     if (!isStrategyRole(role) || !script) return;
@@ -507,10 +524,48 @@ export class BotService {
     const tokens = strategyConfigTokens(role, config);
     if (tokens.length === 0) deny(`config names no token (${role === 'consistency' ? 'tokens' : 'token_id'})`);
     if (!marketIds || marketIds.length === 0) deny(`${role} bots need marketIds covering every token in the config`);
+    const infos: StrategyMarketInfo[] = [];
     for (const t of tokens) {
-      const market = resolve(t);
-      if (!market) deny(`token ${t} is unknown to the market cache (open it with get_market first)`);
-      if (!marketIds!.includes(market!)) deny(`token ${t} belongs to market ${market}, which is not in the bot's marketIds`);
+      const info = resolve(t);
+      if (!info) deny(`token ${t} is unknown to the market cache (open it with get_market first)`);
+      if (!marketIds!.includes(info!.marketId)) deny(`token ${t} belongs to market ${info!.marketId}, which is not in the bot's marketIds`);
+      infos.push(info!);
+    }
+    const c = config ?? {};
+    if (role === 'consistency') {
+      // The same structural rules the template checks at start (5b review): YES tokens of binary markets, ladder
+      // end dates known and ordered, exclusive sums inside one event, exhaustive sets covering the whole event
+      infos.forEach((m, i) => {
+        const own = m.tokens.find((x) => x.tokenId === tokens[i]);
+        if (m.tokens.length !== 2 || !own || !/^yes$/i.test(own.outcome)) deny(`token ${tokens[i]} is not the YES token of a binary market`);
+      });
+      if (new Set(infos.map((m) => m.marketId)).size !== infos.length) deny('every token must be in a different market');
+      if (c.constraint === 'date_ladder') {
+        for (const m of infos) if (!m.endDate || !Number.isFinite(Date.parse(m.endDate))) deny(`date_ladder: "${m.question}" has no known end date`);
+        for (let i = 1; i < infos.length; i++) {
+          if (Date.parse(infos[i - 1].endDate as string) > Date.parse(infos[i].endDate as string)) deny('date_ladder tokens must be ordered by deadline (earliest first)');
+        }
+      }
+      if (c.constraint === 'exclusive_sum') {
+        if (new Set(infos.map((m) => m.eventId)).size !== 1) deny('exclusive_sum: every token must be a market of the same event');
+        if (infos.some((m) => m.negRisk) && !infos.every((m) => m.negRisk)) deny('exclusive_sum: mixed negRisk and plain markets');
+        if (c.exhaustive === true) {
+          if (!infos.every((m) => m.negRisk)) deny('exhaustive: the legs must be the markets of one negRisk event');
+          const all = eventMarkets(infos[0].eventId);
+          if (!all) deny('exhaustive: the event\'s market list is unknown (get_market on a leg loads it)');
+          const legSet = new Set(infos.map((m) => m.marketId));
+          if (all!.length !== infos.length || all!.some((id) => !legSet.has(id))) {
+            deny(`exhaustive: the event has ${all!.length} markets but the config has ${infos.length} legs (every outcome must be a leg)`);
+          }
+        }
+      }
+    }
+    if (role === 'resolution-rule' && typeof c.forecast_id === 'string' && c.forecast_id.trim()) {
+      const f = this.deps.getForecast?.(c.forecast_id.trim()) ?? null;
+      if (!f) deny(`forecast ${c.forecast_id} not found`);
+      if (f!.status !== 'active') deny(`forecast ${c.forecast_id} is ${f!.status}, not active`);
+      const own = infos[0];
+      if (!own.tokens.some((x) => x.tokenId === f!.tokenId)) deny(`forecast ${c.forecast_id} is on token ${f!.tokenId}, not ${tokens[0]} or its complement`);
     }
   }
 
@@ -543,18 +598,27 @@ export class BotService {
       this.checkAgentCreate(data);
       const script = scriptRepo.findById(data.scriptId);
       const role = builtinRoleOf(script);
-      const markets = new Map<string, string | null>();
+      const markets = new Map<string, StrategyMarketInfo | null>();
+      const events = new Map<string, string[] | null>();
       if (isStrategyRole(role)) {
-        // Resolve the config's tokens first (may refresh the market cache from Gamma), then check synchronously
+        // Resolve the config's tokens (and an exhaustive set's event) first — may refresh from Gamma — then check
         for (const t of strategyConfigTokens(role, data.config).slice(0, 20)) {
           try {
-            markets.set(t, this.deps.lookupTokenMarket ? await this.deps.lookupTokenMarket(t) : (this.deps.describeToken?.(t)?.marketId ?? null));
+            markets.set(t, this.deps.lookupTokenMarketInfo ? await this.deps.lookupTokenMarketInfo(t) : (this.deps.cachedTokenMarketInfo?.(t) ?? null));
           } catch {
             markets.set(t, null);
           }
         }
+        const firstEvent = [...markets.values()].find((m) => m)?.eventId;
+        if (firstEvent && data.config?.exhaustive === true && this.deps.eventMarketIds) {
+          try {
+            events.set(firstEvent, await this.deps.eventMarketIds.fetch(firstEvent));
+          } catch {
+            events.set(firstEvent, null);
+          }
+        }
       }
-      this.checkAgentStrategyBot(script, data.config, data.marketIds, 'bot.create', null, (t) => markets.get(t) ?? null);
+      this.checkAgentStrategyBot(script, data.config, data.marketIds, 'bot.create', null, (t) => markets.get(t) ?? null, (e) => events.get(e) ?? null);
     }
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
@@ -624,7 +688,15 @@ export class BotService {
       this.requireAgentOwned(before, 'bot.update');
       // A strategy bot's new config must still match its template and stay within its market_ids (cached markets)
       if (data.config !== undefined) {
-        this.checkAgentStrategyBot(scriptRepo.findById(before.script_id), data.config, parseMarketIds(before.market_ids), 'bot.update', id, (t) => this.deps.describeToken?.(t)?.marketId ?? null);
+        this.checkAgentStrategyBot(
+          scriptRepo.findById(before.script_id),
+          data.config,
+          parseMarketIds(before.market_ids),
+          'bot.update',
+          id,
+          (t) => this.deps.cachedTokenMarketInfo?.(t) ?? null,
+          (e) => this.deps.eventMarketIds?.cached(e) ?? null
+        );
       }
     }
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {

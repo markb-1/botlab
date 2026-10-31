@@ -46,6 +46,8 @@ import type { OrderEventSink } from '../notify/events';
 import type { ConfigService } from '../config/ConfigService';
 import { getBalance } from '../exchange/polymarket/trading';
 import type { MarketView } from '../ledger/MarketCacheService';
+import type { ExitPolicy } from '../sdk/types';
+import { POSITION_MANAGER_AMBIGUITY_EXIT, POSITION_MANAGER_EXIT_WINDOW_FALLBACK } from '../runtime/RpcHandler';
 
 /** Emitted (with { botId, reason }) when a script calls ctx.requestRetire; the core retires the bot (5b) */
 export const BOT_RETIRE_REQUEST_EVENT = 'bot:retire-request';
@@ -360,6 +362,50 @@ export class BotManager extends EventEmitter {
       });
     }
     return this.portfolio;
+  }
+
+  /**
+   * The Position Manager's exit thresholds for bots in this mode (ctx.risk.getExitPolicy, 5b review): the largest
+   * `exit_before_end_minutes` among non-retired Position Manager bots of the mode (any mode if none), else the
+   * template's configSchema default; the ambiguity threshold is the one the template reads from here too.
+   */
+  getExitPolicy(simulated: boolean): ExitPolicy {
+    const pmBots: Array<{ config: string; paper: boolean }> = [];
+    let schemaDefault: number | null = null;
+    for (const b of this.botRepo.findAll()) {
+      if (b.stage === 'retired') continue;
+      const script = this.scriptRepo.findById(b.script_id);
+      if (builtinRoleOf(script) !== 'position-manager') continue;
+      pmBots.push({ config: b.config, paper: b.mode === 'paper' || b.stage === 'paper' });
+    }
+    const windowOf = (raw: string): number | null => {
+      try {
+        const v = (JSON.parse(raw || '{}') as Record<string, unknown>).exit_before_end_minutes;
+        const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+        return Number.isFinite(n) && n >= 0 ? n : null;
+      } catch {
+        return null;
+      }
+    };
+    const sameMode = pmBots.filter((b) => b.paper === simulated);
+    const windows = (sameMode.length ? sameMode : pmBots).map((b) => windowOf(b.config));
+    // A PM bot without its own value uses the template default
+    const pmScript = this.scriptRepo.findAll().find((s) => builtinRoleOf(s) === 'position-manager');
+    if (pmScript) {
+      try {
+        const d = (JSON.parse(pmScript.config_schema || '{}') as { properties?: Record<string, { default?: unknown }> }).properties?.exit_before_end_minutes?.default;
+        if (typeof d === 'number' && Number.isFinite(d)) schemaDefault = d;
+      } catch {
+        /* no default */
+      }
+    }
+    const base = schemaDefault ?? POSITION_MANAGER_EXIT_WINDOW_FALLBACK;
+    if (windows.length === 0) return { exitBeforeEndMinutes: base, ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT, source: 'template-default' };
+    return {
+      exitBeforeEndMinutes: Math.max(...windows.map((w) => w ?? base)),
+      ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT,
+      source: 'position-manager',
+    };
   }
 
   /** ctx.events (spec §5.2): push an event to every running script bot. Never throws. */
@@ -701,6 +747,8 @@ export class BotManager extends EventEmitter {
                 .map((f) => ({ id: f.id, tokenId: f.token_id, marketId: f.market_id, reason: f.reason, createdBy: f.created_by, createdAt: f.created_at })),
           }
         : {}),
+      exitPolicy: (simulated: boolean) => this.getExitPolicy(simulated),
+      ...(this.orderDeps?.marketCache ? { eventMarketIds: (eventId: string) => this.orderDeps!.marketCache!.getEventMarketIds(eventId) } : {}),
       // Retire runs after the RPC reply (it stops this very worker), via the core's BotService (audited as the bot)
       requestRetire: (reason: string) => {
         setImmediate(() => this.emit(BOT_RETIRE_REQUEST_EVENT, { botId, reason }));

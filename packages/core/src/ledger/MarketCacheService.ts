@@ -30,10 +30,13 @@ import { parseMarketFeeSchedule, parseStoredFeeSchedule, type MarketFeeSchedule 
 import { GAMMA_API_URL, type MarketInfo, type MarketQuality, type MarketQualityProvider } from '../orders/MarketDataService';
 import { autoRaiseReason, effectiveAmbiguity, rulesHash } from './ambiguity';
 import { categorize } from './categorize';
+import { fetchGammaEvent } from './polymarketPublic';
 import logger from '../utils/logger';
 
 export const MARKET_RULES_CHANGED_EVENT = 'market:rulesChanged';
 export const MARKET_CACHE_TTL_MS = 10 * 60_000;
+/** How long an event's market list is trusted (exclusive_sum / exhaustive checks) */
+export const EVENT_MARKETS_TTL_MS = 6 * 3_600_000;
 export const MARKET_REFRESH_INTERVAL_MS = 30 * 60_000;
 /** Order path: a row not refreshed for this long is too stale to buy on (ambiguity treated as unknown) */
 export const MARKET_STALE_FOR_BUYS_MS = 2 * 3_600_000;
@@ -321,6 +324,8 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
   private now: () => number;
   private ttlMs: number;
   private inflight = new Map<string, Promise<MarketView | null>>();
+  /** Condition ids of every market of an event (Gamma `/events/{id}`), in memory for EVENT_MARKETS_TTL_MS */
+  private eventMarkets = new Map<string, { at: number; ids: string[] }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private periodic: Promise<void> | null = null;
 
@@ -402,6 +407,35 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       return { category: view.category, ambiguityScore: null, rulesChangedAt: view.rulesChangedAt };
     }
     return { category: view.category, ambiguityScore: view.ambiguityScore, rulesChangedAt: view.rulesChangedAt };
+  }
+
+  // ── Event membership (5b: exclusive_sum / exhaustive checks) ──────
+
+  /** Remember an event's market list (MarketService.detail fetches the event for get_market). */
+  recordEventMarkets(eventId: string, marketIds: string[]): void {
+    this.eventMarkets.set(eventId, { at: this.now(), ids: [...new Set(marketIds)] });
+  }
+
+  /** The event's market list from memory if fetched within the TTL, else null (no network). */
+  getEventMarketIdsCached(eventId: string): string[] | null {
+    const e = this.eventMarkets.get(eventId);
+    return e && this.now() - e.at < EVENT_MARKETS_TTL_MS ? [...e.ids] : null;
+  }
+
+  /** Every market (condition id) of an event, open or closed, from Gamma (cached); null when Gamma has no answer. */
+  async getEventMarketIds(eventId: string): Promise<string[] | null> {
+    const cached = this.getEventMarketIdsCached(eventId);
+    if (cached) return cached;
+    try {
+      const ev = await fetchGammaEvent(this.baseUrl, eventId, this.fetchFn);
+      if (!ev) return null;
+      const ids = ev.markets.map((m) => parseGammaMarketFull(m)?.marketId).filter((x): x is string => !!x);
+      if (ids.length === 0) return null;
+      this.recordEventMarkets(eventId, ids);
+      return ids;
+    } catch {
+      return null;
+    }
   }
 
   // ── Live search (Markets page) ───────────────────────────────────

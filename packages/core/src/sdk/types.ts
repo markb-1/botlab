@@ -246,6 +246,11 @@ export interface PolymarketContext {
    * "selling" an outcome you do not hold means buying its complement).
    */
   getMarket(idOrTokenId: string): Promise<MarketDetail | null>;
+  /**
+   * Condition ids of every market of an event (open or closed), from Gamma, cached; null when unknown. Use it to
+   * check that a set of markets is the whole event (e.g. an exhaustive outcome set).
+   */
+  getEventMarketIds(eventId: string): Promise<string[] | null>;
 }
 
 /** A market as the server's market cache knows it (ctx.polymarket.getMarket). */
@@ -302,6 +307,21 @@ export interface RiskContext {
   getBudget(): Promise<RiskBudget>;
   /** Open exit flags on this bot's positions (same mode); the Position Manager acts on them, a bot may stop buying */
   getExitFlags(): Promise<BotExitFlag[]>;
+  /**
+   * When the Position Manager (in this bot's mode) exits positions on its risk triggers, read by the server from that
+   * bot's config: buying into a market it would exit at once is pointless.
+   */
+  getExitPolicy(): Promise<ExitPolicy>;
+}
+
+/** The Position Manager's risk-exit thresholds (ctx.risk.getExitPolicy). */
+export interface ExitPolicy {
+  /** Ambiguity ≥ 1 and less than this many minutes to the market end ⇒ exit (its `exit_before_end_minutes`) */
+  exitBeforeEndMinutes: number;
+  /** Ambiguity at or above this (after the server raise) ⇒ exit */
+  ambiguityExitScore: number;
+  /** 'position-manager': from a Position Manager bot's config; 'template-default': none exists, the template's default */
+  source: 'position-manager' | 'template-default';
 }
 
 /** A ledger forecast (probability of `tokenId` resolving YES), read-only for bots. */
@@ -768,8 +788,10 @@ export type RpcMethod =
   | 'polymarket:getFee'
   | 'polymarket:getOrderHistory'
   | 'polymarket:getMarket'
+  | 'polymarket:getEventMarketIds'
   | 'risk:getBudget'
   | 'risk:getExitFlags'
+  | 'risk:getExitPolicy'
   | 'bot:requestRetire'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'

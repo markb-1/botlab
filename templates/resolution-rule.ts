@@ -10,11 +10,14 @@
  * Invalidation (sticky: once invalid the bot never buys again) — any of:
  *   - the resolution rules changed since the bot first started (`invalidate_on_rules_change`, default true);
  *   - a UMA dispute is recorded;
- *   - the market's ambiguity (after the server raise) is above `max_ambiguity` (default 1);
- *   - a linked forecast (`forecast_id`) was withdrawn (no active forecast prices the token any more) or now values the
- *     token below `target_entry_price`;
+ *   - the market's ambiguity (after the server raise) is above `max_ambiguity` (default 1), or at / above the
+ *     Position Manager's exit score (ctx.risk.getExitPolicy, 2) whatever `max_ambiguity` says;
+ *   - a linked forecast (`forecast_id`) is no longer the active forecast on the token or its complement (withdrawn,
+ *     superseded, resolved) or values the token below `target_entry_price`;
  *   - an exit flag (agent / human flag_position_exit) is open on this bot's position in the token;
- *   - less than `invalidate_before_end_minutes` to the market end.
+ *   - the Position Manager placed a sell on the token (it is exiting the position);
+ *   - less than `invalidate_before_end_minutes` to the market end, or ambiguity ≥ 1 inside the Position Manager's
+ *     `exit_before_end_minutes` (published by the server: it would sell what this bot buys).
  * On invalidation the bot cancels its bids and stops buying. EXITS ARE THE POSITION MANAGER'S JOB: it already sells
  * on a rules change after the position opened, ambiguity ≥ 2 or a dispute, ambiguity ≥ 1 near the end, and exit
  * flags (risk exits placed as this bot). This bot asks to be retired (ctx.requestRetire) once it is invalid and holds
@@ -197,7 +200,7 @@ export function bidPrice(top: Top, target: number, fee: FeeRates): number | null
 }
 
 export interface Invalidation {
-  kind: 'rules' | 'dispute' | 'ambiguity' | 'forecast' | 'flag' | 'end';
+  kind: 'rules' | 'dispute' | 'ambiguity' | 'forecast' | 'flag' | 'end' | 'position_manager';
   reason: string;
 }
 
@@ -206,15 +209,22 @@ export interface Baseline {
   at: number;
 }
 
-/** The first invalidation that holds now, or null (pure). */
+/**
+ * The first invalidation that holds now, or null (pure). `policy` is the Position Manager's (ctx.risk.getExitPolicy):
+ * whatever this bot's own `max_ambiguity` says, it never buys what the manager would exit at once. `pmSold`: the
+ * manager has placed a sell on this bot's token.
+ */
 export function invalidation(
   cfg: ResolutionConfig,
   m: MarketDetail,
   baseline: Baseline,
   forecasts: { own: BotForecast | null; complement: BotForecast | null } | null,
   flags: BotExitFlag[],
-  now: number
+  now: number,
+  policy: ExitPolicy = { exitBeforeEndMinutes: 180, ambiguityExitScore: 2, source: 'template-default' },
+  pmSold = false
 ): Invalidation | null {
+  if (pmSold) return { kind: 'position_manager', reason: 'the Position Manager is exiting this position (a sell it placed on the token)' };
   if (cfg.invalidateOnRulesChange) {
     const changedAt = m.rulesChangedAt ? Date.parse(m.rulesChangedAt) : NaN;
     if ((baseline.rulesHash !== null && m.rulesHash !== null && m.rulesHash !== baseline.rulesHash) || (Number.isFinite(changedAt) && changedAt > baseline.at)) {
@@ -222,17 +232,27 @@ export function invalidation(
     }
   }
   if (m.disputed) return { kind: 'dispute', reason: 'UMA dispute recorded' };
+  if (m.ambiguityScore !== null && m.ambiguityScore >= policy.ambiguityExitScore) {
+    return { kind: 'ambiguity', reason: `ambiguity ${m.ambiguityScore} ≥ ${policy.ambiguityExitScore} (Position Manager exit)` };
+  }
   if (m.ambiguityScore !== null && m.ambiguityScore > cfg.maxAmbiguity) return { kind: 'ambiguity', reason: `ambiguity ${m.ambiguityScore} > max ${cfg.maxAmbiguity}` };
   if (cfg.forecastId && forecasts) {
-    const fair = forecasts.own ? forecasts.own.probability : forecasts.complement ? 1 - forecasts.complement.probability : null;
-    if (fair === null) return { kind: 'forecast', reason: `linked forecast ${cfg.forecastId} withdrawn (no active forecast on the token)` };
+    // Only the linked forecast keeps the bot valid: a superseding one (new id) is a different view
+    const own = forecasts.own && forecasts.own.id === cfg.forecastId ? forecasts.own : null;
+    const comp = forecasts.complement && forecasts.complement.id === cfg.forecastId ? forecasts.complement : null;
+    const fair = own ? own.probability : comp ? 1 - comp.probability : null;
+    if (fair === null) return { kind: 'forecast', reason: `linked forecast ${cfg.forecastId} is no longer the active forecast on the token (withdrawn, superseded or resolved)` };
     if (fair + 1e-9 < cfg.target) return { kind: 'forecast', reason: `forecast now values the token at ${fair.toFixed(3)} < target ${cfg.target}` };
   }
   const flag = flags.find((f) => f.tokenId === cfg.tokenId);
   if (flag) return { kind: 'flag', reason: `exit flag: ${flag.reason.slice(0, 200)}` };
   const end = m.endDate ? Date.parse(m.endDate) : NaN;
-  if (Number.isFinite(end) && (end - now) / MIN_MS <= cfg.invalidateBeforeEndMinutes) {
-    return { kind: 'end', reason: `${Math.max(Math.round((end - now) / MIN_MS), 0)} min to the market end` };
+  const minutesToEnd = Number.isFinite(end) ? (end - now) / MIN_MS : Infinity;
+  if (minutesToEnd <= cfg.invalidateBeforeEndMinutes) {
+    return { kind: 'end', reason: `${Math.max(Math.round(minutesToEnd), 0)} min to the market end` };
+  }
+  if (m.ambiguityScore !== null && m.ambiguityScore >= 1 && minutesToEnd <= policy.exitBeforeEndMinutes) {
+    return { kind: 'end', reason: `ambiguity ${m.ambiguityScore} and ${Math.max(Math.round(minutesToEnd), 0)} min to the end: inside the Position Manager's ${policy.exitBeforeEndMinutes}-min exit window` };
   }
   return null;
 }
@@ -255,7 +275,8 @@ export async function runResolutionCycle(ctx: BotContext): Promise<CycleResult> 
   const { cfg, errors } = resolutionConfig(ctx.config);
   if (errors.length) return { action: 'invalid', detail: errors.join('; ') };
 
-  const open = (await ctx.polymarket.getOpenOrders()).filter((o) => o.side === 'buy' && !o.placedBy && o.tokenId === cfg.tokenId);
+  const allOpen = await ctx.polymarket.getOpenOrders();
+  const open = allOpen.filter((o) => o.side === 'buy' && !o.placedBy && o.tokenId === cfg.tokenId);
   const cancelAll = async () => {
     let n = 0;
     for (const o of open) {
@@ -295,7 +316,12 @@ export async function runResolutionCycle(ctx: BotContext): Promise<CycleResult> 
       };
     }
     const flags = await ctx.risk.getExitFlags();
-    const inv = invalidation(cfg, m, state.baseline, forecasts, flags, now);
+    const policy = await ctx.risk.getExitPolicy();
+    // A sell the Position Manager placed on our token (open, or in the history): it is exiting — never buy again
+    const pmSold =
+      allOpen.some((o) => o.placedBy && o.side === 'sell' && o.tokenId === cfg.tokenId) ||
+      (await ctx.polymarket.getOrderHistory(30)).some((h) => h.placedBy && h.side === 'sell' && h.tokenId === cfg.tokenId);
+    const inv = invalidation(cfg, m, state.baseline, forecasts, flags, now, policy, pmSold);
     if (inv) {
       state.invalid = { ...inv, at: now };
       await ctx.storage.set(STATE_KEY, state);
@@ -364,14 +390,20 @@ export async function runResolutionCycle(ctx: BotContext): Promise<CycleResult> 
     }
   }
   if (keep) return { action: 'kept', price, size };
-  const r = await ctx.polymarket.placeLimit(cfg.tokenId, 'buy', price, size, {
+  // Cancelled bids may have filled meanwhile: size the new bid on the holdings after the cancels
+  const heldAfter = (await ctx.getPositions()).find((p) => p.tokenId === cfg.tokenId);
+  const heldCostAfter = heldAfter ? heldAfter.size * heldAfter.avgPrice : 0;
+  const usdAfter = Math.min(cfg.maxSizeUsd - heldCostAfter, budget.remainingAllocation + openUsd, roomMarket);
+  const sizeAfter = Math.min(size, Math.floor((Math.max(usdAfter, 0) / price) * 100) / 100);
+  if (sizeAfter < MIN_SHARES) return { action: 'full', detail: 'filled up while re-quoting' };
+  const r = await ctx.polymarket.placeLimit(cfg.tokenId, 'buy', price, sizeAfter, {
     postOnly: true,
     ttlMinutes: Math.max(3, Math.ceil(cfg.requoteMinutes * 2 + 2)),
     // No forecastId tag: this is not a ledger-driven order (no category-rights gate, spec §3.3), the thesis is the edge
     reason: `resolution-rule: bid ≤ target ${cfg.target}`,
   });
   if (!r.ok) ctx.log.info(`resolution-rule: bid ${size} @ ${price} not placed: ${r.error ?? r.status}`);
-  return { action: 'bid', price, size, ...(r.ok ? {} : { detail: r.error ?? r.status }) };
+  return { action: 'bid', price, size: sizeAfter, ...(r.ok ? {} : { detail: r.error ?? r.status }) };
 }
 
 // ─── Lifecycle ─────────────────────────────────────────────────────────
