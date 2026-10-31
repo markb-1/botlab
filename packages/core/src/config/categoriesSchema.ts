@@ -98,7 +98,7 @@ rules:
   - name: geopolitics
     tags: [geopolitics, middle-east, ukraine, russia, israel, iran, gaza, china, taiwan, north-korea, nato, war, ceasefire, foreign-policy]
   - name: weather-climate
-    tags: [weather, climate, temperature, daily-temperature, global-temp, global-temperature, hurricanes, hurricane, snow, rain, climate-science]
+    tags: [weather, climate, temperature, daily-temperature, global-temp, global-temperature, hurricanes, hurricane, snow, rain]
     keywords: [temperature, highest temperature, lowest temperature, hottest, coldest, rainfall, snowfall, hurricane, named storm, named storms, tropical storm, heat wave]
     exclude_keywords: [bitcoin, ethereum]
   - name: economics

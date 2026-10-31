@@ -13,6 +13,8 @@ describe('categorize (config/categories.yaml)', () => {
     ['weather tag', { question: 'Highest temperature in London on Nov 2?', tags: ['Weather'] }, 'weather-climate'],
     ['weather by keyword only', { question: 'Will NYC see snowfall above 2 inches? Highest temperature above 60°F?', tags: [] }, 'weather-climate'],
     ['hurricane keyword', { question: 'How many named storms in the 2026 Atlantic season?', tags: ['climate-science'] }, 'weather-climate'],
+    // Gamma's broad "Climate & Science" tag is also on IPO / AI markets (live data 2026-10-31): not weather
+    ['climate-science tag alone', { question: 'SpaceX IPO closing market cap above $2.6T?', tags: ['climate-science'] }, 'other'],
     ['economics tag', { question: 'US CPI above 3.0% in October?', tags: ['economy', 'inflation'] }, 'economics'],
     ['ECB via keyword + context tag', { question: 'Will the ECB cut rates in December?', tags: ['finance'] }, 'economics'],
     ['non-US election via tag', { question: 'Will Labour win the most seats?', tags: ['politics', 'world-elections'] }, 'politics-non-us'],
