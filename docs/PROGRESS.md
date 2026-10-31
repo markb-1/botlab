@@ -46,7 +46,13 @@ bucket, and watch bids / exits on the bot pages. Review R160–R170.
 **Phase 5b is done:** the Consistency and Resolution Rule builtin templates (trust `new`, one bot per opportunity,
 the agent creates them; R171–R176). To try it: assess the markets (Markets page or the agent's `assess_market`),
 create a paper bot on either template with `market_ids` covering its tokens, and watch the constraint / gap or the
-thesis / state on the bot page. **Not started:** 5c (copy trading v2 + leader scoring).
+thesis / state on the bot page.
+
+**Phase 5c is done — Phase 5 is complete:** Copy Trading v2 (spec §9.5, every row) and leader scoring (R181–R188).
+The v1 copy template was replaced in place: its bots went back to **paper** (1c rule) and buy nothing until
+`copy` is added to `mandate.strategies.allow` (off by default). To try it: allow `copy`, create a paper bot on Copy
+Trading with a few `leaders` (the agent proposes them from `get_leaderboard`), assess the markets they trade, and
+watch the bot page's **Leaders** panel (copies, hit rate, P&L, auto-drop). **Not started:** nothing in Phases 1–5.
 
 ## Plan
 
@@ -66,7 +72,7 @@ thesis / state on the bot page. **Not started:** 5c (copy trading v2 + leader sc
 | 4b | `apps/agent` runner (Claude Agent SDK): scheduled cycles (§7.1 cadence), event-triggered runs, run trigger button, cost tracking per run, Telegram digest integration | done |
 | 5a | Forecast executor + position manager templates (§9.1, §9.2), `ctx.portfolio` (cross-bot risk exits as the owning bot), `ctx.events` push, paper resting-order simulation | done |
 | 5b | Consistency + resolution-rule templates (§9.3, §9.4), strategy roles, `ctx.polymarket.getMarket` / `ctx.risk.getExitFlags` / `ctx.requestRetire`, agent create rules | done |
-| 5c | Copy trading v2 + leader scoring (§9.5) | not started |
+| 5c | Copy trading v2 + leader scoring (§9.5), `copy_leaders` / `copy_trades`, `ctx.copy`, `ctx.risk.getMandateSummary`, Leaders panel, `get_copy_leaders` | done |
 
 Testing policy: tests only for safety- and money-critical logic and core domain logic; existing suite must stay green.
 Known pre-existing failures: `tests/copytrading/1-polymarket-data-api.test.ts` calls the live Polymarket API (fails without network; skipped when `SKIP_NETWORK_TESTS=1`).
@@ -267,6 +273,14 @@ IPC handlers became `apps/server/src/routes/`).
 | R178 | 5b review | **Strategy bots vs the Position Manager**. Consistency: before opening a basket, refuse when any leg (YES or NO token) has an open exit flag, ambiguity unassessed or ≥ the exit score, a dispute, a rules change in the last 7 days, or ambiguity ≥ 1 within the exit window of its end. A Position Manager sell (`placedBy` set) on any constraint token, open or in the last 30 days of the bot's orders, is sticky: no new baskets, the bot asks to be retired once no basket is open; an open basket whose leg it sold (since the basket opened) is set **unhedged** at once and handled as a failed hedge (flatten own excess, or bounded escalation when `flatten_unhedged` is off). Resolution rule: any manager sell on its token invalidates it for good. | Review 1–2. | Template source. |
 | R179 | 5b review | **Exclusivity and ladder checks**, in the template at start (and each cycle) and in `BotService` for agent creates / config updates: `exclusive_sum` legs must be markets of one event, all negRisk if any is; `exhaustive: true` needs every leg negRisk and the event's full market list (Gamma `/events/{id}`, `MarketCacheService.getEventMarketIds`, cached 6 h; also filled by `get_market`) to equal the legs — an "Other" or sibling outside `tokens` is refused, an unknown list is refused (updates use the cached list only). Date ladders need every end date (null refused). Consistency tokens must be YES tokens of binary markets in distinct markets (server too). New `ctx.polymarket.getEventMarketIds(eventId)`. The template header now says the payoff floor assumes the constraint holds; 50-50 / void resolutions can break it. | Review 3. | `checkLegs`, `checkAgentStrategyBot`. |
 | R180 | 5b review | **Nits**: escalation re-reads fills after cancelling the resting legs (a leg that filled during the cancel is not bought twice; level legs ⇒ hedged); leftover imbalances under 5 shares are tracked per token (`state.residual`, shares and cost) across baskets — flattened once a token reaches 5 shares (own holdings), and no new basket opens while their cost exceeds `max_residual_usd` (default 2); resolution-rule re-reads holdings after cancelling before sizing a new bid; `forecast_id` must be an active forecast on the token or its complement (server-side, agent creates / updates). | Review nits. | — |
+| R181 | 5c | **Copy is a builtin strategy role** (amends R171, R172): `scripts.builtin_role = 'copy'` (Copy Trading template, `meta.role`), mandate key `copy`. Agent creates / config updates are checked in `BotService.checkAgentStrategyBot`: `copy` in `mandate.strategies.allow` (default mandate: absent ⇒ refused), config against the template schema, `leaders` 0x addresses (1–20), a leader dropped on this bot cannot be re-added; no `marketIds` needed (copy bots follow leaders across markets, unscoped). Ownership, paper-only and caps as for every agent bot (R109, R133, R134). The template itself buys nothing without `copy` in the mandate (any bot, human too; sells still mirror). | Spec §3.2 / §9.5: copy disabled by default, enabled per mandate; the same server-side pattern as 5b. | `STRATEGY_KEYS`, the `copy` branch in `checkAgentStrategyBot`; the mandate check in `marketSkipReason`. |
+| R182 | 5c | **Leader scoring and auto-drop** (`copy/scoring.ts`, pure). A *copied trade* = one round trip per (mode, token, leader): opened by a fill of an order that copied the leader's buy while that lot is flat, closed when the lot is < 0.01 shares — by copied sells (the tagged leader's lot first), untagged sells (Position Manager exits, reconciler resolution closes at the payout) **pro rata** over the lots holding the token. P&L = proceeds − cost, fees included; win = P&L > 0; hit rate = wins / closed. Unrealised = open shares × the market cache's last outcome price − cost (null when unknown). **Auto-drop**: the leader's last 20 closed copied trades **opened since `active_since`** (added / re-added / re-activated); exactly 20 needed; drop iff net P&L < 0 **and** hit rate < 50 % (both). Run when the bot reads its leaders (≤ once a minute per bot), audited `copy.leader_dropped` (system) ⇒ Telegram. | Spec "a leader whose copies lose over 20 trades": both conditions so one large win or loss does not decide alone; fewer than 20 closed copies never drops. | `AUTO_DROP_WINDOW`, `autoDropDecision`. |
+| R183 | 5c | **Builtin upgrade in place**: the seed matches a builtin row by name when the version differs (v1.0.0 → 2.0.0 updates the same row; bots keep their script), and on a source change now also writes `description` and `config_schema` (before, an existing row kept its old schema — 5b log open item) and sets trust `new` when `meta.trust` is `new`. The 1c rule sends every bot on it back to **paper** (audited `bot.stage`): intended, v2 behaves differently. v1 config keys (`traders`, `baseMultiplier`, `maxOrderSizeUsd`) are still read. | Otherwise existing copy bots would keep running v1 code on an orphaned row. | `seedTemplates`. |
+| R184 | 5c | **Attribution**: `LimitOrderOpts.copy = { leader, key, leaderPrice, leaderUsd }`; `RpcHandler` records it in `copy_trades` (order id → leader) after an `ok` placement, only for bots whose script role is `copy` (BotManager binds `ctx.copy` / the recorder to the bot; other bots: ignored, `ctx.copy` throws). Scoring joins the bot's order-linked fills (`bot_trades`) with it. A fork of the template has no role: it copies every leader and is not scored. | No change to the order path or the orders table; the server, not the script, decides who may write attribution. | — |
+| R185 | 5c | **Copy execution** (spec §9.5 rows made concrete): buys = **non-post-only** GTD limit at floor_tick(leader fill + `max_chase`) — it takes asks up to that price and rests the rest for `ttl_minutes` (default 10, schema min 3, R126); skipped when the best ask is above it. Sells = limit at ceil_tick(fill − `max_chase`), **never skipped** (rests; reducing). Leader filters and market filters gate **buys only**; sells always mirror (also for a dropped leader: unwinding). Market making = a leader buy within `mm_window_minutes` of an opposite-direction trade (sell of the outcome or buy of the other outcome) in the same market. Max trades/day counts every leader TRADE row in the UTC day. De-dup key = `transactionHash:logIndex`, else tx + asset / side / size / price + `#n` (the data API does not always return a log index); pages of 100 until a page holds a seen key or a trade older than the cursor (max 10 pages; more ⇒ warning); keys kept 6 h behind the newest; **state saved before each order** (a crash can miss a copy, never double one); the **first poll copies no backlog**. Size = `copy_fraction` × leader USD or `fixed_usd`, ≤ `max_order_usd`, allocation left, market room; < 5 shares ⇒ skipped. Market filters: mandate category / liquidity / horizons / assessed ambiguity ≤ max (`ctx.risk.getMandateSummary`), ambiguity < the PM exit score, no dispute, no rules change < 24 h, outside the PM exit window (`getExitPolicy`), no exit flag, no PM sell (placedBy) in `pm_cooldown_days` (7). | Unassessed markets are refused by the risk engine anyway (R51): copy bots only trade markets someone assessed. | Template config. |
+| R186 | 5c | **Leader lifecycle**: rows follow the config (BotService create / config update; pre-5c bots get rows, added by `system`, when they first read their leaders): new ⇒ `active`, gone from the config ⇒ `removed`, re-added ⇒ `active` with a new window. `dropped` is sticky: only a human re-activates it (`POST /api/bots/:id/copy-leaders/reactivate`, admin; Leaders panel; audited `copy.leader_reactivated`; new window). **Leader changes take effect at the next start** (the running worker keeps its config, as for every config change, R172); a drop takes effect at the next cycle. | Consistent with `update_bot_config` ("takes effect on the next start"). | — |
+| R187 | 5c | **New ctx calls**: `ctx.risk.getMandateSummary()` (allowed categories, horizons, min liquidity = max(mandate, limits per_market), max ambiguity, strategies; null when the config is invalid) — read-only, any bot; `MarketDetail.liquidityUsd`; `ctx.copy.getLeaders(addresses)` (copy role only). Backtests: mandate summary null, `ctx.copy` disabled. | Spec §9.5 "only markets that pass mandate filters". | — |
+| R188 | 5c | **Reporting**: MCP `get_copy_leaders(botId)` (read, output wrapped as untrusted; tool list snapshot updated), `GET /api/bots/:id/copy-leaders`, Bot page **Leaders** panel, a "Copy leaders" block in the daily Telegram digest, Telegram on each auto-drop. Agent prompt **v4**: step 6 copy (only when the mandate allows it; leaders via `get_leaderboard` + `update_bot_config`), daily review reports per-leader results (`get_copy_leaders`); guide §4 "Copy trading". | Spec §9.5 "the daily agent review reports per-leader realised P&L and hit rate". | — |
 
 ## Log
 
@@ -1178,3 +1192,32 @@ Independent security review of b434e6b..0e1225e. Fixed (R149, R150, R152, R154 a
   from PM config and schema default.
 - Open: a PM sell on a token of an already hedged (closed) basket only stops the bot; the remaining legs are left to
   the PM's own triggers (no flattening of past baskets).
+
+### 2026-10-31 — chunk 5c (copy trading v2, leader scoring)
+
+- **Template** (`templates/copy-trading.ts`, v2.0.0, role `copy`, trust `new`; R183, R185): every §9.5 row — sells
+  mirror the leader's sold fraction capped at holdings net of open sells; limit at fill + `max_chase` with a short
+  GTD TTL, skipped when the book moved beyond it; de-dup by tx hash + log index with pagination to the last seen
+  trade, TRADE rows only, oldest first; no small-trade boost, size by fraction or fixed USD within the risk budget;
+  leader filters (min size, trades per day, market making); mandate / near-end / PM-sold / exit-flag filters; all
+  state in `ctx.storage`.
+- **Leader scoring** (R182, R184, R186): `copy_leaders` + `copy_trades` tables, `CopyLeaderService` (sync with the
+  config, attribution, pure scoring, auto-drop audited + Telegram, human re-activation, digest lines),
+  `ctx.copy.getLeaders` for the copy role only.
+- **Agent** (R181, R188): copy bots only with `copy` in `mandate.strategies.allow`, leaders validated, dropped leaders
+  not re-addable, own bots only; `get_copy_leaders` MCP tool; prompt v4 and guide §4.
+- **UI**: Leaders panel on the bot page (status, copies, closed / open, hit rate, realised / unrealised P&L, drop
+  window, re-activate); `copy` role label on the Bots page.
+- **Core**: `ctx.risk.getMandateSummary()`, `MarketDetail.liquidityUsd` (R187); the seed upgrades a builtin in place
+  and refreshes its schema (R183, closes the 5b open item).
+- Tests: template (keys, pagination / restart de-dup, oldest first, TRADE only, no backlog, sizing and caps, buy /
+  sell prices, TTL ≥ 3, sell fraction net of open sells, min size / trades per day / market making, mandate /
+  near-end / PM-sold / exit-flag / dropped-leader / copy-off skips, typecheck); scoring (round trips, attribution,
+  pro rata, resolution, fees, marks) and the auto-drop threshold; service on the real schema (sync, auto-drop audit +
+  Telegram, sticky drop, human-only re-activation, digest); seed upgrade in place; MCP (mandate gate, leader
+  validation, ownership, dropped leader, `get_copy_leaders` wrapped, re-activation refused to the agent).
+  `tests/copytrading/sell-sizing.test.ts` (v1 hot-fix) replaced by `tests/templates/copy-trading.test.ts`.
+- Open: the activity API's `logIndex` and `type=TRADE` filter and the positions `market` filter are unverified
+  against live data (fallback key and client-side filters in place); copy bots only buy assessed markets, so someone
+  has to assess the leaders' markets; unrealised P&L uses the market cache's last Gamma price, not the book; a fork
+  of the template is not scored.

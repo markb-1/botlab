@@ -446,7 +446,7 @@ The `meta.configSchema` object is a JSON Schema that generates the configuration
 | **Position Manager** | Standing bot (one per mode): exits every bot's positions as risk exits. See Strategies. |
 | **Consistency** | Per opportunity: trades violations of a constraint between markets (implies, date ladder, exclusive sum) with hedged baskets. See Strategies. |
 | **Resolution Rule** | Per market: bids up to a target on the outcome its thesis favours, holds to resolution. See Strategies. |
-| **Copy Trading** | Monitor Polymarket traders and copy their trades. Configurable multipliers, Kelly criterion sizing, position limits, daily volume caps, and auto-redeem. |
+| **Copy Trading** | Optional (mandate `strategies.allow: copy`): mirrors selected Polymarket leaders with limits near their fill, in mandate markets only; leaders are scored and dropped when their copies lose. See Strategies. |
 | **Binance Spot** | Monitor Binance spot prices and trade based on price thresholds. |
 
 You can **fork** any template to create your own version, or **import/export** scripts as files.
@@ -551,6 +551,33 @@ it holds `max_size_usd` of cost, holds to resolution and **never sells**. It sto
 bids) on a rules change since it first started, a UMA dispute, ambiguity above `max_ambiguity`, the linked
 forecast withdrawn or below the target, an exit flag on its position, or the end approaching; the Position Manager
 handles any exit, and the bot retires itself once flat or when the market closes.
+
+### Copy Trading v2 (5c, optional)
+
+`templates/copy-trading.ts` (spec §9.5) follows a few Polymarket wallets ("leaders", config `leaders`). It is a
+builtin strategy template with trust `new` (paper first); the agent may create copy bots only when
+`mandate.strategies.allow` contains `copy` (off by default). Upgrading replaced the v1 template in place, so existing
+copy bots went back to paper and keep their config (`traders` / `baseMultiplier` / `maxOrderSizeUsd` are still read).
+Without `copy` in `strategies.allow` a copy bot (human or agent) buys nothing; it still mirrors leader sells.
+
+| v1 behaviour | v2 |
+|---|---|
+| sold a USD amount as tokens | sells mirror the leader's sold **fraction** of their position, capped at our holdings net of open sells |
+| market (FOK) orders | limit at leader fill + `max_chase` (0.01), GTD `ttl_minutes` (10, ≥ 3); skipped when the best ask is already above it; sells rest at fill − `max_chase` |
+| de-dup by timestamp, 20 rows | de-dup by transaction hash + log index (in `ctx.storage`), activity paginated until the last seen trade, `TRADE` rows only, oldest first; the first poll copies no backlog |
+| small-trade boost, own daily cap | size = `copy_fraction` (0.1) × leader USD or `fixed_usd`, capped by `max_order_usd` (25) and the risk budget (allocation, market room) |
+| no leader filtering | buys skipped below `min_leader_trade_usd` (10), above `max_leader_trades_per_day` (40), or within `mm_window_minutes` (30) of an opposite trade by the leader in the same market (market making) |
+| any market | buys only in markets passing the mandate (category, liquidity, horizon, **assessed** ambiguity; `ctx.risk.getMandateSummary`), no dispute / recent rules change, outside the Position Manager's exit window, no exit flag, not sold by the Position Manager in the last `pm_cooldown_days` (7) |
+
+**Leader scoring** (`copy_leaders`, `copy_trades`): every order a copy bot places carries the leader it copies, so
+each fill is attributed. A *copied trade* is a round trip in one token attributed to one leader (opened by a copied
+buy, closed when that leader's lot is sold — by copied sells, Position Manager exits or the resolution close); P&L
+includes fees. The bot page's **Leaders** panel (and MCP `get_copy_leaders`) shows per leader: status, orders copied,
+closed / open trades, hit rate, realised and unrealised P&L (at the market cache's last price) and the auto-drop
+window. A leader whose **last 20 closed copied trades** (since it became active) have **net P&L < 0 and a hit rate
+under 50 %** is dropped automatically (audited `copy.leader_dropped`, Telegram): the bot no longer copies its buys
+(its sells are still mirrored to unwind). Only a human re-activates it (Leaders panel), which starts a new window.
+Leader changes in the config apply at the bot's next start. The daily digest lists every leader.
 
 ---
 
