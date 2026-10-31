@@ -21,6 +21,13 @@ code is printed in the server log) → everything starts in **paper mode**. See 
 3. Set real limit values (Risk page), then add `live_trading.enabled: true` to `limits.yaml` (R98).
 4. If you have positions from the old Electron app: adopt them (Settings → Reconciliation; R8, S2 of 2b).
 5. Windows service: check NSSM grants "Log on as a service" for your account (R112).
+6. The scheduled agent (4b) is off by default. Switch it on **while live trading is still off**, so it can only
+   make paper bots and ledger forecasts ("shadow" mode): set `limits.yaml agent.monthly_llm_budget_usd` low
+   (e.g. 30) and keep `max_run_cost_usd` at 1.50, put `ANTHROPIC_API_KEY` in the server environment (Windows
+   service: `nssm set BotLab AppEnvironmentExtra +ANTHROPIC_API_KEY=…`, README "Running the agent"), then
+   `server.yaml agent.enabled: true`. Watch a few days of run reports, the Agent page (cost, calls) and the
+   ledger calibration before any agent-made bot is promoted to live by hand. Nothing in 4b ran against the
+   real Anthropic API (fake SDK in tests): check the first runs' cost and the Telegram report (R149–R155).
 
 **Most important decisions to review:** R1 (risk-exit exemptions), R51 (assessment required before buys), R66 (bot
 wallets assumed bot-only — manual trades on them trigger a halt), R98 (live gate), R109 (agent: paper-only bots,
@@ -28,8 +35,9 @@ config-only edits), R110 (setup code). Full list below.
 
 **CI:** the final run (chunk 3c review fixes) failed lint on unnecessary `\"` escapes in `tests/server/ui-routes.test.ts`; fixed in the follow-up commit (lint 0 errors, tests green).
 
-**Phase 4:** 4a (MCP server, agent tools, runs / notes / budget, Agent page) is done; 4b (the scheduled agent runner) and
-Phase 5 (strategy templates) are not started.
+**Phase 4 is complete:** 4a (MCP server, agent tools, runs / notes / budget, Agent page) and 4b (the scheduled agent
+runner: `apps/agent` on the Claude Agent SDK, started by the server's AgentScheduler; off by default). **Not started:
+Phase 5** (strategy templates).
 
 ## Plan
 
@@ -46,7 +54,7 @@ Phase 5 (strategy templates) are not started.
 | 3b | HTTP server + SSE + auth, web client on fetch, remove Electron + AI assistant, cross-platform scripts, Docker | done |
 | 3c | UI pages: Risk, Ledger, Audit, config editing | done |
 | 4a | MCP server (`/mcp` + stdio proxy), §7.3 tools/resources, agent runs/notes/budget, script typecheck, Agent page | done |
-| 4b | `apps/agent` runner (Claude Agent SDK): scheduled cycles (§7.1 cadence), event-triggered runs, run trigger button, cost tracking per run, Telegram digest integration | todo |
+| 4b | `apps/agent` runner (Claude Agent SDK): scheduled cycles (§7.1 cadence), event-triggered runs, run trigger button, cost tracking per run, Telegram digest integration | done |
 
 Testing policy: tests only for safety- and money-critical logic and core domain logic; existing suite must stay green.
 Known pre-existing failures: `tests/copytrading/1-polymarket-data-api.test.ts` calls the live Polymarket API (fails without network; skipped when `SKIP_NETWORK_TESTS=1`).
@@ -215,6 +223,13 @@ IPC handlers became `apps/server/src/routes/`).
 | R146 | 4a review | **Caps not self-policed**: `AgentService.beforeToolCall(tool, actor)` checks and reserves synchronously (no await between check and count), so parallel / batched calls cannot overshoot. New `agent.max_tool_calls_per_hour` (default 300) per token, rolling hour, in memory (a server restart resets it), independent of runs (finish + start does not reset it), and applied to agent `/api` requests too (`mountRoutes` hooks, HTTP 429 `rate_limited`). `finish_run` no longer takes `tokens_in/out` / `cost_usd` (strict schema); `AgentService.recordRunUsage(runId, usage, systemActor)` is the only way to record usage (for the 4b runner), on any run status (a timed-out run keeps its cost). The monthly budget therefore counts system-recorded cost only; interactive Claude Code / Desktop use is **not cost-tracked** by BotLab (README, Agent page). `finish_run` / `kill_switch` stay exempt from both caps. | Review finding 3. | Limits in `limits.yaml agent:`. |
 | R147 | 4a review | **Untrusted wrapping by default**: every tool output is wrapped in `<untrusted_data>` (label `botlab stored text` unless a tool names a source) except `get_orderbook`, `get_price_history`, `get_ledger_stats`, `kill_switch`, `watch_market`, `unwatch_market`, `delete_note` (numbers / ids / computed state; test-pinned). `botlab://templates/{id}` is wrapped; `resources/list` shows template ids, origin and trust only (no names or descriptions). | Review finding 4: names, descriptions, scripts, notes and summaries are agent- or human-written and can carry injected text. | `trustedOutput` in tools.ts. |
 | R148 | 4a review | **stdio proxy transport security**: the token is sent over plain `http://` only to loopback (`localhost`, 127.0.0.0/8, `::1`) or Tailscale (`*.ts.net` MagicDNS names, 100.64.0.0/10 — WireGuard-encrypted); any other http host is refused unless `BOTLAB_ALLOW_INSECURE=1`; https always allowed. | Review nit; Tailscale is the documented remote path (spec §8.2). | `insecureUrlReason`. |
+| R149 | 4b | **Managed runs and event-run enforcement**: every run the server starts is opened by the server (`AgentService.openManagedRun`, system actor: same monthly-budget / one-run checks) with the runner token's principal, kind (`review` / `cycle` / `event`), model and `managed = 1`; the agent's `start_run` with that token **attaches** to the open run (any other principal still gets "in progress"). `finish_run` on a managed run sends no Telegram report: `completeManagedRun` (system) does once the runner exited — usage recorded first (any status), run closed by the server if the agent did not (crash ⇒ `error`, over time ⇒ `timeout`, cost / turn cap or cancel ⇒ `aborted`), then the report with cost, tokens and duration. Runs left open by a dead server are closed as `error` at the next start. **Event runs are maintenance only, in the services**: while the open run is an event run, agent `BotService.create`, `ScriptService.create / createTemplate / update (incl. update_template) / fork / import` and `LedgerService.submitForecast` are refused (`forbidden`, audited `denied: event run`), for every agent token (runs are global), via MCP and `/api`. Pause / retire / config of own bots, notes, exit flags, withdrawals and assessments stay allowed. | Spec §7.1 (event runs: maintenance, no new bots); the agent cannot skip run accounting. | `guardMaintenanceRun`; drop the `guardAgentRun` deps. |
+| R150 | 4b | **Runner token: one per run.** The scheduler creates an agent token named `botlab-runner (automatic)` (stored hashed like any token) right before the run, passes the plaintext only in the child's environment, and revokes it when the child exits (and any active token with that name at server start). No long-lived secret to manage or leak; per-token hourly caps therefore act per run. | Simplest safe option; the user never handles it. | `AgentScheduler.launch` (create a fixed token instead). |
+| R151 | 4b | **Event triggers**: a **bot** halt (not global halts / kill switch: the agent cannot clear them), rules changed or UMA dispute on a **held** market (same rule as the Telegram alert), a reconciliation **mismatch** (not reconciler outages / clock skew). Triggers arriving while a run is active or inside the debounce are queued (≤ 20) and coalesced into the next event run (passed to the runner as untrusted data). Cap `agent.events.max_per_day` (≤ 4, counted from `agent_runs` with trigger `event` since local midnight) and `debounce_minutes` (≥ 30, from the last event run's start); beyond the cap pending triggers are dropped (audited `agent.event_dropped`). **Quiet hours 00:00–07:00: only bot halts start an event run**; other triggers are dropped, the 07:30 review sees them. A manual "maintenance" run (Run now → event) does not count toward the cap. | Spec §7.1 asks to decide night-time triggers: a halted bot is the one case worth a look before morning (the agent can only pause / retire / note). | `acceptTrigger`, `decideEventRun`. |
+| R152 | 4b | **Schedule**: `server.yaml agent` — `enabled` (false), `model` (`claude-sonnet-5-5` default or `claude-opus-5-5`; schema enum), `max_turns` (80), `schedule.review` (07:30) / `cycles` (11:30, 15:30, 19:30, 23:30; times in 00:00–07:00 refused by the schema), `events`. Local times in `timezone`, converted per date (DST-safe). A slot is due from its time for **60 min** (a server down longer skips it) and runs once (in-memory set + "a scheduled run started since the slot" in the DB, so a restart does not repeat it). Skipped (audited `agent.run_skipped`, logged) when a run is active, the agent is disabled, `ANTHROPIC_API_KEY` is missing (a warning is logged once per config state), the core is locked, or the budget is used (one Telegram notice per month). Switching `enabled` off stops an active run. | Spec §7.1. | `dueScheduledRun` grace. |
+| R153 | 4b | **Runner tool surface**: `tools` = WebSearch, WebFetch, ListMcpResourcesTool, ReadMcpResourceTool (to read `botlab://sdk/guide.md` etc.); `allowedTools` = those + `mcp__botlab`; `disallowedTools` names Bash, Read, Write, Edit, Glob, Grep, Task, Agent, Skill, … ; `permissionMode: 'dontAsk'` (no prompts; anything not pre-approved is denied) plus a `PreToolUse` hook that denies anything outside the allow-list; `settingSources: []`, `strictMcpConfig`, `persistSession: false`, `CLAUDE_CONFIG_DIR` and cwd under `<data dir>/agent-runner`. Environment allow-list on both sides (PATH, HOME/USERPROFILE/APPDATA, TEMP, SystemRoot, proxies, CA certs, `ANTHROPIC_API_KEY`): `BOTLAB_MASTER_KEY` and other server variables never reach the child. Started with `child_process.fork(process.execPath, …)` (no shell; `--import tsx` for the `.ts` entry in dev), JSON IPC. The SDK (ESM-only) is loaded with a real dynamic `import()` from the CommonJS build. | Spec §7.1 (BotLab MCP + web search + web fetch; no shell, no files). | `runner.ts` constants. |
+| R154 | 4b | **Per-run limits and cost**: the runner passes `maxTurns` (`agent.max_turns`) and `maxBudgetUsd` (`limits.yaml agent.max_run_cost_usd`) to the SDK **and** estimates cost itself from per-message usage at list prices (Sonnet 5.5 $2 / $10, Opus 5.5 $4 / $20 per MTok; cache read $0.20, cache write 1.25×; unknown models priced as Opus) and aborts the query at the cap; a 30-minute timer aborts it too. Usage is reported cumulatively over IPC; the final SDK result (`total_cost_usd`, `modelUsage`) wins but never below the estimate. The server asks the runner to stop 30 s after its own 30 minutes and kills it at 60 s; on exit it records the last usage it received (a crash keeps the estimate). Cost is an estimate, not an invoice. The SDK adds a per-platform Claude Code binary (~330 MB, optional dependency) to `node_modules` / the Docker image. | Spec §7.1. | — |
+| R155 | 4b | **Manual runs**: Agent page "Run now" (admin; kind cycle / review / maintenance) and "Stop" (`POST /api/agent/runs`, `/api/agent/runs/current/cancel`), Telegram `/run [cycle|review]` (admin chat only, as all commands); refused when disabled / no key / locked / a run is active / over budget. Run reports and the 08:00 digest (runs in the last 24 h by status, cost, key actions such as create_bot / submit_forecast / retire_bot, month-to-date budget) come from core; `GET /api/agent/schedule` (next runs, active run) and `GET /api/agent/runs/:id/calls` (the run's MCP calls from the audit log) feed the Agent page, refreshed by the `agent:run` SSE event. | Spec §11, §12. | — |
 
 ## Log
 
@@ -960,3 +975,46 @@ Independent security review of b542379..ec7ae2c. Fixed (R134, R135, R138, R139 a
    notes, run history and the template resource are wrapped.
 5. Nits: agent script create / PATCH validated (R135; test); stdio proxy refuses plain http to non-loopback,
    non-Tailscale hosts (R148; test).
+
+### 2026-10-31 — chunk 4b (scheduled agent runner)
+Decisions R149–R155.
+
+1. **Runner** (`apps/agent`, `@anthropic-ai/claude-agent-sdk` 0.3.316): one `query()` per run; tools only the BotLab
+   MCP server (Streamable HTTP to the local `/mcp` with a per-run agent token) plus web search / fetch and the MCP
+   resource readers; Bash / file / subagent tools disallowed, `dontAsk`, a `PreToolUse` deny hook, no settings
+   sources, minimal environment (R153). Limits: `max_turns`, `max_run_cost_usd` (SDK `maxBudgetUsd` + own estimate),
+   30 minutes (R154). Versioned system prompt `apps/agent/prompts/system.md` (v1): §7.2 cycle, run kinds (review /
+   cycle / event = steps 1, 2, 7), mandate / limits, untrusted-data rules matching the `<untrusted_data>` tags
+   (R138 / R147), the guide resource, "end with finish_run". Event triggers reach the model as untrusted data.
+2. **AgentScheduler** (`apps/server/src/agent`): §7.1 cadence from `server.yaml agent` (Europe/Dublin, DST-safe,
+   nothing 00:00–07:00), event runs (bot halt, rules change / dispute on a held market, reconciliation mismatch;
+   ≤ 4/day, 30-min debounce, coalesced, halts only at night), Run now / Stop, Telegram `/run`. Per run: token
+   created → run opened by the server (system) → child forked (no shell; tsx in dev) → usage over IPC → on exit
+   usage recorded + run closed (crash ⇒ error, overrun ⇒ stop then kill ⇒ timeout) + token revoked + report
+   (R149–R152). Off by default; enabled without `ANTHROPIC_API_KEY` ⇒ warning, nothing scheduled.
+3. **Core**: `agent_runs.kind / managed / model`; `openManagedRun`, attach on `start_run`, `completeManagedRun`,
+   `closeOrphanedManagedRuns`, `recordRunnerAction` (web tool calls on the run's action list), `runCalls` (audit),
+   `digestText`; event runs refused in BotService / ScriptService / LedgerService (`guardMaintenanceRun`);
+   `agent:trigger` (internal) and `agent:run` (SSE) events; pure schedule rules in `core/src/agent/schedule.ts`.
+4. **Telegram**: run report for every server-started run (kind, trigger, status, duration, cost, tokens, calls;
+   summary cut at a line break with a pointer to the Agent page), failures / timeouts high priority, budget-skip
+   notice once a month, `/run [cycle|review]`, digest lines for the last 24 h of runs and the month's budget.
+5. **UI**: Agent page schedule card (enabled / why not ready with a link to Risk → Server, model, times, next runs,
+   event-run count, active run + Stop), Run now with kind, runs table with kind / duration, per-run transcript
+   (web tool calls + MCP calls from the audit log), live via `agent:run`; Risk page opens `?tab=server`.
+6. **Ops**: README "Running the agent" (macOS / Linux / Windows NSSM `AppEnvironmentExtra` / Docker, model and
+   budget advice), compose hint, Dockerfile copies the prompt; CLAUDE.md layout.
+7. **Tests** (`tests/agent/`, no Anthropic API): schedule across both 2026 DST changes, grace / once, quiet hours,
+   schema refusals, event cap / debounce / night rule; runner with a fake SDK (only BotLab MCP + web tools, Bash /
+   Write / Edit / Read absent and denied by the hook, cumulative usage, cost-cap abort, SDK budget / turn results,
+   crash, wall-clock timeout, server stop, escaped triggers, prompt version); scheduler on a real core with a fake
+   runner process (run opened first, token only in the child env and revoked after, `BOTLAB_MASTER_KEY` not passed,
+   attach, usage recorded by system, report after exit with duration, crash keeps cost, stop-then-kill ⇒ timeout,
+   refusals: active / budget / no key / disabled, scheduled slot once incl. after restart, skip while active, event
+   coalescing / debounce / cap / night, event run refuses create_bot / create_template / submit_forecast over MCP,
+   orphaned runs and tokens cleaned at start). Manual check: the built and the tsx runner start as child
+   processes; with a fake key and the network blocked the SDK accepted the options and the 30-minute abort path
+   ended the process cleanly.
+
+VERIFY: the first real runs (cost estimate vs. the Console, report text) and `nssm set … AppEnvironmentExtra +VAR=…`
+(append syntax) on the Windows box.

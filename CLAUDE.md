@@ -63,8 +63,10 @@ All domain logic lives in a transport-free core (`packages/core`, imported by re
 package, no workspaces). Transports are thin.
 1. **Core** (`packages/core/src/`) — DB, risk, orders, exchanges, bot runtime, ledger, services, backups, `createCore()`
 2. **Server** (`apps/server/src/`) — Hono HTTP API mirroring the old IPC channels, auth, SSE, `/healthz`, static UI, CLI,
-   MCP server at `/mcp` for the agent (+ stdio proxy)
+   MCP server at `/mcp` for the agent (+ stdio proxy), AgentScheduler (starts the agent runner)
 3. **Web** (`apps/web/`) — React SPA (Vite); `src/lib/api.ts` is the fetch + EventSource client
+4. **Agent runner** (`apps/agent/`) — Claude Agent SDK child process for one run, started by the server; talks to
+   BotLab only through `/mcp` (plus web search / fetch)
 
 ### Directory Structure
 
@@ -91,6 +93,7 @@ packages/core/src/
   risk/                    # RiskEngine, halts, kill switch, RiskMonitor, ramp, startup recovery
   config/                  # limits/mandate/fees/server/categories YAML: schema, loader, ConfigService (hot reload)
   ledger/                  # Forecast ledger, scoring, market cache
+  agent/schedule.ts        # agent schedule rules (pure): Europe/Dublin slots across DST, quiet hours, event cap/debounce
   reconcile/ recorder/ backtest/ audit/ notify/ utils/
   security/                # crypto (AES-256-GCM), masterKey (key check), adminAuth (password, sessions, tokens), migrateSecrets
   ops/                     # BackupJob (nightly SQLite .backup, 14 kept)
@@ -112,11 +115,19 @@ apps/server/src/
                            # resources.ts, server.ts (low-level SDK Server: list/call, audit, untrusted wrapping,
                            # tool-call cap), http.ts (stateless Streamable HTTP at /mcp, agent token only)
   mcp-stdio.ts             # stdio ⇄ /mcp proxy for Claude Desktop / Claude Code (never opens the DB)
+  agent/AgentScheduler.ts  # scheduled / event / manual agent runs: per-run agent token, opens the run (system),
+                           # forks apps/agent (tsx in dev), records reported usage, 30-min stop + kill, /run hook
+
+apps/agent/
+  prompts/system.md        # versioned system prompt (cycle §7.2, untrusted-data rules, run kinds); bump the version
+  src/main.ts              # child entry: env → runAgent → IPC messages (protocol.ts) → exit
+  src/runner.ts            # query() options (only mcp__botlab + WebSearch/WebFetch, dontAsk, deny hook), cost /
+                           # turn / wall-clock limits; the SDK query is injected (tests use a fake, never the API)
   masterKey.ts migrateKey.ts cli.ts paths.ts instanceLock.ts
 
 apps/web/src/              # React UI
   pages/                   # Dashboard, Bots, BotDetail (code view, orders), Scripts, Ledger, Markets, Risk,
-                           # Agent (runs, notes, budget, exit flags), Audit, Approvals, Wallets,
+                           # Agent (schedule, Run now, runs + transcript, notes, budget, exit flags), Audit, Approvals, Wallets,
                            # Settings (Telegram, password, tokens, reconcile/adopt)
   hooks/                   # React Query hooks over lib/api.ts; useLiveUpdates = SSE → query invalidation
   lib/api.ts               # fetch client (same exports as the old electronApi) + EventSource events
@@ -173,6 +184,10 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 - **Worker thread isolation**: Bot scripts run in worker threads — they can only communicate via the RPC message channel, not access main process directly
 - **Binance credentials**: Encrypted in settings table, decrypted only in `BotManager.getSettings()`. Only `hasBinanceCredentials: boolean` is ever sent to renderer
 - **Script templates**: Registered in `packages/core/src/db/seed.ts`, source lives in `templates/`
+- **Agent runs**: runs the server starts are `managed` (opened by `AgentService.openManagedRun`, system actor); the
+  agent's `start_run` attaches to them, usage is only recorded by the system (`completeManagedRun`), and while an
+  `event` run is open the services refuse agent bot creates, script writes and forecasts (`guardMaintenanceRun`).
+  New agent write paths must call `guardAgentRun` too. The runner never gets BotLab secrets (env allow-list)
 - **Actors**: services take branded actors from `packages/core/src/services/actors.ts` (`asHuman`/`asAgent`/`asSystem`). Only a transport creates them, from the authenticated principal, never from request data; human-only actions (clear halt, config write/restore, adopt positions, market ambiguity, forced category rights) refuse anything but a minted `HumanActor`
 - **Core is transport-free**: nothing under `packages/core` may import `hono`, `electron` or `apps/*` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not HTTP handlers
 - **Data dir**: `BOTLAB_DATA_DIR`, else `./data` in dev and the OS app-data dir with `--production` / `NODE_ENV=production` (`apps/server/src/paths.ts`); config dir likewise (`resolveConfigDir`). One server per data dir (`server.lock`)
@@ -189,4 +204,5 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 - `BOTLAB_MASTER_KEY` (64 hex) or `BOTLAB_MASTER_KEY_FILE` — master key for secrets at rest
 - `BOTLAB_HOST` (default 127.0.0.1), `BOTLAB_PORT` (3780), `BOTLAB_ALLOWED_HOSTS` — HTTP server (also `http:` in server.yaml)
 - `TELEGRAM_BOT_TOKEN` — overrides server.yaml
+- `ANTHROPIC_API_KEY` — the scheduled agent runner's key (env only; with `server.yaml agent.enabled: true`)
 - `SKIP_NETWORK_TESTS=1` — skip tests that call live APIs

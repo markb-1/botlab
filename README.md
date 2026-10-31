@@ -190,6 +190,7 @@ On macOS and Linux, `npm run service:install` prints a launchd / systemd unit wi
 | `BOTLAB_ALLOWED_HOSTS` | — | extra UI host names, comma-separated (IPs, `localhost`, `*.ts.net` always allowed) |
 | `BOTLAB_LOG_DIR` | `<data dir>/logs` | daily log files |
 | `TELEGRAM_BOT_TOKEN` | — | overrides `notify.telegram.bot_token` in server.yaml |
+| `ANTHROPIC_API_KEY` | — | the scheduled agent's API key (only from the environment; never stored by BotLab). See "Running the agent" |
 | `TZ` | system | e.g. `Europe/Dublin` |
 
 A `.env` file in the working directory is read at start.
@@ -206,7 +207,7 @@ A `.env` file in the working directory is read at start.
   (`set-password`) if you are ever locked out of a fresh setup.
 - **HTTP API**: `/api/*`, JSON `{ success, data?, error?, code? }`; mutations need the `X-BotLab: 1`
   header when using the cookie. Events: `GET /api/events` (server-sent events: `bot:event`, `bot:log`,
-  `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`). Health: `GET /healthz`
+  `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`, `agent:run`). Health: `GET /healthz`
   (no auth; 503 when the DB fails, the server is locked, the reconciler is stale > 3 min or a bot
   worker crashed).
 - **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (the MCP agent, below; on `/api` it keeps
@@ -276,6 +277,53 @@ or set `BOTLAB_ALLOW_INSECURE=1` to override.
 Tool results that contain third-party text (market questions and rules, names, log lines) are wrapped in
 `<untrusted_data>` blocks and the guide tells the agent not to follow instructions in them; the real protection
 is structural (what the agent cannot do, above).
+
+## Running the agent
+
+The server can run the agent itself on a schedule (spec §7.1): a separate runner process (`apps/agent`, the
+Claude Agent SDK) that talks to BotLab only through `/mcp`, plus web search and web fetch — no shell, no file
+access. It is **off by default**. Before you switch it on:
+
+1. Keep live trading off (`limits.yaml` `live_trading.enabled: false`) while you watch the first days: the
+   agent only ever creates **paper** bots, and its forecasts go to the ledger ("shadow" mode).
+2. Set the agent limits in `limits.yaml` → `agent:` (Risk page): `monthly_llm_budget_usd` (start low, e.g. 30),
+   `max_run_cost_usd` (default 1.50), `max_bots_created_per_day`, `max_active_bots`.
+3. Get an API key from the Anthropic Console and put it **in the server's environment** as
+   `ANTHROPIC_API_KEY` (never in a config file or the database):
+   - **macOS / Linux** (`npm start` in a terminal): `export ANTHROPIC_API_KEY=sk-ant-…` before starting, or add
+     it to the launchd plist (`EnvironmentVariables`) / systemd unit (`Environment=`) printed by
+     `npm run service:install`.
+   - **Windows service (NSSM)**, in an elevated PowerShell (the `+` appends to the variables the installer set):
+
+     ```powershell
+     nssm set BotLab AppEnvironmentExtra +ANTHROPIC_API_KEY=sk-ant-...
+     nssm restart BotLab
+     nssm get BotLab AppEnvironmentExtra      # check: BOTLAB_* paths and the key
+     ```
+
+     `npm run service:install` rewrites the service settings: add the key again after reinstalling.
+   - **Windows, in a terminal**: `$env:ANTHROPIC_API_KEY = "sk-ant-..."` then `npm start`.
+   - **Docker**: `ANTHROPIC_API_KEY` in the compose `environment:` (from your shell or an `.env` file next to
+     `docker-compose.yml`).
+4. In `server.yaml` (Risk → Server), set `agent.enabled: true`. Recommended: `model: claude-sonnet-5-5` (default;
+   `claude-opus-5-5` is about twice the cost per token). The change applies without a restart.
+
+Schedule (local times in `server.yaml` `timezone`, default Europe/Dublin): daily review at 07:30 and cycles at
+11:30, 15:30, 19:30 and 23:30 (`agent.schedule`); nothing between 00:00 and 07:00 — bots keep running and the
+risk engine keeps enforcing. **Event runs** (maintenance only: no new bots, templates or forecasts — the server
+refuses them) start when a held market's rules change, a bot is halted or reconciliation finds a mismatch: at
+most 4 a day and one per 30 minutes; at night only bot halts start one. Start a run by hand from the Agent page
+("Run now") or Telegram `/run [cycle|review]`.
+
+What the server enforces for every run: it opens the run itself (the agent cannot skip run accounting), gives the
+runner a fresh agent token that is revoked when the run ends, refuses the run when one is already active or the
+monthly budget is used (one Telegram notice a month), records the token usage and cost the runner reports, and
+stops the run at `max_run_cost_usd`, `agent.max_turns` or 30 minutes (the runner aborts; the server kills it if
+it does not exit). The Telegram run report (cost, duration, summary) follows every run, including failures, and
+the 08:00 digest lists the last 24 hours of runs and the month's spend. With the agent enabled but no
+`ANTHROPIC_API_KEY`, the server logs a warning and schedules nothing. Budget: with the defaults (5 scheduled plus
+up to 4 event runs a day, ≤ $1.50 each) the theoretical maximum is about $400 a month; typical Sonnet runs cost
+far less, and `monthly_llm_budget_usd` is the hard stop.
 
 ## Writing Bot Scripts
 
