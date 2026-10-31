@@ -303,11 +303,33 @@ export function Scripts() {
               <section>
                 <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">Trading</h4>
                 <div className="space-y-2">
-                  <ApiMethod sig="ctx.buy(tokenId, amountUsd, opts?)" ret="Promise<TradeResult>" desc="Place a buy order for a given amount of USD" />
-                  <ApiMethod sig="ctx.sell(tokenId, amountTokens, opts?)" ret="Promise<TradeResult>" desc="Sell a number of tokens" />
+                  <ApiMethod sig="ctx.buy(tokenId, amountUsd, opts?)" ret="Promise<TradeResult>" desc="One fill-or-kill order for amountUsd at best ask + maxSlippage (or opts.maxPrice). Risk-checked; a rejection is returned (status 'rejected_risk', failedCheck), not thrown." />
+                  <ApiMethod sig="ctx.sell(tokenId, amountTokens, opts?)" ret="Promise<TradeResult>" desc="Fill-or-kill sell of held tokens at best bid − maxSlippage (or opts.minPrice). opts.riskExit marks an exit (exempt from hold time and rate limits)." />
                   <ApiMethod sig="ctx.getOrderBook(tokenId)" ret="Promise<OrderBook>" desc="Get the full order book (bids and asks)" />
                   <ApiMethod sig="ctx.getPositions()" ret="Promise<Position[]>" desc="Get all current open positions for this wallet" />
                   <ApiMethod sig="ctx.getBalance()" ret="Promise<number>" desc="Get wallet USDC balance" />
+                </div>
+              </section>
+
+              {/* Orders v2 */}
+              <section>
+                <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">Limit orders (ctx.polymarket)</h4>
+                <div className="space-y-2">
+                  <ApiMethod sig="ctx.polymarket.placeLimit(tokenId, side, price, size, opts?)" ret="Promise<OrderResult>" desc="GTD limit order. Post-only by default (rejected if it would cross); ttlMinutes capped by limits.orders.resting_order_ttl_minutes. Returns ok/status/failedCheck; never throws on a rejection." />
+                  <ApiMethod sig="ctx.polymarket.cancel(orderId)" ret="Promise<void>" desc="Cancel one of this bot's orders (throws if not found or not cancellable)" />
+                  <ApiMethod sig="ctx.polymarket.cancelAll()" ret="Promise<{ cancelled, failed, unknownOutcome }>" desc="Cancel all of this bot's open orders; orders with an unknown outcome expire on their own" />
+                  <ApiMethod sig="ctx.polymarket.getOpenOrders()" ret="Promise<OpenOrder[]>" desc="This bot's open orders" />
+                  <ApiMethod sig="ctx.polymarket.getFee(tokenId)" ret="Promise<{ takerRate, makerRate }>" desc="Fee rates assumed for the market (unknown market ⇒ highest taker rate)" />
+                </div>
+              </section>
+
+              {/* Risk and ledger */}
+              <section>
+                <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">Risk budget & forecast ledger (read-only)</h4>
+                <div className="space-y-2">
+                  <ApiMethod sig="ctx.risk.getBudget()" ret="Promise<{ remainingAllocation, remainingMarket, halted }>" desc="What this bot can still add before its allocation, the total cap or a per-market cap bites" />
+                  <ApiMethod sig="ctx.ledger.getActiveForecasts(filter?)" ret="Promise<BotForecast[]>" desc="Active forecasts ({ category?, tradeableOnly? }); tradeable = its (category, horizon) bucket trades now" />
+                  <ApiMethod sig="ctx.ledger.getForecast(tokenId)" ret="Promise<BotForecast | null>" desc="The active forecast on a token. Pass opts.forecastId when ordering on it (ledger-driven orders)." />
                 </div>
               </section>
 
@@ -325,7 +347,7 @@ export function Scripts() {
               <section>
                 <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">HTTP</h4>
                 <div className="space-y-2">
-                  <ApiMethod sig="ctx.fetch(url, init?)" ret="Promise<Response-like>" desc="HTTPS GET/POST to allowlisted hosts only (Polymarket gamma/data/clob, Binance API by default; limits.yaml server.script_fetch_allowlist)" />
+                  <ApiMethod sig="ctx.fetch(url, init?)" ret="Promise<Response-like>" desc="https only, port 443, exact host in limits.yaml server.script_fetch_allowlist (default: Polymarket gamma/data/clob, api.binance.com). GET/POST, string body ≤ 256 KB, Cookie/Authorization/Host headers dropped, ≤ 3 redirects, 10 s, 2 MB, max 6 in flight. Response: ok, status, headers.get(), text(), json()." />
                 </div>
               </section>
 
@@ -378,8 +400,11 @@ export function Scripts() {
               <section>
                 <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">Key Types</h4>
                 <div className="space-y-3 text-xs">
-                  <TypeBlock name="OrderOpts" fields={['maxPrice?: number', 'maxSlippage?: number', 'retries?: number']} />
-                  <TypeBlock name="TradeResult" fields={['success: boolean', 'executedAmount: number', 'price: number', 'tokenAmount: number', 'error?: string']} />
+                  <TypeBlock name="OrderOpts" fields={['maxPrice?: number', 'minPrice?: number', 'maxSlippage?: number', 'reason?: string', 'forecastId?: string', 'riskExit?: boolean']} />
+                  <TypeBlock name="TradeResult" fields={['success: boolean', 'executedAmount: number', 'price: number', 'tokenAmount: number', 'error?: string', 'orderId?: string | null', 'status?: string', 'failedCheck?: string']} />
+                  <TypeBlock name="LimitOrderOpts" fields={['postOnly?: boolean (default true)', 'ttlMinutes?: number', 'reason?: string', 'forecastId?: string', 'riskExit?: boolean']} />
+                  <TypeBlock name="OrderResult" fields={['ok: boolean', 'orderId: string | null', 'status: string', 'filledSize: number', 'avgFillPrice: number | null', 'feeUsd: number', 'expiresAt: string | null', 'failedCheck?: string', 'error?: string']} />
+                  <TypeBlock name="BotForecast" fields={['id: string', 'tokenId: string', 'probability: number', 'marketPriceAtForecast: number', 'ambiguityScore: number', 'tradeable: boolean', 'bucketState: string | null', 'horizonBucket: short | medium | long']} />
                   <TypeBlock name="MarketPrice" fields={['bid: number', 'ask: number', 'mid: number', 'spread: number']} />
                   <TypeBlock name="Position" fields={['tokenId: string', 'market?: string', 'outcome?: string', 'size: number', 'currentValue: number', 'avgPrice: number']} />
                   <TypeBlock name="Market" fields={['conditionId: string', 'slug: string', 'title: string', 'outcomes: string[]', 'tokens: MarketToken[]', 'active: boolean', 'volume: string']} />

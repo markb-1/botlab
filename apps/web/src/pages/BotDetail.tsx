@@ -5,7 +5,15 @@ import { useScript, useScriptSchema } from '../hooks/useScripts';
 import { useWallets } from '../hooks/useWallets';
 import { events } from '../lib/api';
 import { ScriptEditor } from '../components/ScriptEditor';
-import type { Bot } from '../types';
+import type { Bot, BotOrder, Forecast, ScriptVersionInfo } from '../types';
+import { useQuery } from '@tanstack/react-query';
+import { botApi, ledgerApi, scriptApi } from '../lib/api';
+import { useOverview } from '../hooks/useRisk';
+import { ClearHaltButton } from '../components/HaltControls';
+import { DiffView } from '../components/DiffView';
+import { ForecastDetail } from './Ledger';
+import { Badge, Empty, ErrorBox, Notice, StageBadge, Tabs, tdCls, thCls } from '../components/ui';
+import { dateTime, errorMessage, pct, shortId, usd } from '../lib/format';
 
 /** Shorten a long token ID for display */
 function truncateId(id: string): string {
@@ -28,7 +36,7 @@ function StatusBadge({ status }: { status: Bot['status'] }) {
   );
 }
 
-type Tab = 'overview' | 'config' | 'script' | 'logs' | 'trades';
+type Tab = 'overview' | 'config' | 'code' | 'orders' | 'logs' | 'trades';
 
 export function BotDetail() {
   const { id } = useParams<{ id: string }>();
@@ -38,6 +46,9 @@ export function BotDetail() {
   const { wallets } = useWallets();
   const { script } = useScript(bot?.scriptId || '');
   const { schema } = useScriptSchema(bot?.scriptId || '');
+  const { data: overview } = useOverview();
+  const allocation = overview?.bots.find((a) => a.botId === id);
+  const halt = overview?.halts.bots.find((h) => h.botId === id);
 
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const [isEditing, setIsEditing] = useState(false);
@@ -155,7 +166,8 @@ export function BotDetail() {
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: 'overview', label: 'Overview' },
     { id: 'config', label: 'Config' },
-    { id: 'script', label: 'Script' },
+    { id: 'code', label: 'Code' },
+    { id: 'orders', label: 'Orders' },
     { id: 'logs', label: 'Logs' },
     { id: 'trades', label: 'Trades' },
   ];
@@ -163,14 +175,16 @@ export function BotDetail() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
           <Link to="/bots" className="text-sm text-gray-500 hover:text-gray-300">← Back to Bots</Link>
           <h2 className="mt-2 text-2xl font-bold text-white">{bot.name}</h2>
           <p className="mt-1 text-sm text-gray-400">{bot.scriptName || bot.scriptId}</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <StatusBadge status={bot.status} />
+          <StageBadge stage={bot.stage} />
+          {halt && <Badge tone="red" title={halt.reason ?? undefined}>halted</Badge>}
           {bot.mode === 'paper' && (
             <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-500/15 text-amber-400 border border-amber-500/30">
               PAPER
@@ -194,25 +208,76 @@ export function BotDetail() {
       )}
 
       {/* Tabs */}
-      <div className="flex gap-1 border-b border-[#2a2a2a]">
-        {tabs.map((tab) => (
-          <button key={tab.id} onClick={() => setActiveTab(tab.id)}
-            className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
-              activeTab === tab.id
-                ? 'border-accent text-accent'
-                : 'border-transparent text-gray-400 hover:text-gray-200'
-            }`}>
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      <Tabs<Tab> tabs={tabs} active={activeTab} onChange={setActiveTab} />
 
       {/* Tab content */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          {halt && (
+            <div className="bg-red-500/10 border border-red-500/40 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-red-300">This bot is halted</p>
+                <p className="text-sm text-red-200/80 break-words">
+                  {halt.reason ?? 'no reason recorded'} · {dateTime(halt.haltedAt)}
+                </p>
+              </div>
+              <ClearHaltButton scope={bot.id} />
+            </div>
+          )}
+          {overview?.halts.global.halted && <Notice tone="red">Global halt active: no bot can start ({overview.halts.global.reason}).</Notice>}
+          {bot.stage === 'retired' && <Notice tone="yellow">Retired{bot.retireReason ? `: ${bot.retireReason}` : ''}. Retired bots never trade again.</Notice>}
+          <div className="bg-surface border border-[#2a2a2a] rounded-xl p-4 sm:p-6">
+            <h3 className="text-lg font-medium text-white mb-4">Risk & ramp</h3>
+            <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-sm">
+              <div>
+                <dt className="text-gray-400">Stage</dt>
+                <dd className="mt-1 text-gray-100">
+                  <StageBadge stage={bot.stage} /> <span className="text-xs text-gray-500">since {dateTime(bot.stageChangedAt ?? bot.createdAt)}</span>
+                </dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Created by</dt>
+                <dd className="mt-1 text-gray-100">{bot.createdBy ?? 'human'}</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Allocation used / available</dt>
+                <dd className="mt-1 text-gray-100 tabular-nums">
+                  {allocation ? (
+                    <>
+                      {usd(allocation.usedUsd)} / {allocation.availableUsd === null ? '—' : usd(allocation.availableUsd)}{' '}
+                      <span className="text-xs text-gray-500">
+                        of {usd(allocation.allocationUsd)}
+                        {allocation.simulated ? ' (paper)' : ''}
+                        {bot.allocationUsd != null ? ` · override ${usd(bot.allocationUsd)}` : ''}
+                      </span>
+                    </>
+                  ) : (
+                    '—'
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Script revision</dt>
+                <dd className="mt-1 text-gray-100">
+                  r{bot.scriptRevision ?? '?'} {bot.scriptTrust && <Badge tone={bot.scriptTrust === 'proven' ? 'green' : 'gray'}>{bot.scriptTrust}</Badge>}
+                  {bot.templateVersion != null && bot.templateVersion !== bot.scriptRevision && <span className="block text-xs text-gray-500">created on r{bot.templateVersion}</span>}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Market scope</dt>
+                <dd className="mt-1 text-gray-100 break-all">
+                  {bot.marketIds == null ? 'unscoped' : bot.marketIds.length === 0 ? 'none (cannot trade)' : bot.marketIds.map((m) => shortId(m)).join(', ')}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Strategy</dt>
+                <dd className="mt-1 text-gray-100">{bot.strategy ?? '—'}</dd>
+              </div>
+            </dl>
+          </div>
           {/* Portfolio Stats */}
           {stats && (
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="bg-surface border border-[#2a2a2a] rounded-xl p-4">
                 <dt className="text-xs font-medium text-gray-500 uppercase">Cash Balance</dt>
                 <dd className="mt-1 text-xl font-semibold text-white">
@@ -451,25 +516,9 @@ export function BotDetail() {
         </div>
       )}
 
-      {activeTab === 'script' && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-gray-400">
-              {script?.isTemplate ? 'Template script (read-only)' : 'Custom script'}
-              {script && (
-                <Link to={`/scripts/${script.id}`} className="ml-2 text-accent hover:text-accent-hover">
-                  Open in editor →
-                </Link>
-              )}
-            </p>
-          </div>
-          <ScriptEditor
-            value={script?.source || '// Script source not available'}
-            readOnly
-            height="calc(100vh - 320px)"
-          />
-        </div>
-      )}
+      {activeTab === 'code' && <CodeTab bot={bot} isTemplate={!!script?.isTemplate} />}
+
+      {activeTab === 'orders' && <OrdersTab botId={bot.id} />}
 
       {activeTab === 'logs' && (
         <div className="bg-[#111] border border-[#2a2a2a] rounded-xl overflow-hidden">
@@ -516,5 +565,195 @@ export function BotDetail() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Read-only source of a script version and its diff against the previous version (spec §12 code view) */
+function CodeTab({ bot, isTemplate }: { bot: Bot; isTemplate: boolean }) {
+  const { data: versions = [], error } = useQuery({ queryKey: ['scriptVersions', bot.scriptId], queryFn: async () => (await scriptApi.versions(bot.scriptId)) as ScriptVersionInfo[] });
+  const [picked, setPicked] = useState<number | null>(null);
+  const [view, setView] = useState<'source' | 'diff'>('source');
+  const selected = picked ?? bot.scriptRevision ?? versions[0]?.version ?? null;
+  const prev = versions.filter((v) => selected !== null && v.version < selected).sort((a, b) => b.version - a.version)[0] ?? null;
+  const src = useQuery({
+    queryKey: ['scriptVersion', bot.scriptId, selected],
+    enabled: selected !== null,
+    queryFn: async () => (await scriptApi.version(bot.scriptId, selected!)) as { source: string },
+  });
+  const prevSrc = useQuery({
+    queryKey: ['scriptVersion', bot.scriptId, prev?.version],
+    enabled: view === 'diff' && prev !== null,
+    queryFn: async () => (await scriptApi.version(bot.scriptId, prev!.version)) as { source: string },
+  });
+  const info = versions.find((v) => v.version === selected);
+  return (
+    <div className="space-y-4">
+      <ErrorBox>{error ? errorMessage(error) : src.error ? errorMessage(src.error) : null}</ErrorBox>
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="text-sm text-gray-400">
+          Version{' '}
+          <select className="ml-1 px-2 py-1.5 rounded-lg bg-[#111] border border-[#333] text-sm" value={selected ?? ''} onChange={(e) => setPicked(Number(e.target.value))}>
+            {versions.map((v) => (
+              <option key={v.version} value={v.version}>
+                r{v.version} · {new Date(v.createdAt).toLocaleDateString()} · {v.createdBy}
+                {v.version === bot.scriptRevision ? ' (runs)' : ''}
+                {v.version === bot.templateVersion ? ' (created on)' : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="inline-flex rounded-lg border border-[#333] overflow-hidden text-xs">
+          {(['source', 'diff'] as const).map((m) => (
+            <button key={m} type="button" onClick={() => setView(m)} className={`px-3 py-1.5 ${view === m ? 'bg-accent text-white' : 'text-gray-400 hover:text-gray-200'}`}>
+              {m === 'source' ? 'Source' : 'Diff vs previous'}
+            </button>
+          ))}
+        </div>
+        <Link to={`/scripts/${bot.scriptId}`} className="text-sm text-accent hover:text-accent-hover">
+          {isTemplate ? 'Open template →' : 'Open in editor →'}
+        </Link>
+      </div>
+      <p className="text-xs text-gray-500">
+        A started bot runs the script’s latest revision (r{bot.scriptRevision ?? '?'}); any source change demotes its bots to paper.
+        {info ? ` Hash ${info.sourceHash.slice(0, 12)}.` : ''}
+      </p>
+      {view === 'source' ? (
+        <ScriptEditor value={src.data?.source ?? '// loading…'} readOnly height="calc(100vh - 360px)" />
+      ) : prev === null ? (
+        <Empty>This is the first version: nothing to compare.</Empty>
+      ) : src.data && prevSrc.data ? (
+        <DiffView before={prevSrc.data.source} after={src.data.source} beforeLabel={`r${prev.version}`} afterLabel={`r${selected}`} />
+      ) : (
+        <p className="text-sm text-gray-500">Loading…</p>
+      )}
+    </div>
+  );
+}
+
+const ORDER_TONE: Record<string, 'green' | 'red' | 'yellow' | 'gray' | 'blue'> = {
+  filled: 'green',
+  partially_filled: 'blue',
+  open: 'blue',
+  submitted: 'yellow',
+  rejected_risk: 'red',
+  failed: 'red',
+  cancelled: 'gray',
+  expired: 'gray',
+};
+
+/** Order attempts including risk rejections, and the ledger forecasts they traded on */
+function OrdersTab({ botId }: { botId: string }) {
+  const { data: orders = [], error, isFetching } = useQuery({
+    queryKey: ['botOrders', botId],
+    queryFn: async () => (await botApi.getOrders(botId, 300)) as BotOrder[],
+    refetchInterval: 15_000,
+  });
+  const [onlyRejected, setOnlyRejected] = useState(false);
+  const [forecastId, setForecastId] = useState<string | null>(null);
+  const shown = onlyRejected ? orders.filter((o) => o.status === 'rejected_risk' || o.status === 'failed') : orders;
+  const forecastIds = [...new Set(orders.map((o) => o.forecastId).filter((x): x is string => !!x))];
+  return (
+    <div className="space-y-6">
+      <div className="bg-surface border border-[#2a2a2a] rounded-xl p-4 sm:p-6">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <h3 className="text-lg font-medium text-white">Orders{isFetching ? ' …' : ''}</h3>
+          <label className="flex items-center gap-2 text-sm text-gray-400">
+            <input type="checkbox" checked={onlyRejected} onChange={(e) => setOnlyRejected(e.target.checked)} /> rejections and failures only
+          </label>
+        </div>
+        <ErrorBox>{error ? errorMessage(error) : null}</ErrorBox>
+        {shown.length === 0 ? (
+          <Empty>No orders.</Empty>
+        ) : (
+          <div className="overflow-x-auto -mx-4 sm:mx-0">
+            <table className="min-w-full divide-y divide-[#2a2a2a]">
+              <thead>
+                <tr>
+                  <th className={thCls}>Time</th>
+                  <th className={thCls}>Order</th>
+                  <th className={thCls}>Price × size</th>
+                  <th className={thCls}>Status</th>
+                  <th className={thCls}>Filled</th>
+                  <th className={thCls}>Why</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#2a2a2a]">
+                {shown.map((o) => (
+                  <tr key={o.id}>
+                    <td className={`${tdCls} whitespace-nowrap text-xs text-gray-400`}>{dateTime(o.createdAt)}</td>
+                    <td className={tdCls}>
+                      <span className={o.side === 'buy' ? 'text-green-400' : 'text-red-400'}>{o.side}</span> {o.orderType}
+                      {o.simulated && <span className="ml-1 text-xs text-amber-400">paper</span>}
+                      <span className="block font-mono text-xs text-gray-500" title={o.tokenId}>
+                        {o.exchange} {shortId(o.tokenId)}
+                      </span>
+                    </td>
+                    <td className={`${tdCls} tabular-nums whitespace-nowrap`}>
+                      {o.price} × {o.size.toFixed(2)}
+                      <span className="block text-xs text-gray-500">{usd(o.notionalUsd)}</span>
+                    </td>
+                    <td className={tdCls}>
+                      <Badge tone={ORDER_TONE[o.status] ?? 'gray'}>{o.status}</Badge>
+                    </td>
+                    <td className={`${tdCls} tabular-nums whitespace-nowrap`}>
+                      {o.filledSize > 0 ? `${o.filledSize.toFixed(2)} @ ${o.avgFillPrice ?? '?'}` : '—'}
+                      {o.feeUsd > 0 && <span className="block text-xs text-gray-500">fee {usd(o.feeUsd)}</span>}
+                    </td>
+                    <td className={`${tdCls} text-xs max-w-xs`}>
+                      {o.failedCheck && (
+                        <p>
+                          <Badge tone="red">{o.failedCheck}</Badge> <span className="text-red-300 break-words">{o.riskReason}</span>
+                        </p>
+                      )}
+                      {o.reason && <p className="text-gray-400 break-words">{o.reason}</p>}
+                      {o.forecastId && (
+                        <button type="button" className="text-accent hover:text-accent-hover" onClick={() => setForecastId(o.forecastId)}>
+                          forecast {shortId(o.forecastId, 4)}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div className="bg-surface border border-[#2a2a2a] rounded-xl p-4 sm:p-6">
+        <h3 className="text-lg font-medium text-white mb-3">Linked forecasts</h3>
+        {forecastIds.length === 0 ? (
+          <Empty>No order of this bot traded on a ledger forecast.</Empty>
+        ) : (
+          <ul className="divide-y divide-[#2a2a2a]">
+            {forecastIds.map((fid) => (
+              <LinkedForecast key={fid} id={fid} onOpen={() => setForecastId(fid)} />
+            ))}
+          </ul>
+        )}
+      </div>
+      {forecastId && <ForecastDetail id={forecastId} onClose={() => setForecastId(null)} />}
+    </div>
+  );
+}
+
+function LinkedForecast({ id, onOpen }: { id: string; onOpen: () => void }) {
+  const { data: f, error } = useQuery({ queryKey: ['forecast', id], queryFn: async () => (await ledgerApi.get(id)) as Forecast });
+  return (
+    <li className="py-2 text-sm flex flex-wrap items-center gap-2">
+      <button type="button" className="text-accent hover:text-accent-hover font-mono text-xs" onClick={onOpen}>
+        {shortId(id, 6)}
+      </button>
+      {error && <span className="text-red-400">{errorMessage(error)}</span>}
+      {f && (
+        <>
+          <span className="text-gray-300">
+            {f.category} · {f.horizonBucket}
+          </span>
+          <span className="text-gray-400">p {pct(f.probability)} vs mid {pct(f.marketPriceAtForecast)}</span>
+          <Badge>{f.status}</Badge>
+          {f.skill !== null && <span className={f.skill >= 0 ? 'text-green-400' : 'text-red-400'}>skill {f.skill.toFixed(3)}</span>}
+        </>
+      )}
+    </li>
   );
 }

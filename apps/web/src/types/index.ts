@@ -12,6 +12,18 @@ export interface Bot {
   status: BotStatus;
   enabled: boolean;
   mode: 'live' | 'paper';
+  /** Ramp stage (spec §4.5) */
+  stage?: 'paper' | 'probation' | 'full' | 'retired' | string;
+  createdBy?: string;
+  allocationUsd?: number | null;
+  retireReason?: string | null;
+  pausedBy?: string | null;
+  strategy?: string | null;
+  marketIds?: string[] | null;
+  templateVersion?: number | null;
+  scriptRevision?: number | null;
+  scriptTrust?: string | null;
+  stageChangedAt?: string | null;
   lastStartedAt?: string | null;
   lastStoppedAt?: string | null;
   lastHeartbeat?: string | null;
@@ -30,6 +42,9 @@ export interface Script {
   source: string;
   configSchema: Record<string, unknown>;
   isTemplate: boolean;
+  origin?: string;
+  revision?: number;
+  trust?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -161,3 +176,5 @@ export interface ApiResponse<T = unknown> {
   data?: T;
   error?: string;
 }
+
+export * from './risk';

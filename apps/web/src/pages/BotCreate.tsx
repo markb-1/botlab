@@ -4,6 +4,7 @@ import { useBots } from '../hooks/useBots';
 import { useScripts, useScriptSchema } from '../hooks/useScripts';
 import { useWallets } from '../hooks/useWallets';
 import type { Script } from '../types';
+import { useOverview } from '../hooks/useRisk';
 
 // Trader entry with address and nickname
 interface TraderEntry {
@@ -24,6 +25,10 @@ export function BotCreate() {
   const [walletId, setWalletId] = useState('');
   const [config, setConfig] = useState<Record<string, unknown>>({});
   const [mode, setMode] = useState<'live' | 'paper'>('paper');
+  const { data: overview } = useOverview();
+  /** live_trading.enabled is false (or the config is invalid): live bots could not start */
+  const liveDisabled = overview ? overview.liveTradingEnabled !== true : false;
+  const effectiveMode: 'live' | 'paper' = liveDisabled ? 'paper' : mode;
   const [paperBalance, setPaperBalance] = useState(10000);
   const [error, setError] = useState<string | null>(null);
 
@@ -96,16 +101,16 @@ export function BotCreate() {
 
     if (!name.trim()) { setError('Name is required'); return; }
     if (!scriptId) { setError('Script is required'); return; }
-    if (mode === 'live' && !walletId) { setError('Wallet is required'); return; }
+    if (effectiveMode === 'live' && !walletId) { setError('Wallet is required'); return; }
 
     try {
-      const finalConfig = mode === 'paper' ? { ...config, paperBalance } : config;
+      const finalConfig = effectiveMode === 'paper' ? { ...config, paperBalance } : config;
       await createBot({
         scriptId,
         name: name.trim(),
-        walletId: mode === 'paper' ? undefined : walletId,
+        walletId: effectiveMode === 'paper' ? undefined : walletId,
         config: finalConfig,
-        mode,
+        mode: effectiveMode,
       });
       navigate('/bots');
     } catch (err: any) {
@@ -368,9 +373,10 @@ export function BotCreate() {
           <div>
             <label className="block text-sm font-medium text-gray-300 mb-2">Mode</label>
             <div className="flex gap-2">
-              <button type="button" onClick={() => setMode('live')}
-                className={`flex-1 px-4 py-2.5 rounded-lg text-sm font-medium border transition-colors ${
-                  mode === 'live'
+              <button type="button" onClick={() => setMode('live')} disabled={liveDisabled}
+                title={liveDisabled ? 'Live trading is disabled in limits.yaml (live_trading.enabled: false)' : undefined}
+                className={`flex-1 px-4 py-2.5 rounded-lg text-sm font-medium border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                  effectiveMode === 'live'
                     ? 'bg-accent/15 border-accent text-accent'
                     : 'bg-[#111] border-[#2a2a2a] text-gray-400 hover:border-[#444]'
                 }`}>
@@ -378,7 +384,7 @@ export function BotCreate() {
               </button>
               <button type="button" onClick={() => setMode('paper')}
                 className={`flex-1 px-4 py-2.5 rounded-lg text-sm font-medium border transition-colors ${
-                  mode === 'paper'
+                  effectiveMode === 'paper'
                     ? 'bg-amber-500/15 border-amber-500 text-amber-400'
                     : 'bg-[#111] border-[#2a2a2a] text-gray-400 hover:border-[#444]'
                 }`}>
@@ -386,14 +392,25 @@ export function BotCreate() {
               </button>
             </div>
             <p className="text-xs text-gray-500 mt-1.5">
-              {mode === 'paper'
+              {effectiveMode === 'paper'
                 ? 'Simulates trades with virtual funds using real market data. A wallet is auto-generated.'
                 : 'Executes real trades on Polymarket.'}
             </p>
+            {liveDisabled && (
+              <p className="text-xs text-yellow-400 mt-1.5">
+                Live trading is disabled (<code>live_trading.enabled: false</code> in limits.yaml, Risk page). New bots are paper bots.
+              </p>
+            )}
+            {mode === 'live' && !liveDisabled && (
+              <div className="mt-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs text-red-200">
+                <strong>Real money.</strong> The bot trades the selected wallet’s funds within the risk limits. Bots on a new script still start in the paper stage and must
+                earn probation through the ramp; check the limits and the mandate on the Risk page first.
+              </div>
+            )}
           </div>
 
           {/* Paper balance */}
-          {mode === 'paper' && (
+          {effectiveMode === 'paper' && (
             <div>
               <label className="block text-sm font-medium text-gray-300">Starting Balance (USDC)</label>
               <input type="number" value={paperBalance}
@@ -405,7 +422,7 @@ export function BotCreate() {
           )}
 
           {/* Wallet selector (live mode only) */}
-          {mode === 'live' && (
+          {effectiveMode === 'live' && (
             <div>
               <label className="block text-sm font-medium text-gray-300">Wallet</label>
               {walletsLoading ? (
@@ -441,7 +458,7 @@ export function BotCreate() {
             className="px-4 py-2 border border-[#333] rounded-xl text-sm font-medium text-gray-300 hover:bg-surface-light">
             Cancel
           </button>
-          <button type="submit" disabled={isCreating || !name || !scriptId || (mode === 'live' && !walletId)}
+          <button type="submit" disabled={isCreating || !name || !scriptId || (effectiveMode === 'live' && !walletId)}
             className="px-4 py-2 border border-transparent rounded-xl shadow-sm text-sm font-medium text-white bg-accent hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed">
             {isCreating ? 'Creating...' : 'Create Bot'}
           </button>

@@ -3,7 +3,11 @@ import { Link } from 'react-router-dom';
 import { useBots, useDashboardStats } from '../hooks/useBots';
 import { useWallets } from '../hooks/useWallets';
 import { useSettings } from '../hooks/useSettings';
-import type { Bot } from '../types';
+import type { Bot, Overview } from '../types';
+import { useOverview } from '../hooks/useRisk';
+import { HaltBanner, KillSwitchButton } from '../components/HaltControls';
+import { Badge, Card, LimitBar, Notice, PageHeader, RightsBadge, StageBadge } from '../components/ui';
+import { dateTime, pct, relTime, signedUsd, usd } from '../lib/format';
 
 function StatusBadge({ status }: { status: Bot['status'] }) {
   const colors = {
@@ -14,11 +18,7 @@ function StatusBadge({ status }: { status: Bot['status'] }) {
     error: 'bg-red-500/10 text-red-400',
   };
 
-  return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colors[status]}`}>
-      {status}
-    </span>
-  );
+  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colors[status]}`}>{status}</span>;
 }
 
 export function Dashboard() {
@@ -27,6 +27,9 @@ export function Dashboard() {
   const { statsMap, isLoading: statsLoading } = useDashboardStats();
   const { wallets, isLoading: walletsLoading } = useWallets();
   const { settings, isLoading: settingsLoading } = useSettings();
+  const { data: overview, error: overviewQueryError } = useOverview();
+  const overviewError = overviewQueryError ? (overviewQueryError as Error).message : null;
+  const allocationOf = new Map((overview?.bots ?? []).map((a) => [a.botId, a]));
 
   const runningBots = bots.filter((b) => b.status === 'running');
   const stoppedBots = bots.filter((b) => b.status === 'stopped');
@@ -51,12 +54,9 @@ export function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold text-white">Dashboard</h2>
-        <p className="mt-1 text-sm text-gray-400">
-          Overview of your multi-bot trading system
-        </p>
-      </div>
+      <PageHeader title="Dashboard" subtitle="Risk, halts and bots at a glance" actions={<KillSwitchButton />} />
+
+      <RiskSummary overview={overview} error={overviewError} />
 
       {/* Setup Warning */}
       {!settingsLoading && (!settings?.rpcUrl || settings.rpcUrl === '') && (
@@ -64,14 +64,16 @@ export function Dashboard() {
           <div className="flex">
             <div className="flex-shrink-0">
               <svg className="h-5 w-5 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                <path
+                  fillRule="evenodd"
+                  d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z"
+                  clipRule="evenodd"
+                />
               </svg>
             </div>
             <div className="ml-3">
               <h3 className="text-sm font-medium text-yellow-300">Setup Required</h3>
-              <p className="mt-1 text-sm text-yellow-300/80">
-                Please configure your RPC URL and other settings before starting bots.
-              </p>
+              <p className="mt-1 text-sm text-yellow-300/80">Please configure your RPC URL and other settings before starting bots.</p>
               <Link to="/settings" className="mt-2 inline-block text-sm font-medium text-accent hover:text-accent-hover">
                 Go to Settings →
               </Link>
@@ -81,12 +83,10 @@ export function Dashboard() {
       )}
 
       {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
         <div className="bg-surface border border-[#2a2a2a] rounded-xl p-6">
           <h3 className="text-sm font-medium text-gray-400">Total Bots</h3>
-          <p className="mt-2 text-3xl font-semibold text-white">
-            {botsLoading ? '...' : bots.length}
-          </p>
+          <p className="mt-2 text-3xl font-semibold text-white">{botsLoading ? '...' : bots.length}</p>
           <Link to="/bots" className="mt-2 text-sm text-accent hover:text-accent-hover">
             Manage bots →
           </Link>
@@ -94,9 +94,7 @@ export function Dashboard() {
 
         <div className="bg-surface border border-[#2a2a2a] rounded-xl p-6">
           <h3 className="text-sm font-medium text-gray-400">Running</h3>
-          <p className="mt-2 text-3xl font-semibold text-green-400">
-            {botsLoading ? '...' : runningBots.length}
-          </p>
+          <p className="mt-2 text-3xl font-semibold text-green-400">{botsLoading ? '...' : runningBots.length}</p>
           <p className="mt-1 text-sm text-gray-500">
             {stoppedBots.length} stopped, {errorBots.length} errors
           </p>
@@ -104,12 +102,8 @@ export function Dashboard() {
 
         <div className="bg-surface border border-[#2a2a2a] rounded-xl p-6">
           <h3 className="text-sm font-medium text-gray-400">Wallets</h3>
-          <p className="mt-2 text-3xl font-semibold text-white">
-            {walletsLoading ? '...' : wallets.length}
-          </p>
-          <p className="mt-1 text-sm text-gray-500">
-            {availableWallets.length} available
-          </p>
+          <p className="mt-2 text-3xl font-semibold text-white">{walletsLoading ? '...' : wallets.length}</p>
+          <p className="mt-1 text-sm text-gray-500">{availableWallets.length} available</p>
           <Link to="/wallets" className="mt-2 text-sm text-accent hover:text-accent-hover">
             Manage wallets →
           </Link>
@@ -117,9 +111,7 @@ export function Dashboard() {
 
         <div className="bg-surface border border-[#2a2a2a] rounded-xl p-6">
           <h3 className="text-sm font-medium text-gray-400">Settings</h3>
-          <p className="mt-2 text-xl font-semibold text-white">
-            {settingsLoading ? '...' : settings?.rpcUrl ? 'Configured' : 'Not Set'}
-          </p>
+          <p className="mt-2 text-xl font-semibold text-white">{settingsLoading ? '...' : settings?.rpcUrl ? 'Configured' : 'Not Set'}</p>
           <Link to="/settings" className="mt-2 text-sm text-accent hover:text-accent-hover">
             View settings →
           </Link>
@@ -171,9 +163,7 @@ export function Dashboard() {
                         <button
                           onClick={() => setPnlPeriod('all')}
                           className={`px-1.5 py-0.5 text-[10px] font-medium rounded-l-md transition-colors ${
-                            pnlPeriod === 'all'
-                              ? 'bg-accent text-white'
-                              : 'text-gray-500 hover:text-gray-300'
+                            pnlPeriod === 'all' ? 'bg-accent text-white' : 'text-gray-500 hover:text-gray-300'
                           }`}
                         >
                           All
@@ -181,9 +171,7 @@ export function Dashboard() {
                         <button
                           onClick={() => setPnlPeriod('24h')}
                           className={`px-1.5 py-0.5 text-[10px] font-medium rounded-r-md transition-colors ${
-                            pnlPeriod === '24h'
-                              ? 'bg-accent text-white'
-                              : 'text-gray-500 hover:text-gray-300'
+                            pnlPeriod === '24h' ? 'bg-accent text-white' : 'text-gray-500 hover:text-gray-300'
                           }`}
                         >
                           24h
@@ -201,18 +189,20 @@ export function Dashboard() {
               <tbody className="bg-surface divide-y divide-[#2a2a2a]">
                 {bots.map((bot) => {
                   const botStats = statsMap.get(bot.id);
-                  const pnlValue = botStats
-                    ? pnlPeriod === 'all' ? botStats.pnlAllTime : botStats.pnl24h
-                    : null;
+                  const pnlValue = botStats ? (pnlPeriod === 'all' ? botStats.pnlAllTime : botStats.pnl24h) : null;
                   return (
                     <tr key={bot.id} className="hover:bg-surface-light">
                       <td className="px-6 py-4 whitespace-nowrap">
                         <Link to={`/bots/${bot.id}`} className="text-sm font-medium text-accent hover:text-accent-hover">
                           {bot.name}
                         </Link>
-                        {bot.mode === 'paper' && (
-                          <span className="ml-2 text-xs bg-yellow-500/10 text-yellow-400 px-1.5 py-0.5 rounded">
-                            PAPER
+                        {bot.mode === 'paper' && <span className="ml-2 text-xs bg-yellow-500/10 text-yellow-400 px-1.5 py-0.5 rounded">PAPER</span>}
+                        <span className="ml-2">
+                          <StageBadge stage={bot.stage} />
+                        </span>
+                        {allocationOf.get(bot.id)?.allocationUsd != null && (
+                          <span className="block text-xs text-gray-500 mt-0.5">
+                            {usd(allocationOf.get(bot.id)!.usedUsd, 0)} of {usd(allocationOf.get(bot.id)!.allocationUsd, 0)} allocation
                           </span>
                         )}
                       </td>
@@ -234,9 +224,7 @@ export function Dashboard() {
                         {statsLoading ? (
                           <span className="text-gray-500">...</span>
                         ) : botStats ? (
-                          <span className="text-white font-medium">
-                            ${botStats.totalValue.toFixed(2)}
-                          </span>
+                          <span className="text-white font-medium">${botStats.totalValue.toFixed(2)}</span>
                         ) : (
                           <span className="text-gray-500">—</span>
                         )}
@@ -250,33 +238,20 @@ export function Dashboard() {
                           <span className="text-gray-500">—</span>
                         )}
                       </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">{bot.scriptName || bot.scriptId}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
-                        {bot.scriptName || bot.scriptId}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
-                        {bot.lastHeartbeat
-                          ? new Date(bot.lastHeartbeat).toLocaleString()
-                          : 'Never'}
+                        {bot.lastHeartbeat ? new Date(bot.lastHeartbeat).toLocaleString() : 'Never'}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm space-x-3">
-                        <Link
-                          to={`/bots/${bot.id}/trades`}
-                          className="text-accent hover:text-accent-hover font-medium"
-                        >
+                        <Link to={`/bots/${bot.id}/trades`} className="text-accent hover:text-accent-hover font-medium">
                           Trades
                         </Link>
                         {bot.status === 'stopped' || bot.status === 'error' ? (
-                          <button
-                            onClick={() => handleStartBot(bot.id)}
-                            className="text-green-400 hover:text-green-300 font-medium"
-                          >
+                          <button onClick={() => handleStartBot(bot.id)} className="text-green-400 hover:text-green-300 font-medium">
                             Start
                           </button>
                         ) : bot.status === 'running' ? (
-                          <button
-                            onClick={() => handleStopBot(bot.id)}
-                            className="text-red-400 hover:text-red-300 font-medium"
-                          >
+                          <button onClick={() => handleStopBot(bot.id)} className="text-red-400 hover:text-red-300 font-medium">
                             Stop
                           </button>
                         ) : (
@@ -301,16 +276,9 @@ export function Dashboard() {
               <div key={bot.id} className="flex items-center justify-between">
                 <div>
                   <p className="font-medium text-red-300">{bot.name}</p>
-                  {bot.errorLogs.length > 0 && (
-                    <p className="text-sm text-red-400">
-                      {bot.errorLogs[bot.errorLogs.length - 1].message}
-                    </p>
-                  )}
+                  {bot.errorLogs.length > 0 && <p className="text-sm text-red-400">{bot.errorLogs[bot.errorLogs.length - 1].message}</p>}
                 </div>
-                <Link
-                  to={`/bots/${bot.id}`}
-                  className="text-sm text-red-400 hover:text-red-300 font-medium"
-                >
+                <Link to={`/bots/${bot.id}`} className="text-sm text-red-400 hover:text-red-300 font-medium">
                   View Details →
                 </Link>
               </div>
@@ -318,6 +286,169 @@ export function Dashboard() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function StatusDot({ ok, warn }: { ok: boolean; warn?: boolean }) {
+  return <span className={`inline-block w-2 h-2 rounded-full ${ok ? 'bg-green-500' : warn ? 'bg-yellow-500' : 'bg-red-500'}`} />;
+}
+
+/** Equity, exposure vs limits, daily P&L vs loss limit, halts, reconciler/clock, category rights (spec §12) */
+function RiskSummary({ overview, error }: { overview: Overview | undefined; error: string | null }) {
+  if (error) return <Notice tone="red">Risk overview unavailable: {error}</Notice>;
+  if (!overview) return <p className="text-sm text-gray-500">Loading risk overview…</p>;
+  const o = overview;
+  const loss = o.dailyPnl;
+  return (
+    <div className="space-y-4">
+      {!o.config.valid && (
+        <Notice tone="red">
+          <strong>Config is invalid</strong> — no bot can start until it is fixed (Risk page): {o.config.error}
+        </Notice>
+      )}
+      <HaltBanner global={o.halts.global} bots={o.halts.bots} />
+      {o.liveTradingEnabled === false && (
+        <Notice tone="yellow">
+          <strong>Live trading is disabled</strong> (<code>limits.yaml live_trading.enabled: false</code>). Paper bots run normally; live bots cannot start and
+          live orders are rejected. Enable it on the{' '}
+          <Link to="/risk" className="underline">
+            Risk page
+          </Link>{' '}
+          when you are ready.
+        </Notice>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Card title="Equity">
+          <p className="text-3xl font-semibold text-white tabular-nums">{usd(o.equity.usd)}</p>
+          <p className="mt-1 text-sm text-gray-400">
+            cash {usd(o.equity.cashUsd)} + live positions at cost {usd(o.equity.positionsUsd)}
+          </p>
+          {o.equity.error && <p className="mt-1 text-xs text-yellow-400 break-words">Balance unavailable: {o.equity.error}</p>}
+          <p className="mt-1 text-xs text-gray-500">Cash of the wallets live bots use (+ Binance USDT); refreshed every 30 s.</p>
+        </Card>
+
+        <Card title="Exposure (live)">
+          <div className="space-y-4">
+            <LimitBar
+              label="Total"
+              value={o.exposure.totalUsd}
+              limit={o.exposure.totalLimitUsd}
+              format={(n) => usd(n, 0)}
+              hint={
+                o.equity.usd === null
+                  ? `Equity unknown: showing the USD cap only`
+                  : `Lower of ${usd(o.exposure.totalCapUsd, 0)} and ${pct(o.exposure.totalCapPct)} of equity`
+              }
+            />
+            <LimitBar
+              label="Long horizon (> 30 days)"
+              value={o.exposure.longHorizonUsd}
+              limit={o.exposure.longHorizonLimitUsd}
+              format={(n) => usd(n, 0)}
+              hint={
+                o.exposure.longHorizonUnknownUsd > 0
+                  ? `${usd(o.exposure.longHorizonUnknownUsd, 0)} counted long because the end date is unknown`
+                  : `${pct(o.exposure.longHorizonPct)} of equity`
+              }
+            />
+            <LimitBar label="Open orders" value={o.exposure.openOrders} limit={o.exposure.maxOpenOrders} format={(n) => (n === null ? '—' : String(n))} />
+          </div>
+        </Card>
+
+        <Card title="Daily P&L (UTC day)">
+          <p className={`text-3xl font-semibold tabular-nums ${(loss.liveUsd ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>{signedUsd(loss.liveUsd)}</p>
+          <p className="mt-1 text-sm text-gray-400">paper {signedUsd(loss.paperUsd)}</p>
+          <div className="mt-3">
+            <LimitBar
+              label="Loss vs daily limit"
+              value={loss.lossUsd}
+              limit={loss.limitUsd}
+              format={(n) => usd(n, 0)}
+              hint={loss.baselineUsd !== null ? `Counted from ${signedUsd(loss.baselineUsd)} (halt cleared today)` : `Updated ${relTime(loss.updatedAt)}`}
+            />
+          </div>
+        </Card>
+
+        <Card title="Reconciler & clock">
+          <ul className="space-y-2 text-sm">
+            <li className="flex items-center gap-2">
+              <StatusDot ok={!o.reconciler.stale} warn={o.reconciler.locked} />
+              <span className="text-gray-300">
+                {o.reconciler.locked
+                  ? 'Not running (server locked)'
+                  : o.reconciler.reconciledAt
+                    ? `Last full run ${relTime(o.reconciler.reconciledAt)}`
+                    : 'No complete run yet'}
+              </span>
+            </li>
+            {o.reconciler.consecutiveFailures > 0 && (
+              <li className="text-xs text-yellow-400 break-words">
+                {o.reconciler.consecutiveFailures} incomplete run(s) in a row{o.reconciler.lastErrors[0] ? `: ${o.reconciler.lastErrors[0]}` : ''}
+              </li>
+            )}
+            <li className="flex items-center gap-2">
+              <StatusDot ok={o.reconciler.mismatches === 0} />
+              <span className="text-gray-300">
+                {o.reconciler.mismatches === 0 ? 'No position mismatches' : `${o.reconciler.mismatches} position mismatch(es)`}
+              </span>
+            </li>
+            <li className="flex items-center gap-2">
+              <StatusDot ok={o.reconciler.clock.ok} />
+              <span className="text-gray-300 break-words">
+                Clock{' '}
+                {o.reconciler.clock.ok && o.reconciler.clock.skewMs === null
+                  ? 'not checked yet (live orders allowed for 3 min after start)'
+                  : o.reconciler.clock.ok
+                    ? 'OK'
+                    : o.reconciler.clock.reason === 'clock_skew'
+                      ? 'skewed — live orders refused'
+                      : o.reconciler.clock.reason === 'clock_unverified'
+                        ? 'unverified — live orders refused'
+                        : 'unknown'}
+                {o.reconciler.clock.skewMs !== null ? ` (${(o.reconciler.clock.skewMs / 1000).toFixed(1)} s)` : ''}
+              </span>
+            </li>
+          </ul>
+          <Link to="/settings" className="mt-3 inline-block text-sm text-accent hover:text-accent-hover">
+            Reconciliation details →
+          </Link>
+        </Card>
+
+        <Card title="Category rights">
+          <div className="flex flex-wrap gap-2">
+            {Object.keys(o.rights.counts).length === 0 ? (
+              <span className="text-sm text-gray-500">No buckets yet: rights appear once forecasts are scored.</span>
+            ) : (
+              Object.entries(o.rights.counts).map(([state, n]) => (
+                <span key={state} className="text-sm text-gray-300">
+                  <RightsBadge state={state} /> {n}
+                </span>
+              ))
+            )}
+          </div>
+          {o.rights.trading.length > 0 && (
+            <ul className="mt-3 space-y-1 text-sm text-gray-300">
+              {o.rights.trading.map((t) => (
+                <li key={`${t.category}|${t.horizonBucket}`}>
+                  {t.category} · {t.horizonBucket} <span className="text-gray-500">up to {usd(t.maxAllocationUsd, 0)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <Link to="/ledger" className="mt-3 inline-block text-sm text-accent hover:text-accent-hover">
+            Ledger →
+          </Link>
+        </Card>
+
+        <Card title="Approvals">
+          <p className="text-sm text-gray-400">
+            New-template live approvals: {o.approvalsNewTemplateLive ? <Badge tone="yellow">required</Badge> : <Badge tone="gray">disabled</Badge>}
+          </p>
+          <p className="mt-2 text-xs text-gray-500">Updated {dateTime(o.at)}</p>
+        </Card>
+      </div>
     </div>
   );
 }

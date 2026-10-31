@@ -144,6 +144,8 @@ export const botApi = {
   getPositions: (botId: string) => call('GET', `/bots/${enc(botId)}/positions`),
   getStats: (botId: string) => call('GET', `/bots/${enc(botId)}/stats`),
   getDashboardStats: () => call('GET', '/dashboard/stats'),
+  /** Order attempts incl. risk rejections, newest first */
+  getOrders: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/orders${qs({ limit })}`),
 };
 
 // ── Wallets ───────────────────────────────────────────────────────────────
@@ -211,6 +213,8 @@ export const scriptApi = {
   getSchema: (id: string) => call('GET', `/scripts/${enc(id)}/schema`),
   compile: (source: string): Promise<{ compiled: boolean; error?: string }> => call('POST', '/scripts/compile', { source }),
   fork: (id: string, newName?: string) => call('POST', `/scripts/${enc(id)}/fork`, { newName }),
+  versions: (id: string) => call('GET', `/scripts/${enc(id)}/versions`),
+  version: (id: string, version: number) => call('GET', `/scripts/${enc(id)}/versions/${version}`),
   /** Downloads the script as a `.botlab` file */
   export: async (id: string): Promise<{ exported: boolean; filePath?: string }> => {
     const { fileName, file } = await call<{ fileName: string; file: unknown }>('GET', `/scripts/${enc(id)}/export`);
@@ -245,12 +249,14 @@ export const backtestApi = {
   delete: (runId: string) => call('DELETE', `/backtests/${enc(runId)}`),
 };
 
-// ── Risk, config, ledger, markets, reconciler (pages in chunk 3c) ─────────
+// ── Risk, config, audit, tokens, ledger, markets, reconciler ─────────────
 
-type ConfigFile = 'limits' | 'mandate' | 'fees' | 'server' | 'categories';
+export type ConfigFile = 'limits' | 'mandate' | 'fees' | 'server' | 'categories';
 
 export const riskApi = {
   getState: () => call('GET', '/risk/state'),
+  /** Equity, exposure vs limits, daily P&L, halts, reconciler, rights, allocations */
+  overview: () => call('GET', '/risk/overview'),
   /** Human only; needs a password check within the last 15 minutes */
   clearHalt: (scope: string, reason: string) => call('POST', '/risk/clear-halt', { scope, reason }),
   killSwitch: (reason: string) => call('POST', '/risk/kill-switch', { reason }),
@@ -261,6 +267,23 @@ export const configApi = {
   write: (file: ConfigFile, value: unknown, expectedSha256?: string) => call('PUT', `/config/${file}`, { value, expectedSha256 }),
   history: (file: ConfigFile) => call('GET', `/config/${file}/history`),
   restore: (file: ConfigFile, versionId: string) => call('POST', `/config/${file}/restore`, { versionId }),
+  schemas: () => call('GET', '/config/schema'),
+  /** Validation + risk classification of an edit; nothing is written */
+  preview: (file: ConfigFile, value: unknown) => call('POST', `/config/${file}/preview`, { value }),
+  versionText: (file: ConfigFile, versionId: string) => call('GET', `/config/${file}/history/${enc(versionId)}`),
+};
+
+export const auditApi = {
+  list: (filter?: { action?: string; actionPrefix?: string; actor?: string; target?: string; since?: string; until?: string; before?: number; limit?: number }) =>
+    call('GET', `/audit${qs(filter)}`),
+  actions: (): Promise<string[]> => call('GET', '/audit/actions'),
+};
+
+export const tokenApi = {
+  list: () => call('GET', '/auth/tokens'),
+  /** Human only (recent password check); the token is returned once */
+  create: (name: string, scope: 'agent' | 'readonly') => call('POST', '/auth/tokens', { name, scope }),
+  revoke: (id: string) => call('DELETE', `/auth/tokens/${enc(id)}`),
 };
 
 export const ledgerApi = {
@@ -268,11 +291,14 @@ export const ledgerApi = {
   withdrawForecast: (id: string, reason: string) => call('POST', `/ledger/forecasts/${enc(id)}/withdraw`, { reason }),
   list: (filter?: { status?: string | string[]; category?: string; horizonBucket?: string; marketId?: string; tokenId?: string; tradeableOnly?: boolean; limit?: number }) =>
     call('GET', `/ledger/forecasts${qs(filter)}`),
+  get: (id: string) => call('GET', `/ledger/forecasts/${enc(id)}`),
   stats: () => call('GET', '/ledger/stats'),
   setRightsState: (category: string, bucket: string, state: string, reason: string) => call('POST', '/ledger/rights', { category, bucket, state, reason }),
 };
 
 export const marketApi = {
+  /** Search cached markets (question, event, slug, market id or token id) */
+  search: (q: string, limit?: number) => call('GET', `/markets${qs({ q, limit })}`),
   get: (marketId: string) => call('GET', `/markets/${enc(marketId)}`),
   setAmbiguity: (marketId: string, score: number, note?: string) => call('POST', `/markets/${enc(marketId)}/ambiguity`, { score, note }),
 };
@@ -280,6 +306,8 @@ export const marketApi = {
 export const reconcileApi = {
   status: () => call('GET', '/reconcile/status'),
   adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => call('POST', '/reconcile/adopt', { walletId, botId, ...opts }),
+  /** What adoption would do now (nothing written) */
+  adoptPreview: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => call('POST', '/reconcile/adopt/preview', { walletId, botId, ...opts }),
   watchlistList: () => call('GET', '/recorder/watchlist'),
   watchlistAdd: (tokenId: string, marketId?: string, note?: string) => call('POST', '/recorder/watchlist', { tokenId, marketId, note }),
   watchlistRemove: (tokenId: string) => call('DELETE', `/recorder/watchlist/${enc(tokenId)}`),

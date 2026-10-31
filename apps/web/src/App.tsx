@@ -12,6 +12,11 @@ import { ScriptNew } from './pages/ScriptNew';
 import { Wallets } from './pages/Wallets';
 import { Settings } from './pages/Settings';
 import { LoginScreen } from './pages/LoginScreen';
+import { Risk } from './pages/Risk';
+import { Ledger } from './pages/Ledger';
+import { Markets } from './pages/Markets';
+import { Audit } from './pages/Audit';
+import { Approvals } from './pages/Approvals';
 import { ReauthDialog } from './components/ReauthDialog';
 import { useAuth } from './hooks/useAuth';
 
@@ -65,6 +70,11 @@ function AppContent() {
             <Route path="/scripts/:id" element={<ScriptEdit />} />
             <Route path="/wallets" element={<Wallets />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/risk" element={<Risk />} />
+            <Route path="/ledger" element={<Ledger />} />
+            <Route path="/markets" element={<Markets />} />
+            <Route path="/audit" element={<Audit />} />
+            <Route path="/approvals" element={<Approvals />} />
           </Routes>
         </Layout>
       </HashRouter>

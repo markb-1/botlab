@@ -1,3 +1,4 @@
+import { PasswordSettings, ReconcileSettings, TelegramSettings, TokenSettings } from '../components/SettingsSections';
 import { useState, useEffect } from 'react';
 import { useSettings } from '../hooks/useSettings';
 
@@ -149,7 +150,7 @@ export function Settings() {
   }
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="max-w-3xl mx-auto space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-white">Settings</h2>
         <p className="mt-1 text-sm text-gray-400">
@@ -396,6 +397,15 @@ export function Settings() {
         </p>
       </div>
 
+      <h3 className="pt-4 text-lg font-semibold text-white">Notifications</h3>
+      <TelegramSettings />
+
+      <h3 className="pt-4 text-lg font-semibold text-white">Access</h3>
+      <PasswordSettings />
+      <TokenSettings />
+
+      <h3 className="pt-4 text-lg font-semibold text-white">Reconciliation</h3>
+      <ReconcileSettings />
     </div>
   );
 }

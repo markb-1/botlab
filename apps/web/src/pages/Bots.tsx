@@ -2,6 +2,9 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useBots } from '../hooks/useBots';
 import type { Bot } from '../types';
+import { useOverview } from '../hooks/useRisk';
+import { Badge, ErrorBox, StageBadge } from '../components/ui';
+import { usd } from '../lib/format';
 
 function StatusBadge({ status }: { status: Bot['status'] }) {
   const colors = {
@@ -23,6 +26,10 @@ export function Bots() {
   const { bots, isLoading, startBot, stopBot, deleteBot } = useBots();
   const [filterType, setFilterType] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [actionError, setActionError] = useState<string | null>(null);
+  const { data: overview } = useOverview();
+  const allocationOf = new Map((overview?.bots ?? []).map((a) => [a.botId, a]));
+  const haltOf = new Map((overview?.halts.bots ?? []).map((h) => [h.botId, h]));
 
   const filteredBots = bots.filter((bot) => {
     if (filterType !== 'all' && bot.scriptName !== filterType) return false;
@@ -33,18 +40,20 @@ export function Bots() {
   const scriptNames = [...new Set(bots.map((b) => b.scriptName).filter(Boolean))];
 
   const handleStartBot = async (id: string) => {
+    setActionError(null);
     try {
       await startBot(id);
     } catch (err) {
-      console.error('Failed to start bot:', err);
+      setActionError(`Could not start the bot: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
   const handleStopBot = async (id: string) => {
+    setActionError(null);
     try {
       await stopBot(id);
     } catch (err) {
-      console.error('Failed to stop bot:', err);
+      setActionError(`Could not stop the bot: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
@@ -111,8 +120,10 @@ export function Bots() {
         </div>
       </div>
 
+      <ErrorBox>{actionError}</ErrorBox>
+
       {/* Bots Table */}
-      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-hidden">
+      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl overflow-x-auto">
         {isLoading ? (
           <div className="p-6 text-center text-gray-500">Loading bots...</div>
         ) : filteredBots.length === 0 ? (
@@ -136,6 +147,8 @@ export function Bots() {
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Script</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Stage</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Allocation used / available</th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Last Activity</th>
                 <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>
               </tr>
@@ -147,6 +160,7 @@ export function Bots() {
                     <Link to={`/bots/${bot.id}`} className="text-sm font-medium text-accent hover:text-accent-hover">
                       {bot.name}
                     </Link>
+                    <span className="block text-xs text-gray-500">by {bot.createdBy ?? 'human'}</span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
                     {bot.scriptName || bot.scriptId}
@@ -159,7 +173,28 @@ export function Bots() {
                           PAPER
                         </span>
                       )}
+                      {haltOf.has(bot.id) && (
+                        <Badge tone="red" title={haltOf.get(bot.id)!.reason ?? undefined}>
+                          halted
+                        </Badge>
+                      )}
                     </span>
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm">
+                    <StageBadge stage={bot.stage} />
+                    {bot.stage === 'retired' && bot.retireReason && <span className="block text-xs text-gray-500 max-w-[14rem] truncate" title={bot.retireReason}>{bot.retireReason}</span>}
+                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300 tabular-nums">
+                    {(() => {
+                      const a = allocationOf.get(bot.id);
+                      if (!a) return <span className="text-gray-500">—</span>;
+                      return (
+                        <span title={a.simulated ? 'paper orders and fills' : 'live orders and fills'}>
+                          {usd(a.usedUsd, 0)} / {a.availableUsd === null ? '—' : usd(a.availableUsd, 0)}
+                          {a.simulated && <span className="ml-1 text-xs text-gray-500">paper</span>}
+                        </span>
+                      );
+                    })()}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
                     {bot.lastHeartbeat
