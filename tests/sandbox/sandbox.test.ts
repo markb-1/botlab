@@ -394,6 +394,23 @@ describe('script worker', () => {
     expect(runner.isRunning).toBe(true);
   });
 
+  it('stop() ends the worker: no onTick runs and no RPC is served afterwards', async () => {
+    const code = await compileOk(`export async function onTick(ctx) { ctx.emit('tick', {}); await ctx.storage.get('k'); }`);
+    const runner = makeRunner(code);
+    const onError = vi.fn();
+    runner.on('error', onError);
+    let ticks = 0;
+    runner.on('event', (e: { type: string }) => { if (e.type === 'tick') ticks++; });
+    await runner.start();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(ticks).toBeGreaterThan(0);
+    await runner.stop(2000);
+    const after = ticks;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(ticks).toBe(after);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('a clean stop is not reported as fatal', async () => {
     const code = await compileOk('export function onTick(ctx) {}');
     const runner = makeRunner(code);

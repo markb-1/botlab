@@ -156,6 +156,8 @@ describe('ScriptRunner', () => {
       await stopPromise;
 
       expect(runner.isRunning).toBe(false);
+      // the worker's timers would keep it ticking: it is terminated once onStop is done
+      expect(mockWorkerInstance.terminate).toHaveBeenCalled();
     });
 
     it('should resolve immediately if no worker exists', async () => {

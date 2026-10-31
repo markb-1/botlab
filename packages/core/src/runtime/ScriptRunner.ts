@@ -189,7 +189,7 @@ export class ScriptRunner extends EventEmitter {
           startResolved = true;
           reject(new Error(`Worker exited with code ${code} before starting`));
         }
-        if (code !== 0 && !this.fatalReason) {
+        if (code !== 0 && !this.fatalReason && !this.stopRequested) {
           this.emit('error', { message: `Worker exited with code ${code}` });
         }
         // Died or was killed while running, not through stop(): the bot must be marked error
@@ -232,7 +232,13 @@ export class ScriptRunner extends EventEmitter {
 
       this.once('stopped', () => {
         clearTimeout(timer);
-        resolve();
+        // onStop finished, but the worker's timers (the onTick loop, ctx.setInterval) keep it alive and
+        // its RPC calls would still be served: end it before reporting the bot stopped
+        const worker = this.worker;
+        if (!worker) return resolve();
+        this.worker = null;
+        this.running = false;
+        void worker.terminate().then(() => resolve(), () => resolve());
       });
 
       this.sendToWorker({ type: 'stop' });
