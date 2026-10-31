@@ -50,6 +50,19 @@ function matchRule(rule: CategoryRule, tags: Set<string>, text: string): Categor
   return kw ? { rule: rule.name, via: 'keyword', term: kw } : null;
 }
 
+/**
+ * Gamma tag slugs to search a category by (Mac test F6): every `tags` and `when_tags` entry of the rules that map to
+ * it, strong tags first, de-duplicated. Empty for a category no rule names (e.g. `other`). Hits must still be
+ * categorized (a weak `when_tags` tag such as `economy` also returns company markets).
+ */
+export function categorySearchTags(category: string, config: CategoriesConfig): string[] {
+  const rules = config.rules.filter((r) => r.name === category);
+  const out = new Set<string>();
+  for (const r of rules) for (const t of r.tags) out.add(t);
+  for (const r of rules) for (const t of r.when_tags) out.add(t);
+  return [...out];
+}
+
 /** First matching rule wins; nothing matches ⇒ `other` (never allowed). */
 export function categorize(market: CategorizeInput, config: CategoriesConfig): CategorizeResult {
   const tags = new Set(market.tags.map(slugify).filter((t) => t.length > 0));
