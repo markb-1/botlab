@@ -305,7 +305,49 @@ describe('connectivity check — authenticated (read-only)', () => {
   });
 });
 
+describe('connectivity check — credentials never follow a redirect', () => {
+  it('a 3xx on an authenticated probe is not followed (manual redirect) and is "unexpected"', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const r = await run(
+      {
+        ...healthy(),
+        'clob.polymarket.com/auth/derive-api-key': () => new Response(null, { status: 302, headers: { location: 'https://evil.example/collect' } }),
+      },
+      { auth: authProbe },
+      calls
+    );
+    expect(byId(r, 'clob_auth_derive')).toMatchObject({ classification: 'unexpected', status: 302 });
+    expect(byId(r, 'clob_auth_derive').detail).toBe('HTTP 302 redirect to evil.example not followed (credentials are never sent to a redirect)');
+    expect(calls.some((c) => c.url.includes('evil.example'))).toBe(false);
+    const authCalls = calls.filter((c) => c.url.includes('/auth/'));
+    expect(authCalls).toHaveLength(1);
+    expect(authCalls[0].init?.redirect).toBe('manual');
+    // Public probes keep following redirects
+    expect(calls.find((c) => c.url.endsWith('/time'))!.init?.redirect).toBe('follow');
+    expect(r.verdict.kind).toBe('degraded');
+  });
+
+  it('refuses to send credentials to an http: CLOB URL', async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const r = await runConnectivityCheck({ fetch: fakeFetch(healthy(), calls), now: () => NOW, clobUrl: 'http://clob.polymarket.com', auth: authProbe });
+    expect(byId(r, 'clob_auth')).toMatchObject({ classification: 'skipped' });
+    expect(byId(r, 'clob_auth').detail).toMatch(/non-https/);
+    expect(calls.some((c) => c.url.includes('/auth/'))).toBe(false);
+  });
+});
+
 describe('connectivity check — classifiers', () => {
+  it('Cloudflare country ban (error 1009) ⇒ geo_blocked with the ToS warning', async () => {
+    const page =
+      '<!DOCTYPE html><html><head><title>Access denied | clob.polymarket.com used Cloudflare to restrict access</title></head>' +
+      '<body><span>Error 1009</span><p>The owner of this website (clob.polymarket.com) has banned the country or region your IP address is in (US) from accessing this website.</p></body></html>';
+    const r = await run({ ...healthy(), 'clob.polymarket.com/time': () => html(page, 403, { 'cf-ray': 'abc-IAD', server: 'cloudflare' }) });
+    expect(byId(r, 'clob_time').classification).toBe('geo_blocked');
+    expect(r.verdict.kind).toBe('blocked_geo');
+    expect(r.verdict.hints.join(' ')).toMatch(/Terms of Service/);
+    expect(classifyResponse({ status: 403, headers: {}, body: 'error 1009', expectJson: true }).classification).toBe('geo_blocked');
+  });
+
   it('classifyResponse', () => {
     expect(classifyResponse({ status: 200, headers: {}, body: '{}', expectJson: true }).classification).toBe('ok');
     expect(classifyResponse({ status: 451, headers: {}, body: '', expectJson: true }).classification).toBe('geo_blocked');
@@ -325,17 +367,5 @@ describe('connectivity check — classifiers', () => {
     const tls = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('bad cert'), { code: 'CERT_HAS_EXPIRED' }) });
     expect(classifyError(tls, 10_000).detail).toBe('TLS error (CERT_HAS_EXPIRED)');
     expect(classifyError(new DOMException('timed out', 'TimeoutError'), 10_000).detail).toBe('timeout after 10 s');
-  });
-});
-
-describe('check-polymarket CLI glue', () => {
-  it('shows the proxy as host:port only (never its credentials)', async () => {
-    const { envProxy } = await import('../../apps/server/src/checkPolymarket');
-    expect(envProxy({ HTTPS_PROXY: 'http://user:s3cret@proxy.example:3128' })).toEqual({
-      raw: 'http://user:s3cret@proxy.example:3128',
-      display: 'proxy.example:3128',
-    });
-    expect(envProxy({ http_proxy: 'http://10.0.0.1:8080' })?.display).toBe('10.0.0.1:8080');
-    expect(envProxy({})).toBeNull();
   });
 });

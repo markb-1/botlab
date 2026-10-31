@@ -25,9 +25,13 @@ import { defaultKeyFile, loadMasterKey } from './masterKey';
 
 type Flags = Record<string, string | true>;
 
-/** The proxy URL from the environment, as host:port (credentials never shown), or null */
+/**
+ * The proxy Node's fetch uses for https URLs with `NODE_USE_ENV_PROXY` (undici's EnvHttpProxyAgent): lowercase
+ * first, `??` semantics (a variable set to "" means "no proxy" and stops the lookup), `http_proxy` as the
+ * fallback. Host:port only (credentials never shown); null when there is none.
+ */
 export function envProxy(env: NodeJS.ProcessEnv = process.env): { raw: string; display: string } | null {
-  const raw = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
+  const raw = env.https_proxy ?? env.HTTPS_PROXY ?? env.http_proxy ?? env.HTTP_PROXY;
   if (!raw) return null;
   try {
     const u = new URL(raw);
@@ -37,13 +41,33 @@ export function envProxy(env: NodeJS.ProcessEnv = process.env): { raw: string; d
   }
 }
 
+/** Whether `no_proxy` / `NO_PROXY` (same lookup order) exempts `host` from the proxy */
+export function bypassesProxy(host: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const list = (env.no_proxy ?? env.NO_PROXY ?? '')
+    .split(/[\s,]+/)
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  const h = host.toLowerCase();
+  return list.some((e) => {
+    if (e === '*') return true;
+    const name = e.replace(/:\d+$/, '').replace(/^\*?\./, '');
+    return h === name || h.endsWith(`.${name}`);
+  });
+}
+
+/** The proxy the check's requests will actually go through (env proxy honoured by fetch and not bypassed) */
+export function effectiveProxy(env: NodeJS.ProcessEnv = process.env, active: boolean = envProxyActive(env), host = 'clob.polymarket.com'): string | null {
+  const p = envProxy(env);
+  return p && active && !bypassesProxy(host, env) ? p.display : null;
+}
+
 function nodeSupportsEnvProxy(version: string = process.versions.node): boolean {
   const [major, minor] = version.split('.').map(Number);
   return major > 22 || (major === 22 && minor >= 21);
 }
 
-function envProxyActive(): boolean {
-  return process.env.NODE_USE_ENV_PROXY === '1' || process.execArgv.includes('--use-env-proxy');
+function envProxyActive(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_USE_ENV_PROXY === '1' || process.execArgv.includes('--use-env-proxy');
 }
 
 /**
@@ -70,12 +94,16 @@ interface WalletRow {
   private_key_encrypted: string;
 }
 
-function openReadOnly(dbFile: string): Database.Database | null {
-  if (!fs.existsSync(dbFile)) return null;
+/**
+ * Opens the database read-only (no migrations, no writes; allowed next to a running server). On a WAL database
+ * SQLite may still create empty `-wal` / `-shm` files next to it. `error` carries the real reason (permissions, …).
+ */
+export function openReadOnly(dbFile: string): { db: Database.Database } | { db: null; error: string } {
+  if (!fs.existsSync(dbFile)) return { db: null, error: `no BotLab database at ${dbFile} (use --data-dir, or --prod for the npm start location)` };
   try {
-    return new Database(dbFile, { readonly: true, fileMustExist: true });
-  } catch {
-    return null;
+    return { db: new Database(dbFile, { readonly: true, fileMustExist: true }) };
+  } catch (err) {
+    return { db: null, error: `cannot open ${dbFile} read-only: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -105,16 +133,21 @@ function pickWallet(db: Database.Database, which: string | undefined): { wallet:
 }
 
 /** The read-only auth probe, or why it is skipped. Never throws for a missing key / wallet. */
-function buildAuth(db: Database.Database | null, dataDir: string, flags: Flags): { auth: ConnectivityOptions['auth']; address?: string; notes: string[] } {
+export function buildAuth(
+  opened: ReturnType<typeof openReadOnly>,
+  dataDir: string,
+  flags: Flags,
+  env: NodeJS.ProcessEnv = process.env
+): { auth: ConnectivityOptions['auth']; address?: string; notes: string[] } {
   const notes: string[] = [];
-  if (!db) return { auth: { skip: `no BotLab database in ${dataDir} (use --data-dir, or --prod for the npm start location)` }, notes };
-  const env = process.env;
+  if (!opened.db) return { auth: { skip: opened.error }, notes };
+  const db = opened.db;
   const hasKey = !!env.BOTLAB_MASTER_KEY || !!env.BOTLAB_MASTER_KEY_FILE || fs.existsSync(defaultKeyFile(dataDir));
   if (!hasKey) return { auth: { skip: 'no master key (BOTLAB_MASTER_KEY, BOTLAB_MASTER_KEY_FILE or <data dir>/master.key)' }, notes };
   let key: string;
   try {
     // production: true ⇒ never generates a key file here
-    key = loadMasterKey({ dataDir, production: true, log: () => undefined }).key;
+    key = loadMasterKey({ env, dataDir, production: true, log: () => undefined }).key;
   } catch (err) {
     return { auth: { skip: `master key: ${err instanceof Error ? err.message : String(err)}` }, notes };
   }
@@ -148,20 +181,22 @@ export async function checkPolymarketCommand(flags: Flags, dataDir: string): Pro
 
   const json = flags.json === true;
   const notes: string[] = [];
-  const proxy = envProxy();
-  if (proxy && !envProxyActive()) {
-    notes.push(`HTTPS_PROXY is set but Node ${process.versions.node} cannot use it from fetch (needs ≥ 22.21): requests go out directly from this machine`);
+  if (envProxy() && !envProxyActive()) {
+    notes.push(
+      `A proxy is set (https_proxy / HTTPS_PROXY) but Node ${process.versions.node} cannot use it from fetch (needs ≥ 22.21): requests go out directly from this machine`
+    );
   }
 
-  const db = openReadOnly(path.join(dataDir, 'botlab.db'));
+  const opened = openReadOnly(path.join(dataDir, 'botlab.db'));
+  const db = opened.db;
   try {
     const opts: ConnectivityOptions = {
       clobUrl: settingsClobUrl(db) ?? DEFAULT_CLOB_URL,
       binance: flags.binance === true,
-      proxy: proxy && envProxyActive() ? proxy.display : null,
+      proxy: effectiveProxy(),
     };
     if (flags['with-credentials']) {
-      const a = buildAuth(db, dataDir, flags);
+      const a = buildAuth(opened, dataDir, flags);
       opts.auth = a.auth;
       if (a.address) opts.sampleAddress = a.address;
       notes.push(...a.notes);

@@ -9,6 +9,11 @@
  * that handler. The error keeps its response (status, data), so clob-client still returns
  * `{ error, status }`.
  *
+ * Redirects: axios follows them through follow-redirects, which drops only `Authorization` / `Cookie` (and
+ * `Proxy-Authorization`) on a host change — the POLY_* headers would go to the new host. A request interceptor
+ * sets `maxRedirects: 0` on every request carrying a POLY_* header, so a 3xx comes back as an HTTP error
+ * (clob-client: `{ error, status }`) and nothing is sent to the redirect target.
+ *
  * `installCredentialRedaction()` is idempotent and runs at import of this module's users
  * (orders.ts, BotManager, createCore), i.e. before any ClobClient exists.
  */
@@ -23,7 +28,10 @@ const INSTALLED = Symbol.for('botlab.credentialRedaction');
 type AnyRecord = Record<string, unknown>;
 
 interface AxiosLike {
-  interceptors: { response: { use(onOk: undefined, onErr: (err: unknown) => unknown): number } };
+  interceptors: {
+    response: { use(onOk: undefined, onErr: (err: unknown) => unknown): number };
+    request?: { use(onOk: (config: AnyRecord) => AnyRecord): number };
+  };
   [INSTALLED]?: boolean;
 }
 
@@ -47,6 +55,17 @@ export function redactAxiosConfig(config: unknown): void {
   if ('auth' in c && c.auth !== undefined) c.auth = REDACTED;
 }
 
+const POLY_HEADER = /^poly[_-]/i;
+
+/** Requests carrying POLY_* auth headers never follow a redirect (`maxRedirects: 0`). Returns the config. */
+export function refuseAuthRedirects<T>(config: T): T {
+  if (config && typeof config === 'object') {
+    const headers = plainHeaders((config as AnyRecord).headers);
+    if (headers && Object.keys(headers).some((k) => POLY_HEADER.test(k))) (config as AnyRecord).maxRedirects = 0;
+  }
+  return config;
+}
+
 /** Redact the request side of an axios error in place; the response (status, body) is kept. */
 export function redactAxiosError(err: unknown): unknown {
   if (err && typeof err === 'object') {
@@ -67,6 +86,7 @@ function install(axios: unknown): void {
   if (!a || (typeof a !== 'object' && typeof a !== 'function')) return;
   if (!a.interceptors?.response || a[INSTALLED]) return;
   a.interceptors.response.use(undefined, (err: unknown) => Promise.reject(redactAxiosError(err)));
+  a.interceptors.request?.use((config) => refuseAuthRedirects(config));
   a[INSTALLED] = true;
 }
 

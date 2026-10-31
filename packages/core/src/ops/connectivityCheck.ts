@@ -136,9 +136,12 @@ export const DEFAULT_GEOBLOCK_URL = 'https://polymarket.com/api/geoblock';
 export const DEFAULT_SAMPLE_ADDRESS = '0x0000000000000000000000000000000000000001';
 export const DEFAULT_TIMEOUT_MS = 10_000;
 
-/** "restricted region" style bodies (CLOB order refusal, Polymarket docs, Binance 451 / 403) */
+/**
+ * "restricted region" style bodies (CLOB order refusal, Polymarket docs, Binance 451 / 403) and Cloudflare's
+ * country ban page ("Error 1009 … has banned the country or region your IP address is in")
+ */
 const GEO_BODY =
-  /restricted (in your |)(region|location|jurisdiction|country)|trading restricted|not available in your (region|country|jurisdiction)|geo-?block|unavailable from a restricted location|eligibility/i;
+  /restricted (in your |)(region|location|jurisdiction|country)|trading restricted|not available in your (region|country|jurisdiction)|geo-?block|unavailable from a restricted location|eligibility|banned the country or region|error 1009/i;
 const CHALLENGE_BODY =
   /just a moment|attention required|cf-chl|challenge-platform|challenges\.cloudflare\.com|captcha|checking your browser|cf-browser-verification|enable javascript and cookies/i;
 const HTML_BODY = /^\s*(<!doctype html|<html|<head|<body)/i;
@@ -182,11 +185,12 @@ export function classifyResponse(obs: HttpObservation): { classification: CheckC
   const html = looksHtml(body, headers);
   const mitigated = header(headers, 'cf-mitigated');
   if (status === 451) return { classification: 'geo_blocked', detail: `HTTP 451 (unavailable for legal reasons)${snippet(body)}` };
+  // Before the challenge markers: a Cloudflare country ban (1009) is an HTML page from Cloudflare too
+  if (status >= 400 && GEO_BODY.test(body)) return { classification: 'geo_blocked', detail: `HTTP ${status}${snippet(body)}` };
   if (mitigated) return { classification: 'bot_challenge', detail: `Cloudflare cf-mitigated: ${mitigated} (HTTP ${status})` };
   if (html && CHALLENGE_BODY.test(body) && (isCloudflare(headers) || status === 403 || status === 503 || status === 429)) {
     return { classification: 'bot_challenge', detail: `Cloudflare challenge page (HTTP ${status})` };
   }
-  if (status >= 400 && GEO_BODY.test(body)) return { classification: 'geo_blocked', detail: `HTTP ${status}${snippet(body)}` };
   if (status === 429)
     return { classification: 'rate_limited', detail: `HTTP 429${header(headers, 'retry-after') ? ` (retry-after ${header(headers, 'retry-after')})` : ''}` };
   if (status === 403) {
@@ -310,9 +314,28 @@ async function probe<T>(ctx: Ctx, spec: ProbeSpec): Promise<Probe<T>> {
     const resp = await ctx.fetch(spec.url, {
       method: 'GET',
       headers: { Accept: spec.text ? 'text/plain, */*' : 'application/json', 'User-Agent': 'BotLab-connectivity-check', ...(spec.headers ?? {}) },
-      redirect: 'follow',
+      // fetch forwards custom headers (POLY_*) across origins on a redirect: never follow one with credentials
+      redirect: spec.headers ? 'manual' : 'follow',
       signal: AbortSignal.timeout(ctx.timeoutMs),
     });
+    if (spec.headers && resp.status >= 300 && resp.status < 400) {
+      await resp.body?.cancel().catch(() => undefined);
+      let to = 'elsewhere';
+      try {
+        to = new URL(resp.headers.get('location') ?? '', spec.url).host || to;
+      } catch {
+        /* unparseable Location */
+      }
+      return {
+        result: {
+          ...base,
+          status: resp.status,
+          latencyMs: ctx.now() - t0,
+          classification: 'unexpected',
+          detail: `HTTP ${resp.status} redirect to ${to} not followed (credentials are never sent to a redirect)`,
+        },
+      };
+    }
     const body = await resp.text();
     const t1 = ctx.now();
     const c = classifyResponse({ status: resp.status, headers: resp.headers, body, expectJson: !spec.text });
@@ -587,6 +610,7 @@ function readGeoblock(p: Probe<unknown>): GeoblockInfo {
 async function authChecks(ctx: Ctx, clob: string, auth: ClobAuthProbe | { skip: string }): Promise<CheckResult[]> {
   const name = 'CLOB authenticated (read-only)';
   if ('skip' in auth) return [skipped('clob_auth', 'clob_auth', name, auth.skip, false)];
+  if (!/^https:\/\//i.test(clob)) return [skipped('clob_auth', 'clob_auth', name, `refusing to send credentials to a non-https CLOB URL (${clob})`, false)];
   const out: CheckResult[] = [];
   let l1: Record<string, string>;
   try {
