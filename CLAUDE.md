@@ -151,6 +151,8 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 
 ## Key Gotchas
 
+- **Node 22 only**: `engines` is `>=22.12 <25` (better-sqlite3 does not build on Node 25+); `preinstall` runs `scripts/check-node.mjs`
+- **Polymarket fees**: `orders/feeModel.ts` — taker fee = shares × rate × p × (1 − p) in USDC, the market's own Gamma `feeSchedule` first, `fees.yaml` category table only as fallback (PROGRESS R125)
 - **Polymarket API**: Series endpoint (`/series/{id}`) returns events WITHOUT `markets` field. Must use Event endpoint (`/events/{id}`) to get market data
 - **Wallet addresses**: Polymarket USDC balance lives in `proxyAddress`, not the main `address`. Balance queries must use proxyAddress when available
 - **Binance USDT-only**: Paper trading simulator only supports USDT-quoted pairs (BTCUSDT, ETHUSDT, etc.)
