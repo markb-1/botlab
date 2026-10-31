@@ -11,7 +11,7 @@ import type { AddressInfo } from 'net';
 import path from 'path';
 import { serve, type ServerType } from '@hono/node-server';
 import { createCore, type Core } from '../../../packages/core/src/core';
-import { resolveConfigDir } from '../../../packages/core/src/config/loader';
+import { legacyConfigDirWarning, resolveConfigDir } from '../../../packages/core/src/config/loader';
 import { createApp } from './app';
 import { listSecrets } from '../../../packages/core/src/security/migrateSecrets';
 import { loadMasterKey, type LoadedMasterKey } from './masterKey';
@@ -73,6 +73,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     if (!process.env.BOTLAB_LOG_DIR) process.env.BOTLAB_LOG_DIR = env.BOTLAB_LOG_DIR || path.join(dataDir, 'logs');
     log(`[Server] Data dir: ${dataDir}`);
     log(`[Server] Config dir: ${configDir}`);
+    const legacyWarning = opts.configDir ? null : legacyConfigDirWarning(env);
+    if (legacyWarning) {
+      const bar = '!'.repeat(78);
+      log(`${bar}\n[Server] WARNING: ${legacyWarning}\n${bar}`);
+    }
     core = createCore({ dataDir, configDir, ...(opts.templatesDir ? { templatesDir: opts.templatesDir } : {}), backups: opts.backups ?? true });
     const c = core;
     await c.start();

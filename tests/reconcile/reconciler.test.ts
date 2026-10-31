@@ -177,6 +177,21 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
     expect(h.tradeRepo.getRiskPositions({ simulated: false })[0].net_quantity).toBeCloseTo(20.4);
   });
 
+  it('fills recovered for an unknown-outcome LIMIT order are charged the taker fee (may have matched on placement)', async () => {
+    const id = h.orderRepo.create({
+      botId: 'b1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'buy', orderType: 'limit',
+      price: 0.5, size: 20, notionalUsd: 10, status: 'submitted', expiresAt: new Date(h.clock.now + 60 * 60_000).toISOString(),
+    }).id;
+    const created = Date.parse(h.orderRepo.findById(id)!.created_at);
+    clobTrades = [{ id: 'tr-l', assetId: 't1', status: 'CONFIRMED', matchTimeMs: created + 1000, traderSide: 'TAKER', takerOrderId: 'ex-l', side: 'buy', size: 20, price: 0.5, makerOrders: [] }];
+    h.poly.getOrder.mockResolvedValue(null);
+    h.clock.now += 30 * 60_000;
+    const res = await makeReconciler().runOnce();
+    expect(res.errors).toEqual([]);
+    expect(res.recovered).toEqual([id]);
+    expect(fillsOf(id)[0].fee_usd).toBeCloseTo(TAKER * 10);
+  });
+
   it('expires an unknown-outcome order only after the exchange confirms no match, and never on a failed lookup', async () => {
     const id = unknownMarketBuy();
     const r = makeReconciler();

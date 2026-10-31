@@ -17,6 +17,7 @@ const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economi
 import type { PolymarketAdapter, BinanceAdapter } from '../../packages/core/src/orders/ExchangeAdapter';
 import { PaperTradingState } from '../../packages/core/src/runtime/PaperTradingState';
 import type { RiskDecision } from '../../packages/core/src/risk/types';
+import { computeDailyPnl, markKey } from '../../packages/core/src/risk/dailyPnl';
 
 const NOW = Date.parse('2026-06-01T00:00:00Z');
 const DAY = 86_400_000;
@@ -252,6 +253,29 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     expect(r.expiresAt).toBe(new Date(NOW + ttl * 60_000).toISOString());
     expect(t.orderRepo.sumOpenBuyNotional({ marketId: 'm1' })).toBeCloseTo(9 + 0.44 * 20);
     expect(t.orderRepo.findById(r.orderId!)!.fee_usd).toBe(0); // maker
+  });
+
+  it('a limit order not marketable at check time that comes back matched pays the taker fee (and daily P&L sees it)', async () => {
+    market = { ...MARKET, feeSchedule: { feesEnabled: true, feeType: 'politics_fees', rate: 0.04, exponent: 1, takerOnly: true, rebateRate: null, from: 'feeSchedule' } };
+    // Book moved between the check (best ask 0.5) and the post: the CLOB matched it at once
+    poly.postLimitOrder.mockResolvedValueOnce({ kind: 'accepted', exchangeOrderId: 'ex-m', status: 'matched', filledSize: 20, filledNotional: 9 });
+    const svc = makeService('bot-1');
+    const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+    expect(r).toMatchObject({ ok: true, status: 'filled', filledSize: 20 });
+    const expected = 20 * 0.04 * 0.45 * 0.55;
+    expect(t.orderRepo.findById(r.orderId!)!.fee_usd).toBeCloseTo(expected, 9);
+
+    const fills = t.tradeRepo.findPnlFills().filter((f) => f.bot_id === 'bot-1');
+    expect(fills).toHaveLength(1);
+    expect(fills[0].fee_usd).toBeCloseTo(expected, 9);
+    const pnl = computeDailyPnl({
+      fills: fills.map((f) => ({ exchange: f.exchange, symbol: f.symbol, side: f.side as 'BUY' | 'SELL', quantity: f.quantity ?? 0, quoteAmount: f.quote_amount ?? 0, feeUsd: f.fee_usd ?? 0, executedAt: NOW })),
+      dayStartMs: NOW - 1000,
+      dayStartMarks: {},
+      currentMarks: { [markKey('polymarket', 't1')]: 0.45 },
+      lastKnownMarks: {},
+    });
+    expect(pnl.totalPnl).toBeCloseTo(-expected, 9); // marked at cost: the fee is the whole day's loss
   });
 
   it('syncs resting fills from the exchange into positions', async () => {

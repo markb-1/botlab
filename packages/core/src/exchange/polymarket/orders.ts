@@ -11,6 +11,8 @@
  */
 
 import { OrderType, Side, type ClobClient } from '@polymarket/clob-client';
+// Side effect: CLOB credentials never reach clob-client's error logs (registered before any call)
+import './redactCredentials';
 
 import { GTD_MIN_LIFETIME_SECONDS, GTD_MIN_TTL_MINUTES, GTD_SECURITY_BUFFER_SECONDS } from './gtd';
 

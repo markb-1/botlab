@@ -590,7 +590,10 @@ export class OrderService {
       preCheck = preDecision('market_data_unavailable', `Cannot check order: ${why}`, this.now());
     }
 
-    const fee: AppliedFee = { rates: ctx.fees ?? this.deps.fees.getRates(null), taker: this.isMarketable(order, ctx.market) };
+    // Anything the placement response reports as filled was matched immediately against resting orders:
+    // a taker fill by definition, even for a limit order that did not look marketable at check time
+    // (post-only is only emulated at check time). Later resting fills come through the sync as maker.
+    const fee: AppliedFee = { rates: ctx.fees ?? this.deps.fees.getRates(null), taker: true };
 
     const row = await this.checkAndPersist(order, preCheck, shape.expiresAt, input);
     if (row.status === 'rejected_risk') {
@@ -749,7 +752,7 @@ export class OrderService {
 
   /**
    * Update the order row from the exchange outcome and record any fill, atomically.
-   * `fee`: the market's rates, taker if the order crossed the book at check time (else maker).
+   * `fee`: the market's rates; fills in the placement response are always taker fills.
    */
   private applyOutcome(row: OrderRow, outcome: PostOrderOutcome, fee: AppliedFee | null, ctx: PolymarketContext): OrderRow {
     const side = row.side as OrderSide;

@@ -259,6 +259,14 @@ describe.skipIf(!sqliteAvailable)('3c UI routes', () => {
     expect((await req('GET', '/api/bots/nope/events', { cookie })).status).toBe(404);
   });
 
+  it('live market search is rate-limited per principal (30/min), independently for each token', async () => {
+    for (let i = 0; i < 30; i++) expect((await req('GET', `/api/markets/search?q=q${i}`, { bearer: readonly })).status).toBe(503); // Gamma offline in tests
+    const limited = await req('GET', '/api/markets/search?q=more', { bearer: readonly });
+    expect(limited.status).toBe(429);
+    expect(limited.json).toMatchObject({ success: false, code: 'rate_limited' });
+    expect((await req('GET', '/api/markets/search?q=more', { bearer: agent })).status).toBe(503); // own budget
+  });
+
   it('adoption preview: human admin only; refused for an unknown bot without auditing', async () => {
     expect((await statuses('POST', '/api/reconcile/adopt/preview', { walletId: 'w', botId: 'b' })).slice(1)).toEqual([403, 403]);
     const r = await req('POST', '/api/reconcile/adopt/preview', { cookie, body: { walletId: 'w', botId: 'b' } });

@@ -137,6 +137,18 @@ has 8+ characters; otherwise it asks for a new admin password (or `BOTLAB_NEW_AD
 If you edited `config/*.yaml` in the repo while using Electron in dev, copy them into the production config
 dir (table above); otherwise defaults are created there.
 
+### Upgrade notes (2026-10-31 fix-up round)
+
+- **Config dir with `BOTLAB_DATA_DIR`:** with `npm start` and only `BOTLAB_DATA_DIR` set, the config dir is now
+  `<data dir>/config` (it used to stay in the OS app-data dir). The server prints a warning at startup if your
+  old config files are still in the old place; move them, or set `BOTLAB_CONFIG_DIR` to the old dir.
+- **`resting_order_ttl_minutes` must be ≥ 3** in `limits.yaml`: Polymarket refuses GTD orders that expire less
+  than 3 minutes ahead. A smaller value makes `limits.yaml` invalid: at startup everything that needs the config
+  fails closed (no orders, the Risk page shows the error); on a live edit the previous valid config stays. Raise
+  it to 3 or more. Scripts calling `placeLimit` with `ttlMinutes` < 3 get an error.
+- **`categories.yaml` / `fees.yaml`** you already have are not rewritten: see `docs/PROGRESS.md` (R50, R125) for
+  the economics-tag and sports-fee changes to apply by hand.
+
 ---
 
 ## Windows home server (service)

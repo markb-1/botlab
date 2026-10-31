@@ -483,9 +483,13 @@ export class Reconciler implements ClockSkewGuard {
     }
   }
 
-  /** Recovered Polymarket fills: market orders pay the taker fee, resting (limit) fills are maker. */
-  private recoveredFee(row: OrderRow): AppliedFee {
-    return { rates: this.deps.getFeeRates(row.token_id), taker: row.order_type === 'market' };
+  /**
+   * Fee for fills the Reconciler records. Market orders are taker. A limit order with a known exchange id
+   * fills as maker once resting; for an unknown-outcome order (found by search) the fills may have
+   * matched immediately on placement, so they are charged as taker (conservative).
+   */
+  private recoveredFee(row: OrderRow, opts: { unknownOutcome?: boolean } = {}): AppliedFee {
+    return { rates: this.deps.getFeeRates(row.token_id), taker: row.order_type === 'market' || opts.unknownOutcome === true };
   }
 
   /** Record a fill/status from the exchange via the shared path; emit fills after commit. */
@@ -552,7 +556,7 @@ export class Reconciler implements ClockSkewGuard {
       const state = outcome.state;
       this.apply(row, state, {
         exchangeOrderId: outcome.exchangeOrderId,
-        fee: this.recoveredFee(row),
+        fee: this.recoveredFee(row, { unknownOutcome: true }),
       });
       // Linked even if nothing filled (a live resting order): later runs sync it by id
       const after = this.deps.orderRepo.findById(row.id);

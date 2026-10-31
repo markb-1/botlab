@@ -91,6 +91,24 @@ export interface MarketView {
   updatedAt: string;
 }
 
+/** HTTP error from Gamma with its status and Retry-After (ms) for callers that back off */
+export class GammaHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterMs: number | null
+  ) {
+    super(message);
+    this.name = 'GammaHttpError';
+  }
+}
+
+function gammaHttpError(what: string, resp: Response): GammaHttpError {
+  const ra = resp.headers?.get?.('retry-after') ?? null;
+  const secs = ra !== null && /^\d+$/.test(ra.trim()) ? Number(ra) : null;
+  return new GammaHttpError(`${what} HTTP ${resp.status}`, resp.status, secs !== null ? secs * 1000 : null);
+}
+
 /** One market from a live Gamma search (MarketCacheService.searchGamma) */
 export interface GammaSearchHit {
   marketId: string;
@@ -400,7 +418,7 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       const params = new URLSearchParams({ q, limit_per_type: String(Math.min(limit, 50)), search_tags: 'false', search_profiles: 'false' });
       if (active) params.set('events_status', 'active');
       const resp = await this.fetchFn(`${this.baseUrl}/public-search?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      if (!resp.ok) throw new Error(`Gamma search HTTP ${resp.status}`);
+      if (!resp.ok) throw gammaHttpError('Gamma search', resp);
       const body = (await resp.json()) as { events?: unknown };
       const events = Array.isArray(body?.events) ? (body.events as Array<Record<string, unknown>>) : [];
       raws = events.flatMap((e) => {
@@ -415,7 +433,7 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
         params.set('closed', 'false');
       }
       const resp = await this.fetchFn(`${this.baseUrl}/markets?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      if (!resp.ok) throw new Error(`Gamma HTTP ${resp.status}`);
+      if (!resp.ok) throw gammaHttpError('Gamma', resp);
       const body = (await resp.json()) as unknown;
       raws = Array.isArray(body) ? body : [];
     }

@@ -68,6 +68,37 @@ export function resolveConfigDir(
   }
 }
 
+/**
+ * Upgrade check for R127: in production, a config dir that now follows BOTLAB_DATA_DIR may leave the
+ * YAML files a previous version wrote to the OS app-data config dir behind. Returns a warning when the
+ * old dir has YAML files and the new one has none (the server would otherwise start on fresh defaults).
+ */
+export function legacyConfigDirWarning(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  homeDir: string = os.homedir()
+): string | null {
+  if (env.NODE_ENV !== 'production' || !env.BOTLAB_DATA_DIR || env.BOTLAB_CONFIG_DIR) return null;
+  const current = resolveConfigDir(env, platform, homeDir);
+  const { BOTLAB_DATA_DIR: _ignored, ...withoutData } = env;
+  const legacy = resolveConfigDir(withoutData, platform, homeDir);
+  if (path.resolve(legacy) === path.resolve(current)) return null;
+  const yamls = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(dir).filter((f) => /\.ya?ml$/i.test(f) && !/\.example\.ya?ml$/i.test(f));
+    } catch {
+      return [];
+    }
+  };
+  const old = yamls(legacy);
+  if (old.length === 0 || yamls(current).length > 0) return null;
+  return (
+    `Config dir is now ${current} (it follows BOTLAB_DATA_DIR), but your existing config files ` +
+    `(${old.join(', ')}) are in ${legacy}. BotLab will start with DEFAULT limits/mandate there. ` +
+    `Move or copy them to ${current}, or set BOTLAB_CONFIG_DIR=${legacy}.`
+  );
+}
+
 function formatIssues(error: z.ZodError): string[] {
   return error.issues.map((issue) => {
     const where = issue.path.length > 0 ? issue.path.join('.') : '(root)';

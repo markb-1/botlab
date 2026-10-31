@@ -15,6 +15,7 @@ export {
   parseConfigYaml,
   readOrCreate,
   resolveConfigDir,
+  legacyConfigDirWarning,
   ConfigError,
   LIMITS_FILE,
   MANDATE_FILE,

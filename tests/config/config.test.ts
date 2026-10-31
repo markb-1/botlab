@@ -9,6 +9,7 @@ import {
   loadConfig,
   loadLimits,
   resolveConfigDir,
+  legacyConfigDirWarning,
   ConfigError,
   DEFAULT_LIMITS_YAML,
   DEFAULT_MANDATE_YAML,
@@ -70,7 +71,9 @@ describe('config schema defaults', () => {
   });
 
   it('resting_order_ttl_minutes must be at least 3 (Polymarket GTD minimum)', () => {
-    expect(LimitsSchema.safeParse({ orders: { resting_order_ttl_minutes: 2 } }).success).toBe(false);
+    const r = LimitsSchema.safeParse({ orders: { resting_order_ttl_minutes: 2 } });
+    expect(r.success).toBe(false);
+    expect(JSON.stringify(r.error?.issues)).toMatch(/at least 3.*Polymarket/);
     expect(LimitsSchema.safeParse({ orders: { resting_order_ttl_minutes: 3 } }).success).toBe(true);
   });
 
@@ -111,6 +114,25 @@ describe('config loader', () => {
       expect(resolveConfigDir({ BOTLAB_DATA_DIR: data, BOTLAB_CONFIG_DIR: dir, NODE_ENV: 'production' }, 'darwin', home)).toBe(dir);
       // Dev keeps the repo's config/ (BOTLAB_DATA_DIR only moves the data)
       expect(resolveConfigDir({ BOTLAB_DATA_DIR: data }, 'darwin', home)).toBe(path.join(process.cwd(), 'config'));
+    });
+
+    it('warns at startup when the old app-data config dir has YAML files and <data dir>/config has none', () => {
+      const fakeHome = path.join(dir, 'home');
+      const legacy = path.join(fakeHome, '.local', 'share', 'botlab', 'config');
+      const data = path.join(dir, 'data');
+      const env = { BOTLAB_DATA_DIR: data, NODE_ENV: 'production' };
+      expect(legacyConfigDirWarning(env, 'linux', fakeHome)).toBeNull(); // nothing to migrate
+      fs.mkdirSync(legacy, { recursive: true });
+      fs.writeFileSync(path.join(legacy, 'limits.yaml'), 'global: {}\n');
+      const w = legacyConfigDirWarning(env, 'linux', fakeHome)!;
+      expect(w).toContain(legacy);
+      expect(w).toContain(path.join(data, 'config'));
+      expect(w).toContain('limits.yaml');
+      fs.mkdirSync(path.join(data, 'config'), { recursive: true });
+      fs.writeFileSync(path.join(data, 'config', 'limits.yaml'), 'global: {}\n');
+      expect(legacyConfigDirWarning(env, 'linux', fakeHome)).toBeNull(); // already moved
+      expect(legacyConfigDirWarning({ ...env, BOTLAB_CONFIG_DIR: legacy }, 'linux', fakeHome)).toBeNull();
+      expect(legacyConfigDirWarning({ BOTLAB_DATA_DIR: data }, 'linux', fakeHome)).toBeNull(); // dev
     });
 
     it('defaults to <cwd>/config outside production', () => {

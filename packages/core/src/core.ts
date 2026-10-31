@@ -17,6 +17,8 @@
 
 import { EventEmitter } from 'events';
 import fs from 'fs';
+// Side effect: exchange credentials never reach HTTP-client error logs
+import './exchange/polymarket/redactCredentials';
 import path from 'path';
 import { initializeDatabase, closeDatabase, type Database } from './db/index';
 import {

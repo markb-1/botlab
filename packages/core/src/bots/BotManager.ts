@@ -1,6 +1,8 @@
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';
+// Side effect: CLOB credentials never reach clob-client's error logs (registered before any call)
+import '../exchange/polymarket/redactCredentials';
 import { SignatureType } from '@polymarket/order-utils';
 import type {
   BotStatus,
