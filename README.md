@@ -209,12 +209,69 @@ A `.env` file in the working directory is read at start.
   `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`). Health: `GET /healthz`
   (no auth; 503 when the DB fails, the server is locked, the reconciler is stale > 3 min or a bot
   worker crashed).
-- **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (for the MCP agent in Phase 4: read,
-  scripts, backtests, paper bot create / config update / start / stop, forecasts, kill switch — never
-  wallets, credentials, settings, config writes or halt clearing) or `readonly` (GET only, and not
-  wallets, settings, config or script export).
+- **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (the MCP agent, below; on `/api` it keeps
+  read routes, scripts, backtests, paper bot create / config update of its own bots / start of its own bots /
+  stop, forecasts, kill switch — never wallets, credentials, settings, config writes or halt clearing) or
+  `readonly` (GET only, and not wallets, settings, config or script export).
   `npm run cli -- token create --scope agent --name mcp` · `token list` · `token revoke <id>`.
 - Forgot the admin password: `npm run cli -- set-password` (add `--prod` for the `npm start` data dir).
+
+## MCP server (AI agent)
+
+BotLab exposes its agent interface as an MCP server (spec §7.3): **Streamable HTTP at `/mcp`**, authenticated
+with an **agent-scope token only** (a readonly token or the admin session is refused). Everything the agent can
+do goes through the same core services and rules as the UI: its bots are paper bots on their own paper wallet,
+it may change / start / retire only bots it created (it may pause any), bot creation is capped by
+`limits.yaml` `agent.max_bots_created_per_day` / `max_active_bots`, its ambiguity assessments can only set or
+raise a score (never lower it or override yours), and runs stop at `agent.monthly_llm_budget_usd` and
+`max_tool_calls_per_run`. It cannot touch limits, the mandate, wallets, credentials, settings or orders, and
+cannot clear halts. Every tool call is in the audit log (`mcp.<tool>`, actor `agent`). The Agent page shows
+runs, notes, budget and exit flags.
+
+Tools: read — `get_overview`, `search_markets`, `get_market`, `get_orderbook`, `get_price_history`,
+`get_positions`, `get_open_orders`, `get_trades`, `list_bots`, `get_bot`, `get_bot_logs`, `list_templates`,
+`get_script`, `get_forecasts`, `get_ledger_stats`, `get_notes`, `get_run_history`, `get_leaderboard`;
+build — `validate_script` (compile + typecheck against `botlab-sdk.d.ts`), `create_template`,
+`update_template`, `run_backtest`, `get_backtest`; operate — `create_bot`, `update_bot_config`, `start_bot`,
+`pause_bot`, `retire_bot`, `submit_forecast`, `withdraw_forecast`, `assess_market`, `flag_position_exit`,
+`kill_switch`, `watch_market`, `unwatch_market`, `write_note`, `delete_note`, `start_run`, `finish_run`.
+Resources: `botlab://sdk/types.d.ts`, `botlab://sdk/guide.md`, `botlab://templates/{id}`,
+`botlab://config/mandate`, `botlab://config/limits`, `botlab://fees`.
+
+Create a token first (with the server running or not): `npm run cli -- token create --scope agent --name claude`
+(add `--prod` for the `npm start` data dir), or Settings → API tokens.
+
+**Claude Code** (HTTP, any OS):
+
+```bash
+claude mcp add --transport http botlab http://127.0.0.1:3780/mcp --header "Authorization: Bearer blt_…"
+```
+
+**Claude Desktop** (stdio): Desktop starts a local process, so BotLab ships a stdio proxy
+(`dist/apps/server/src/mcp-stdio.js`, built by `npm run build`; `npm run mcp:stdio` runs it). It does not open the
+database: it forwards every message to the running server's `/mcp` with the token. Edit
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "botlab": {
+      "command": "node",
+      "args": ["/Users/you/botlab/dist/apps/server/src/mcp-stdio.js"],
+      "env": { "BOTLAB_URL": "http://127.0.0.1:3780", "BOTLAB_AGENT_TOKEN": "blt_…" }
+    }
+  }
+}
+```
+
+On Windows use `"args": ["C:\\Users\\you\\botlab\\dist\\apps\\server\\src\\mcp-stdio.js"]`. The same
+proxy works for Claude Code (`claude mcp add botlab -e BOTLAB_URL=http://127.0.0.1:3780 -e BOTLAB_AGENT_TOKEN=blt_… -- node /path/to/mcp-stdio.js`).
+Revoking the token (`npm run cli -- token revoke <id>` or Settings) cuts the agent off at once.
+
+Tool results that contain third-party text (market questions and rules, names, log lines) are wrapped in
+`<untrusted_data>` blocks and the guide tells the agent not to follow instructions in them; the real protection
+is structural (what the agent cannot do, above).
 
 ## Writing Bot Scripts
 
@@ -348,12 +405,15 @@ npm run typecheck      # core + server + web
 npm test               # vitest (SKIP_NETWORK_TESTS=1 skips live-API tests)
 npm run lint           # ESLint (0 errors expected)
 npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke
+npm run gen:sdk        # regenerate botlab-sdk.d.ts (packages/core/src/sdk/sdkDts.generated.ts) after editing sdk/types.ts
+npm run mcp:stdio      # MCP stdio proxy (BOTLAB_URL, BOTLAB_AGENT_TOKEN); mcp:stdio:dev runs it from source
 ```
 
 ```
 packages/core/src/      all domain logic, no transport code (createCore, services, db, risk, orders,
                         runtime, ledger, reconcile, recorder, exchange, security, ops/backup)
-apps/server/src/        Hono HTTP API, auth, SSE, /healthz, static UI, CLI, entrypoint
+apps/server/src/        Hono HTTP API, auth, SSE, /healthz, static UI, CLI, entrypoint; mcp/ (MCP tools,
+                        resources, /mcp transport) and mcp-stdio.ts (stdio proxy)
 apps/web/               React UI (Vite), fetch + EventSource client in src/lib/api.ts
 templates/              built-in bot templates
 config/*.example.yaml   config defaults (real files are created on first start)
