@@ -302,6 +302,33 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       expect(h.auditActions('category_rights.change').at(-1)).toMatchObject({ actor: 'human', payload: { forced: true, to: 'trading' } });
       expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'back to rules', HUMAN)!.forced).toBe(false);
     });
+
+    it('un-forcing (auto) re-evaluates at once: a forced trading bucket without a record goes back to shadow; a qualified one keeps trading', () => {
+      h.ledger.forceRightsState('politics-non-us', 'medium', 'trading', 'test run', HUMAN);
+      h.ledger.forceRightsState('economics', 'short', 'trading', 'test run', HUMAN);
+      expect(h.rightsRepo.get('economics', 'short')).toMatchObject({ state: 'trading', forced: 1, max_allocation_usd: 50 });
+      const back = h.ledger.forceRightsState('economics', 'short', 'auto', 'test done', HUMAN)!;
+      expect(back).toMatchObject({ state: 'shadow', forced: false, maxAllocationUsd: 0 });
+      expect(h.auditActions('category_rights.change').at(-1)).toMatchObject({ actor: 'human', payload: { from: 'trading', to: 'shadow', forced: false } });
+      // Other buckets are untouched by the targeted evaluation
+      expect(h.rightsRepo.get('politics-non-us', 'medium')).toMatchObject({ state: 'trading', forced: 1 });
+
+      // With a qualifying record the rules promote it again straight away
+      for (let i = 0; i < 30; i++) {
+        h.forecastRepo.insertSuperseding({
+          id: `q${i}`, marketId: `mk${i}`, tokenId: `tok${i}`, eventId: `ev${i}`, category: 'economics', probability: 0.7,
+          marketPriceAtForecast: 0.5, bestBid: 0.49, bestAsk: 0.51, liquidityUsd: 1e4, rationale: 'r', sources: [],
+          ambiguityScore: 0, tradeable: false, daysToResolution: 3, horizonBucket: 'short', createdBy: 'human',
+          createdAt: new Date(T0 - 40 * DAY + i * DAY).toISOString(),
+        });
+        h.forecastRepo.setScore(`q${i}`, { outcome: i % 5 === 0 ? 0 : 1, brierAgent: 0, brierMarket: 0, skill: i % 5 === 0 ? -0.24 : 0.16, resolvedAt: new Date(T0 - 35 * DAY + i * DAY).toISOString() });
+      }
+      h.ledger.forceRightsState('economics', 'short', 'trading', 'again', HUMAN);
+      expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'rules', HUMAN)).toMatchObject({ state: 'trading', forced: false, maxAllocationUsd: 50 });
+      // Un-forcing a forced shadow bucket hands it to the rules too (qualified ⇒ trading now)
+      h.ledger.forceRightsState('economics', 'short', 'shadow', 'pause', HUMAN);
+      expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'resume', HUMAN)).toMatchObject({ state: 'trading', forced: false });
+    });
   });
 
   describe('risk engine path for ledger-driven buys', () => {

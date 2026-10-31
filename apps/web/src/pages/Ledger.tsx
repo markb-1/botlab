@@ -387,7 +387,7 @@ function ForceState({ bucket, onClose }: { bucket: BucketStats; onClose: () => v
     >
       <p className="text-sm text-gray-400">
         Currently <RightsBadge state={bucket.state} forced={bucket.forced} />. A forced state blocks automatic promotion and deprioritisation; suspension and
-        the mandate rule still apply. <strong>auto</strong> hands the bucket back to the rules. Forcing <strong>trading</strong> is refused unless the category
+        the mandate rule still apply. <strong>auto</strong> hands the bucket back to the rules and runs them at once (a forced <strong>trading</strong> bucket restarts from shadow and trades again only if its record qualifies). Forcing <strong>trading</strong> is refused unless the category
         is in the mandate allow list.
       </p>
       {state === 'trading' && (
