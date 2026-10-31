@@ -22,6 +22,8 @@ code is printed in the server log) → everything starts in **paper mode**. See 
 wallets assumed bot-only — manual trades on them trigger a halt), R98 (live gate), R109 (agent: paper-only bots,
 config-only edits), R110 (setup code). Full list below.
 
+**CI:** the final run (chunk 3c review fixes) failed lint on unnecessary `\"` escapes in `tests/server/ui-routes.test.ts`; fixed in the follow-up commit (lint 0 errors, tests green).
+
 **Not started:** Phase 4 (MCP server + scheduled agent) and Phase 5 (strategy templates).
 
 ## Plan

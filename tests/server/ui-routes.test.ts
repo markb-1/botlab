@@ -25,7 +25,7 @@ vi.mock('../../packages/core/src/exchange/polymarket/trading', async (importOrig
     ...actual,
     getBalance: vi.fn(async (address: string, rpcUrl: string) => {
       const err = new Error(
-        `missing response (requestBody="{\"method\":\"eth_call\",\"params\":[{\"to\":\"0x2791\",\"data\":\"0x70a08231000000000000000000000000${address.slice(2)}\"}]}", requestMethod="POST", serverError={}, url="${rpcUrl}", code=SERVER_ERROR, version=web/5.8.0)`
+        `missing response (requestBody="{"method":"eth_call","params":[{"to":"0x2791","data":"0x70a08231000000000000000000000000${address.slice(2)}"}]}", requestMethod="POST", serverError={}, url="${rpcUrl}", code=SERVER_ERROR, version=web/5.8.0)`
       ) as Error & { code: string };
       err.code = 'SERVER_ERROR';
       throw err;
