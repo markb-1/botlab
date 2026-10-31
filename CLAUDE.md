@@ -200,7 +200,13 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
   `meta.role` / `meta.trust: 'new'`; the seed stores the role in `scripts.builtin_role` (origin builtin only,
   `builtinRoleOf`). Only a bot on the builtin position-manager script gets `ctx.portfolio` (server-side, never from
   the script) and it cannot buy; its exits are risk-exit sells through the owner's OrderService (`orders.placed_by`).
-  One running bot per role and mode. Paper resting orders fill on a later sync when the book crosses them
+  One running bot per standing role and mode. Paper resting orders fill on a later sync when the book crosses them
+- **Strategy templates (5b)**: `templates/consistency.ts` and `templates/resolution-rule.ts` have strategy roles
+  (`STRATEGY_ROLES`; per opportunity, any number, the agent creates them). `isStandingRole` gates the one-per-mode
+  rule and the agent refusal — never test `role` alone for those. Agent strategy bots: mandate `strategies.allow`,
+  config vs `meta.configSchema` (`utils/configSchema.ts`) and `market_ids` covering every config token
+  (`BotService.checkAgentStrategyBot`). Scripts may `ctx.requestRetire(reason)` (retires only themselves, audited
+  `bot:<id>`); "short" = buy the complement token (`ctx.polymarket.getMarket(...).complementTokenId`)
 - **SDK types**: after changing `packages/core/src/sdk/types.ts`, run `npm run gen:sdk` (the d.ts for MCP and the typecheck is a committed generated file)
 - **Shutdown**: an unclean stop (crash, kill, second Ctrl+C after 2 s) ⇒ next start is globally halted (spec §4.3); clear via `POST /api/risk/clear-halt` (human, recent password check)
 

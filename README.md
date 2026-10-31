@@ -395,6 +395,9 @@ At least one of `onStart` or `onTick` must be exported. Both can coexist — `on
 | `ctx.polymarket.cancel / cancelAll / getOpenOrders / getFee` | This bot's orders; fee rates |
 | `ctx.ledger.getActiveForecasts(filter?)` / `getForecast(tokenId)` | Read the forecast ledger |
 | `ctx.risk.getBudget()` | Remaining allocation, per-market room, halted |
+| `ctx.risk.getExitFlags()` | Open exit flags on this bot's positions |
+| `ctx.polymarket.getMarket(conditionIdOrTokenId)` | Cached market: tokens, complement (NO) token, end date, closed, ambiguity, rules hash / change, dispute, in this bot's scope |
+| `ctx.requestRetire(reason)` | Retire this bot (terminal; the server stops it) when its opportunity is over |
 | `ctx.events.on('forecast_changed' \| 'rules_changed' \| 'halt', fn)` | Server push events (hints to re-check) |
 | `ctx.portfolio.*` | Position Manager template only |
 
@@ -441,6 +444,8 @@ The `meta.configSchema` object is a JSON Schema that generates the configuration
 |----------|-------------|
 | **Forecast Executor** | Standing bot (one per mode): trades the forecast ledger with post-only, Kelly-sized bids. See Strategies. |
 | **Position Manager** | Standing bot (one per mode): exits every bot's positions as risk exits. See Strategies. |
+| **Consistency** | Per opportunity: trades violations of a constraint between markets (implies, date ladder, exclusive sum) with hedged baskets. See Strategies. |
+| **Resolution Rule** | Per market: bids up to a target on the outcome its thesis favours, holds to resolution. See Strategies. |
 | **Copy Trading** | Monitor Polymarket traders and copy their trades. Configurable multipliers, Kelly criterion sizing, position limits, daily volume caps, and auto-redeem. |
 | **Binance Spot** | Monitor Binance spot prices and trade based on price thresholds. |
 
@@ -502,6 +507,50 @@ bots (the agent may pause them). Scripts cannot flag their own orders as risk ex
 (best bid − `escalate_slippage`) after `escalate_after_minutes` (30). Risk exits are exempt from hold time, order
 size, rate and spread limits and pass from any bot stage (a retired bot's positions can still be exited), but not
 from halts: during a halt or kill switch nothing is sold (spec §4.3).
+
+### Per-opportunity strategies: Consistency and Resolution Rule (5b)
+
+These two builtin templates (trust `new`: paper first) are made **one bot per opportunity**, usually by the agent
+(it may create, start, reconfigure and retire them; the standing executor / manager stay human-operated). They do
+not use forecasts or category rights, but every market they buy must be assessed for ambiguity (R51). A bot's
+`market_ids` must cover every token in its config (checked by the server for agent bots; every bot refuses to
+start otherwise). When their markets close, or the opportunity is gone, they retire themselves
+(`ctx.requestRetire`). Exits on risk triggers (rules change, ambiguity, dispute, exit flags) are left to the
+Position Manager. The bot page shows the consistency constraint with its current gap, or the resolution-rule
+thesis with its state.
+
+Polymarket has **no shorting**: to "sell" an outcome you do not hold, a bot buys the market's **other (NO) token**
+— YES at a plus NO at b pays exactly 1, so the NO token is the short.
+
+**Consistency** (`templates/consistency.ts`, spec §9.3) — a declared logical constraint between binary markets
+(their YES tokens, in `tokens`):
+
+| `constraint` | tokens | rule | trade on a violation |
+|---|---|---|---|
+| `implies` | [A, B] | A implies B: P(A) ≤ P(B) | buy B YES + A NO (pays ≥ 1) |
+| `date_ladder` | ordered by deadline, earliest first | "by date 1" implies "by date 2": prices non-decreasing | the most inverted pair: later YES + earlier NO |
+| `exclusive_sum` | mutually exclusive outcomes | Σ P ≤ `max_sum` (1) | buy NO on every leg (pays ≥ n − `max_sum`) |
+| `exclusive_sum` + `exhaustive: true` | exactly one outcome wins | Σ P = 1 | also: Σ YES < 1 ⇒ buy YES on every leg (pays 1) |
+
+Exhaustiveness is never assumed (an "Other" outcome, a tie or a void breaks it): set `exhaustive` only when the
+rules guarantee a single winner. The gap is payoff − Σ (best ask + taker fee at the ask) over the legs, i.e. at
+executable prices with the fee on every leg (R125); a basket trades only when the gap ≥ `min_gap` (0.03). One
+basket at a time: every leg rests post-only one tick inside its ask, sized by `max_pair_usd` (20), the risk budget
+and `max_unhedged_usd` (10: the cost of all legs but the cheapest, i.e. what can fill without its hedge). If some
+legs fill and others do not within `hedge_timeout_minutes` (15), the missing legs are bought marketable up to
+their ask at opening + `max_slippage` (0.02), and only while the hedged basket still costs no more than it pays.
+Otherwise the basket is **unhedged**: no new baskets, and with `flatten_unhedged` (default) the bot sells its own
+excess at best bid − `max_slippage` (an ordinary sell: hold time applies, never a risk exit). After
+`idle_days` (7) without a gap it retires itself.
+
+**Resolution Rule** (`templates/resolution-rule.ts`, spec §9.4) — one market where the rules favour an outcome.
+Config: `token_id`, `target_entry_price`, `max_size_usd`, `thesis` (≤ 2000 chars, shown on the bot page), optional
+`forecast_id`, `invalidate_on_rules_change` (true), `max_ambiguity` (1), `invalidate_before_end_minutes` (120),
+`requote_minutes` (5). It rests post-only GTD bids one tick over the best other bid, never above the target, until
+it holds `max_size_usd` of cost, holds to resolution and **never sells**. It stops buying for good (cancels its
+bids) on a rules change since it first started, a UMA dispute, ambiguity above `max_ambiguity`, the linked
+forecast withdrawn or below the target, an exit flag on its position, or the end approaching; the Position Manager
+handles any exit, and the bot retires itself once flat or when the market closes.
 
 ---
 
