@@ -104,9 +104,12 @@ apps/server/src/
   masterKey.ts migrateKey.ts cli.ts paths.ts instanceLock.ts
 
 apps/web/src/              # React UI
-  pages/                   # Dashboard, Bots, Scripts, Wallets, Settings, LoginScreen
-  hooks/                   # React Query hooks over lib/api.ts
+  pages/                   # Dashboard, Bots, BotDetail (code view, orders), Scripts, Ledger, Markets, Risk,
+                           # Audit, Approvals, Wallets, Settings (Telegram, password, tokens, reconcile/adopt)
+  hooks/                   # React Query hooks over lib/api.ts; useLiveUpdates = SSE → query invalidation
   lib/api.ts               # fetch client (same exports as the old electronApi) + EventSource events
+  lib/                     # pure helpers (unit-tested in tests/web): lineDiff, schemaForm, sdkTypings, calibration
+  components/ConfigEditor.tsx  # config file editor: zod→JSON-Schema form / YAML, preview (risk raises), save with hash, history
   components/ReauthDialog.tsx  # password prompt for human-only actions (reauth_required)
 
 scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
@@ -143,6 +146,8 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 - React 19 + React Router (hash routes) + TanStack React Query + Tailwind CSS
 - Hooks in `hooks/` wrap `lib/api.ts` calls with React Query; real-time events via `events.onBotEvent/onBotLog/...` (one shared EventSource on `/api/events`)
 - Vite dev server proxies `/api` and `/healthz` to the server (`BOTLAB_PORT`, default 3780)
+- Shared UI pieces in `components/ui.tsx` (Card, Badge, Modal, ConfirmDialog, LimitBar, Tabs); pages must stay usable at phone width (sidebar becomes a drawer below `md`)
+- Script editor typings come from `packages/core/src/sdk/types.ts` (imported `?raw`, converted by `lib/sdkTypings.ts`): change the SDK types, not the editor
 
 ## Key Gotchas
 

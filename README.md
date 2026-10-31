@@ -79,15 +79,17 @@ The image builds for `linux/amd64` and `linux/arm64` (`docker buildx build --pla
    itself: `docker compose logs botlab | grep "Setup code"`).
 2. Create a bot from a template — new bots are **paper** bots (simulated balance, real market data).
 3. Live trading is **off** until you enable it explicitly: add a wallet (Wallets page), set
-   `live_trading.enabled: true` in `limits.yaml`, and create the bot in **Live** mode. Until then live
+   `live_trading.enabled: true` (Risk page → Limits, or `limits.yaml`), and create the bot in **Live** mode. Until then live
    bots are refused at start and any live order is rejected (`live_disabled`).
 4. All hard limits (exposure, loss limits, order sizes, ramp) are in `config/limits.yaml` and
-   `config/mandate.yaml`; edits are picked up without a restart.
+   `config/mandate.yaml`; edit them on the Risk page (validated, risk raises flagged, history with
+   diff and restore) or by hand — edits are picked up without a restart.
+5. Before a bot may **buy** a Polymarket market, the market's rules must be assessed: Markets page →
+   open the market → **Set ambiguity** (or a forecast with an ambiguity score).
 
 After an unclean stop (crash, power cut, Windows Update reboot, a second Ctrl+C) the server starts with a
-**global halt**; open orders are cancelled. Clear it after checking: `POST /api/risk/clear-halt` (a
-Risk page with a button comes in 3c; until then e.g. from the browser console while logged in:
-`fetch('/api/risk/clear-halt', {method:'POST', headers:{'X-BotLab':'1','Content-Type':'application/json'}, body: JSON.stringify({scope:'global', reason:'checked'})})`).
+**global halt**; open orders are cancelled. Clear it after checking: **Clear halt** on the Dashboard or the
+Risk page (a reason and, if your last password check is older than 15 minutes, your password).
 
 ---
 
