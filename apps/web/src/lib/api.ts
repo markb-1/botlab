@@ -133,8 +133,10 @@ export const authApi = {
 export const botApi = {
   list: (filter?: { scriptId?: string; status?: string }) => call('GET', `/bots${qs(filter)}`),
   get: (id: string) => call('GET', `/bots/${enc(id)}`),
-  create: (data: { name: string; scriptId: string; walletId?: string; config?: Record<string, unknown>; mode?: 'live' | 'paper' }) => call('POST', '/bots', data),
-  update: (id: string, data: { name?: string; config?: Record<string, unknown>; enabled?: boolean; walletId?: string }) => call('PATCH', `/bots/${enc(id)}`, data),
+  create: (data: { name: string; scriptId: string; walletId?: string; config?: Record<string, unknown>; mode?: 'live' | 'paper' }) =>
+    call('POST', '/bots', data),
+  update: (id: string, data: { name?: string; config?: Record<string, unknown>; enabled?: boolean; walletId?: string }) =>
+    call('PATCH', `/bots/${enc(id)}`, data),
   delete: (id: string) => call('DELETE', `/bots/${enc(id)}`),
   start: (id: string) => call('POST', `/bots/${enc(id)}/start`),
   stop: (id: string) => call('POST', `/bots/${enc(id)}/stop`),
@@ -208,7 +210,8 @@ export const scriptApi = {
   list: () => call('GET', '/scripts'),
   get: (id: string) => call('GET', `/scripts/${enc(id)}`),
   create: (data: { name: string; description?: string; source: string; configSchema?: Record<string, unknown> }) => call('POST', '/scripts', data),
-  update: (id: string, data: { name?: string; description?: string; source?: string; configSchema?: Record<string, unknown> }) => call('PATCH', `/scripts/${enc(id)}`, data),
+  update: (id: string, data: { name?: string; description?: string; source?: string; configSchema?: Record<string, unknown> }) =>
+    call('PATCH', `/scripts/${enc(id)}`, data),
   delete: (id: string) => call('DELETE', `/scripts/${enc(id)}`),
   getSchema: (id: string) => call('GET', `/scripts/${enc(id)}/schema`),
   compile: (source: string): Promise<{ compiled: boolean; error?: string }> => call('POST', '/scripts/compile', { source }),
@@ -266,7 +269,10 @@ export const configApi = {
   get: () => call('GET', '/config'),
   write: (file: ConfigFile, value: unknown, expectedSha256?: string) => call('PUT', `/config/${file}`, { value, expectedSha256 }),
   history: (file: ConfigFile) => call('GET', `/config/${file}/history`),
-  restore: (file: ConfigFile, versionId: string) => call('POST', `/config/${file}/restore`, { versionId }),
+  /** `expectedSha256`: hash of the file when the restore was reviewed (refused if it changed since) */
+  restore: (file: ConfigFile, versionId: string, expectedSha256?: string) => call('POST', `/config/${file}/restore`, { versionId, expectedSha256 }),
+  /** What restoring a version would change, classified against the current file */
+  previewRestore: (file: ConfigFile, versionId: string) => call('POST', `/config/${file}/restore/preview`, { versionId }),
   schemas: () => call('GET', '/config/schema'),
   /** Validation + risk classification of an edit; nothing is written */
   preview: (file: ConfigFile, value: unknown) => call('POST', `/config/${file}/preview`, { value }),
@@ -274,8 +280,16 @@ export const configApi = {
 };
 
 export const auditApi = {
-  list: (filter?: { action?: string; actionPrefix?: string; actor?: string; target?: string; since?: string; until?: string; before?: number; limit?: number }) =>
-    call('GET', `/audit${qs(filter)}`),
+  list: (filter?: {
+    action?: string;
+    actionPrefix?: string;
+    actor?: string;
+    target?: string;
+    since?: string;
+    until?: string;
+    before?: number;
+    limit?: number;
+  }) => call('GET', `/audit${qs(filter)}`),
   actions: (): Promise<string[]> => call('GET', '/audit/actions'),
 };
 
@@ -287,10 +301,18 @@ export const tokenApi = {
 };
 
 export const ledgerApi = {
-  submitForecast: (input: { tokenId: string; probability: number; rationale: string; sources: string[]; ambiguityScore: number }) => call('POST', '/ledger/forecasts', input),
+  submitForecast: (input: { tokenId: string; probability: number; rationale: string; sources: string[]; ambiguityScore: number }) =>
+    call('POST', '/ledger/forecasts', input),
   withdrawForecast: (id: string, reason: string) => call('POST', `/ledger/forecasts/${enc(id)}/withdraw`, { reason }),
-  list: (filter?: { status?: string | string[]; category?: string; horizonBucket?: string; marketId?: string; tokenId?: string; tradeableOnly?: boolean; limit?: number }) =>
-    call('GET', `/ledger/forecasts${qs(filter)}`),
+  list: (filter?: {
+    status?: string | string[];
+    category?: string;
+    horizonBucket?: string;
+    marketId?: string;
+    tokenId?: string;
+    tradeableOnly?: boolean;
+    limit?: number;
+  }) => call('GET', `/ledger/forecasts${qs(filter)}`),
   get: (id: string) => call('GET', `/ledger/forecasts/${enc(id)}`),
   stats: () => call('GET', '/ledger/stats'),
   setRightsState: (category: string, bucket: string, state: string, reason: string) => call('POST', '/ledger/rights', { category, bucket, state, reason }),
@@ -305,9 +327,11 @@ export const marketApi = {
 
 export const reconcileApi = {
   status: () => call('GET', '/reconcile/status'),
-  adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => call('POST', '/reconcile/adopt', { walletId, botId, ...opts }),
-  /** What adoption would do now (nothing written) */
-  adoptPreview: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => call('POST', '/reconcile/adopt/preview', { walletId, botId, ...opts }),
+  adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) =>
+    call('POST', '/reconcile/adopt', { walletId, botId, ...opts }),
+  /** What adoption would do now: adopts nothing, but syncs the wallet's orders with the exchange first (may record real fills) */
+  adoptPreview: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) =>
+    call('POST', '/reconcile/adopt/preview', { walletId, botId, ...opts }),
   watchlistList: () => call('GET', '/recorder/watchlist'),
   watchlistAdd: (tokenId: string, marketId?: string, note?: string) => call('POST', '/recorder/watchlist', { tokenId, marketId, note }),
   watchlistRemove: (tokenId: string) => call('DELETE', `/recorder/watchlist/${enc(tokenId)}`),

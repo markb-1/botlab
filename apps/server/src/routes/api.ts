@@ -14,7 +14,7 @@
  * Read routes added for the 3c pages: `/api/risk/overview` (get_overview; all scopes), `/api/audit`
  * (admin + readonly), `/api/config/schema` (admin + readonly), `/api/config/:file/preview` and
  * `/api/config/:file/history/:versionId` (admin session only), script versions, bot orders, forecast by
- * id and market search (all scopes), `/api/reconcile/adopt/preview` (admin session only).
+ * id and market search (all scopes), `/api/reconcile/adopt/preview` (admin session only; syncs the wallet's orders, adopts nothing).
  */
 
 import type { CoreServices } from '../../../../packages/core/src/core';
@@ -196,7 +196,7 @@ export function riskRoutes(risk: CoreServices['risk'], overview: CoreServices['o
 // ── Config files ────────────────────────────────────────────────────────
 
 const ConfigWriteBody = z.object({ value: z.unknown(), expectedSha256: z.string().optional() });
-const ConfigRestoreBody = z.object({ versionId: z.string() });
+const ConfigRestoreBody = z.object({ versionId: z.string(), expectedSha256: z.string().optional() });
 const ConfigPreviewBody = z.object({ value: z.unknown() });
 
 export function configRoutes(config: CoreServices['config']): RouteDef[] {
@@ -235,7 +235,16 @@ export function configRoutes(config: CoreServices['config']): RouteDef[] {
       path: '/api/config/:file/restore',
       recentAuth: true,
       domainErrors: 'invalid_input',
-      handler: ({ param, body, human }) => config.restore(parseInput(ConfigFileSchema, param('file')), parseInput(ConfigRestoreBody, body).versionId, human()),
+      handler: ({ param, body, human }) => {
+        const { versionId, expectedSha256 } = parseInput(ConfigRestoreBody, body);
+        return config.restore(parseInput(ConfigFileSchema, param('file')), versionId, human(), expectedSha256);
+      },
+    },
+    // Dry run of a restore: the version classified against the current file (UI review before restoring)
+    {
+      method: 'post',
+      path: '/api/config/:file/restore/preview',
+      handler: ({ param, body, human }) => config.previewRestore(parseInput(ConfigFileSchema, param('file')), parseInput(ConfigRestoreBody, body).versionId, human()),
     },
   ];
 }
@@ -325,7 +334,8 @@ export function reconcileRoutes(reconcile: CoreServices['reconcile']): RouteDef[
         return reconcile.adoptPositions(walletId, botId, human(), { includePostFirstOrder });
       },
     },
-    // What adoption would do now (same checks, nothing written); human admin, no recent password needed
+    // What adoption would do now (same checks; writes no adopted fill, but syncs the wallet's orders like a
+    // reconciler run, which may record real fills / expire orders); human admin, no recent password needed
     {
       method: 'post',
       path: '/api/reconcile/adopt/preview',

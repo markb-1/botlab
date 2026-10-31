@@ -1014,8 +1014,11 @@ export class Reconciler implements ClockSkewGuard {
    * adopted; anything beyond needs `includePostFirstOrder: true` (audited).
    */
   /**
-   * `dryRun` (UI preview): the same checks, order sync and plan, but nothing is adopted and only a
-   * non-human caller is audited; the planned rows are returned in `adopted`.
+   * `dryRun` (UI preview): the same checks and plan, the planned rows returned in `adopted`; no adopted
+   * fill is written and only a non-human caller is audited. It is **not read-only**: step 1 syncs the
+   * wallet's live orders with the exchange like a reconciler run (which may record real fills and expire
+   * or link orders). A dry run holds the reconcile lock only for that sync; the Data API position and
+   * per-token history lookups run without it (they only read), so a slow preview never delays a run.
    */
   async adoptPositions(walletId: string, botId: string, humanActor: HumanActor, opts: { includePostFirstOrder?: boolean; dryRun?: boolean } = {}): Promise<AdoptResult> {
     const actor = auditActorOf(humanActor);
@@ -1040,7 +1043,12 @@ export class Reconciler implements ClockSkewGuard {
     // Not while a run compares positions
     while (this.running) await this.running;
     let release!: () => void;
-    this.running = new Promise<ReconcileRunResult | null>((r) => (release = () => r(null)));
+    const lock = new Promise<ReconcileRunResult | null>((r) => (release = () => r(null)));
+    this.running = lock;
+    const unlock = () => {
+      if (this.running === lock) this.running = null;
+      release();
+    };
     try {
       // 1. Bring the wallet's orders up to date (fills recorded locally are not "unexplained")
       const sync = { errors: [], ordersChecked: 0, recovered: [], expired: [], ambiguous: [] } as unknown as ReconcileRunResult;
@@ -1050,6 +1058,8 @@ export class Reconciler implements ClockSkewGuard {
         .findOpen(undefined, false)
         .filter((o) => o.exchange === 'polymarket' && !o.exchange_order_id && this.walletOf(o) === walletId);
       if (unknown.length > 0) deny(`wallet has ${unknown.length} open order(s) with unknown outcome (${unknown.map((o) => o.id).join(', ')}); wait for the reconciler`);
+      // A preview writes nothing below: let reconciler runs go on during its network lookups
+      if (dryRun) unlock();
 
       // 2. Exchange excess, capped at what was held before the wallet's first order
       const diffs = (await this.polymarketDiffs(walletId)).filter((d) => d.direction === 'exchange_excess');
@@ -1124,8 +1134,7 @@ export class Reconciler implements ClockSkewGuard {
       logger.info(`[Reconciler] Adopted ${result.adopted.length} position(s) of wallet ${walletId} into bot ${botId}`);
       return result;
     } finally {
-      this.running = null;
-      release();
+      unlock();
     }
   }
 }

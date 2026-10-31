@@ -10,6 +10,7 @@ import type { OrderbookSnapshotRepository } from '../db/repositories/OrderbookSn
 import type { AuditService } from '../audit/AuditService';
 import { auditActorOf, requireActor, type Actor, type HumanActor } from './actors';
 import { ServiceError, invalidInput } from './errors';
+import { scrubPublicText } from './redact';
 
 export class ReconcileService {
   constructor(
@@ -28,7 +29,10 @@ export class ReconcileService {
 
   /** Last reconciler run (null before the first one) */
   status() {
-    return this.reconciler().lastRun();
+    const last = this.reconciler().lastRun();
+    if (!last) return null;
+    // Exchange / Data API errors may embed request URLs (signed Binance queries): host only
+    return { ...last, result: { ...last.result, errors: last.result.errors.map(scrubPublicText) } };
   }
 
   /** One-time adoption of pre-existing exchange positions (R8) into a bot on the same wallet */
@@ -38,7 +42,10 @@ export class ReconcileService {
     return r.adoptPositions(walletId, botId, actor, { includePostFirstOrder: opts?.includePostFirstOrder === true });
   }
 
-  /** What `adoptPositions` would adopt now (same checks; nothing written). Human only. */
+  /**
+   * What `adoptPositions` would adopt now (same checks). Writes no adopted fill, but first syncs the wallet's
+   * orders with the exchange like a reconciler run (may record real fills, expire or link orders). Human only.
+   */
   async adoptPreview(walletId: unknown, botId: unknown, actor: HumanActor, opts?: { includePostFirstOrder?: unknown }) {
     const r = this.reconciler();
     if (typeof walletId !== 'string' || !walletId || typeof botId !== 'string' || !botId) throw invalidInput('walletId and botId are required');

@@ -449,17 +449,7 @@ export class ConfigService {
       if (!CONFIG_FILE_NAMES.includes(file)) throw new Error(`Unknown config file: ${String(file)}`);
       const current = this.requireConfig();
 
-      if (expectedSha256 !== undefined) {
-        let onDisk = '';
-        try {
-          onDisk = fs.readFileSync(this.filePath(file), 'utf8');
-        } catch {
-          /* missing file: hash mismatch below */
-        }
-        if (sha256(onDisk) !== expectedSha256) {
-          throw new Error(`${FILE_NAMES[file]} changed on disk since it was loaded; reload it and apply your edit again`);
-        }
-      }
+      this.checkUnchanged(file, expectedSha256);
 
       const unmasked = this.unmask(file, newValue, current);
       const result = SCHEMAS[file].safeParse(unmasked);
@@ -522,11 +512,50 @@ export class ConfigService {
     return { valid: true, issues: [], changes, raises: changes.some((c) => c.effect === 'raises') };
   }
 
-  /** Re-apply the file text of a previous version (validated like any edit). */
-  restore(file: ConfigFileName, versionId: string, humanActor: HumanActor): Promise<ConfigChangedEvent | null> {
+  /** Lost-update guard: refuse when the file on disk no longer hashes to what the caller loaded. */
+  private checkUnchanged(file: ConfigFileName, expectedSha256: string | undefined): void {
+    if (expectedSha256 === undefined) return;
+    let onDisk = '';
+    try {
+      onDisk = fs.readFileSync(this.filePath(file), 'utf8');
+    } catch {
+      /* missing file: hash mismatch below */
+    }
+    if (sha256(onDisk) !== expectedSha256) {
+      throw new Error(`${FILE_NAMES[file]} changed on disk since it was loaded; reload it and apply your edit again`);
+    }
+  }
+
+  /**
+   * Dry run of `restore`: the version's text parsed like a reload (strict) and classified against the
+   * current file, so restoring an older, looser version is flagged as raising risk like any edit.
+   */
+  previewRestore(file: ConfigFileName, versionId: string): { valid: boolean; issues: string[]; changes: ClassifiedChange[]; raises: boolean } {
+    const fail = (issues: string[]) => ({ valid: false, issues: issues.map((i) => this.scrub(i)), changes: [], raises: false });
+    if (!CONFIG_FILE_NAMES.includes(file)) return fail([`Unknown config file: ${String(file)}`]);
+    const text = this.store?.read(file, versionId) ?? null;
+    if (text === null) return fail([`Unknown version ${versionId} of ${FILE_NAMES[file]}`]);
+    const current = this.current;
+    if (!current) return fail([`The current config is invalid, so a restore cannot be checked against it: ${this.getLastError() ?? 'not loaded'}`]);
+    let value: unknown;
+    try {
+      value = parseConfigYaml(SCHEMAS[file], text, `${FILE_NAMES[file]}@${versionId}`, { strict: true, requiredSections: REQUIRED_SECTIONS[file] });
+    } catch (err) {
+      return fail(err instanceof ConfigError ? err.issues : [err instanceof Error ? err.message : String(err)]);
+    }
+    const candidate = { ...current, [file]: value } as AppConfig;
+    const cross = validateCrossFile(candidate.limits, candidate.mandate);
+    if (cross.length > 0) return fail(cross);
+    const changes = classifyChange({ [file]: current[file] }, { [file]: value } as Partial<AppConfig>).map(redactChange);
+    return { valid: true, issues: [], changes, raises: changes.some((c) => c.effect === 'raises') };
+  }
+
+  /** Re-apply the file text of a previous version (validated like any edit). `expectedSha256` as in `write`. */
+  restore(file: ConfigFileName, versionId: string, humanActor: HumanActor, expectedSha256?: string): Promise<ConfigChangedEvent | null> {
     const actor = auditActorOf(humanActor);
     return this.exclusive(async () => {
       this.assertHuman(humanActor, 'config.restore', file);
+      this.checkUnchanged(file, expectedSha256);
       if (!this.store) throw new Error('Config history is not available');
       if (!CONFIG_FILE_NAMES.includes(file)) throw new Error(`Unknown config file: ${String(file)}`);
       const text = this.store.read(file, versionId);

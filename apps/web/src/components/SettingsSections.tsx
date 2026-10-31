@@ -384,6 +384,9 @@ function AdoptPositions() {
           )}
         </span>
       </label>
+      <p className="text-xs text-gray-500">
+        Preview adopts nothing, but first syncs this wallet’s orders with the exchange like a reconciler run (fills found are recorded).
+      </p>
       <ErrorBox>{error}</ErrorBox>
       {preview && (
         <div className="space-y-2">

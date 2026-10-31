@@ -20,3 +20,4 @@ export type { OverviewView, BotAllocationView } from './OverviewService';
 export { AuditLogService } from './AuditLogService';
 export type { AuditQuery, AuditPage, AuditEntryView } from './AuditLogService';
 export type { BotOrderView } from './BotService';
+export { PublicError, publicLookupError, scrubPublicText } from './redact';

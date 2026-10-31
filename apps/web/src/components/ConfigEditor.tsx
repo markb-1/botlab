@@ -6,7 +6,7 @@ import type { ConfigPreview, ConfigVersion } from '../types';
 import { useConfig, useConfigSchemas } from '../hooks/useRisk';
 import { SchemaForm } from './SchemaForm';
 import { DiffView } from './DiffView';
-import { Badge, Card, ConfirmDialog, ErrorBox, Modal, Notice, btnPrimary, btnSecondary, inputCls } from './ui';
+import { Badge, Card, ErrorBox, Modal, Notice, btnPrimary, btnSecondary, inputCls } from './ui';
 import { dateTime, errorMessage } from '../lib/format';
 
 const SECRET_PATHS: Partial<Record<ConfigFile, string[]>> = { server: ['notify.telegram.bot_token'] };
@@ -90,8 +90,11 @@ export function ConfigEditor({
   const switchMode = (next: 'form' | 'yaml') => {
     if (next === mode) return;
     if (next === 'yaml') {
+      // Fields with a typing error kept their last valid value, which is what the YAML shows
       setYamlText(YAML.stringify(draft ?? {}));
       setYamlError(null);
+      setFieldErrors({});
+      setFormKey((k) => k + 1);
     } else {
       try {
         setDraft(YAML.parse(yamlText) ?? {});
@@ -133,6 +136,10 @@ export function ConfigEditor({
   };
 
   const save = async () => {
+    if (!baseHash) {
+      setError('The file hash is unknown (the config did not reload): reload the page before saving.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
@@ -143,7 +150,14 @@ export function ConfigEditor({
       );
       setPreview(null);
       const fresh = await refetch();
-      adopt((fresh.data?.config?.[file] ?? value) as Record<string, unknown>, fresh.data?.hashes?.[file]);
+      const freshHash = fresh.data?.hashes?.[file];
+      if (fresh.error || !freshHash || !fresh.data?.config?.[file]) {
+        // Saved, but the new state could not be loaded: block further saves until a reload succeeds
+        setBaseHash(undefined);
+        setError('Saved, but reloading the config failed. Reload the page before editing again.');
+      } else {
+        adopt(fresh.data.config[file] as Record<string, unknown>, freshHash);
+      }
       qc.invalidateQueries({ queryKey: ['configHistory', file] });
       qc.invalidateQueries({ queryKey: ['overview'] });
     } catch (err) {
@@ -391,18 +405,84 @@ export function ConfigHistory({ file }: { file: ConfigFile }) {
       )}
       {diffOf && <VersionDiff file={file} v={diffOf.v} prev={diffOf.prev} onClose={() => setDiffOf(null)} />}
       {restoreOf && (
-        <ConfirmDialog
-          title={`Restore ${file}.yaml to ${dateTime(restoreOf.at)}?`}
-          confirmLabel="Restore"
-          body={<p>The old text is validated like any edit and becomes the file. If it raises risk, a Telegram confirmation is sent.</p>}
-          onConfirm={async () => {
-            await configApi.restore(file, restoreOf.versionId);
+        <RestoreReview
+          file={file}
+          version={restoreOf}
+          onDone={() => {
             for (const k of ['config', 'configHistory', 'overview']) qc.invalidateQueries({ queryKey: [k] });
           }}
           onClose={() => setRestoreOf(null)}
         />
       )}
     </Card>
+  );
+}
+
+/**
+ * Restore goes through the same review as an edit: the server classifies the version against the current
+ * file (an older, looser version raises risk), raises need the tick, and the restore carries the hash of
+ * the file as reviewed so a concurrent edit is not overwritten.
+ */
+function RestoreReview({ file, version, onDone, onClose }: { file: ConfigFile; version: ConfigVersion; onDone: () => void; onClose: () => void }) {
+  const { data: cfg } = useConfig();
+  const [hash] = useState<string | undefined>(cfg?.hashes?.[file]);
+  const { data: preview, error: previewError } = useQuery({
+    queryKey: ['configRestorePreview', file, version.versionId],
+    queryFn: async () => (await configApi.previewRestore(file, version.versionId)) as ConfigPreview,
+    gcTime: 0,
+  });
+  const [ackRaise, setAckRaise] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const restore = async () => {
+    if (!hash) {
+      setError('The current file hash is unknown; reload the page before restoring.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await configApi.restore(file, version.versionId, hash);
+      onDone();
+      onClose();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      title={`Restore ${file}.yaml to ${dateTime(version.at)}?`}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <button type="button" className={btnSecondary} onClick={onClose}>
+            Cancel
+          </button>
+          {preview?.valid && (
+            <button
+              type="button"
+              className={btnPrimary}
+              onClick={restore}
+              disabled={busy || !hash || preview.changes.length === 0 || (preview.raises && !ackRaise)}
+            >
+              {busy ? 'Restoring…' : preview.raises ? 'Restore (raises risk)' : 'Restore'}
+            </button>
+          )}
+        </>
+      }
+    >
+      <p className="text-sm text-gray-400">The old text replaces the file (comments included) after the same validation as any edit.</p>
+      <ErrorBox>{previewError ? errorMessage(previewError) : null}</ErrorBox>
+      {preview ? (
+        <PreviewPanel preview={preview} ackRaise={ackRaise} setAckRaise={setAckRaise} />
+      ) : (
+        !previewError && <p className="text-sm text-gray-500">Checking…</p>
+      )}
+      <ErrorBox>{error}</ErrorBox>
+    </Modal>
   );
 }
 

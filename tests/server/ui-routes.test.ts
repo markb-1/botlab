@@ -13,6 +13,25 @@ import { sqliteAvailable } from '../orders/db';
 import { createCore, type Core } from '../../packages/core/src';
 import { createApp } from '../../apps/server/src/app';
 import { LoginLimiter } from '../../apps/server/src/routes/auth';
+import { scrubPublicText, publicLookupError, PublicError } from '../../packages/core/src/services/redact';
+
+const RPC_URL = 'https://polygon-mainnet.g.alchemy.com/v2/SECRET_ALCHEMY_KEY_123';
+const WALLET = '0x1111111111111111111111111111111111111111';
+
+// The Polygon balance read fails the way ethers v5 does: URL (with the API key) and request body in the message
+vi.mock('../../packages/core/src/exchange/polymarket/trading', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/core/src/exchange/polymarket/trading')>();
+  return {
+    ...actual,
+    getBalance: vi.fn(async (address: string, rpcUrl: string) => {
+      const err = new Error(
+        `missing response (requestBody="{\"method\":\"eth_call\",\"params\":[{\"to\":\"0x2791\",\"data\":\"0x70a08231000000000000000000000000${address.slice(2)}\"}]}", requestMethod="POST", serverError={}, url="${rpcUrl}", code=SERVER_ERROR, version=web/5.8.0)`
+      ) as Error & { code: string };
+      err.code = 'SERVER_ERROR';
+      throw err;
+    }),
+  };
+});
 
 const PASSWORD = 'correct horse battery';
 const HOST = '127.0.0.1:3780';
@@ -82,6 +101,73 @@ describe.skipIf(!sqliteAvailable)('3c UI routes', () => {
       reconciler: { locked: false },
     });
     expect(o.equity.usd).toBe(0); // no live bots: no wallets to read
+  });
+
+  it('equity errors never carry the RPC URL / API key or the request body (agent and readonly see them)', async () => {
+    core.repos.settingsRepo.update({ rpcUrl: RPC_URL });
+    const wallet = core.repos.walletRepo.create({ name: 'live', address: WALLET, privateKeyEncrypted: 'x' });
+    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    core.repos.botRepo.create({ name: 'live bot', scriptId: script.id, walletId: wallet.id, mode: 'live', stage: 'full' });
+    for (const auth of [{ cookie }, { bearer: agent }, { bearer: readonly }]) {
+      const o = (await req('GET', '/api/risk/overview', auth)).json.data;
+      expect(o.equity.usd).toBeNull();
+      expect(o.equity.error).toBe('polygon balance lookup failed (SERVER_ERROR)');
+      const text = JSON.stringify(o);
+      expect(text).not.toContain('SECRET_ALCHEMY_KEY');
+      expect(text).not.toContain('alchemy');
+      expect(text).not.toContain(WALLET.slice(2));
+    }
+  });
+
+  it('redaction helpers: URLs keep only the host, addresses are shortened, library codes kept', () => {
+    expect(scrubPublicText(`failed url="${RPC_URL}" for ${WALLET}`)).toBe('failed url="https://polygon-mainnet.g.alchemy.com/…" for 0x1111…1111');
+    expect(scrubPublicText('GET https://api.binance.com/api/v3/account?timestamp=1&signature=abc failed')).toBe('GET https://api.binance.com/… failed');
+    expect(publicLookupError(Object.assign(new Error(RPC_URL), { code: 'NETWORK_ERROR' }), 'x')).toBe('x failed (NETWORK_ERROR)');
+    expect(publicLookupError(new Error(RPC_URL), 'x')).toBe('x failed');
+    expect(publicLookupError(new PublicError('RPC URL or USDC contract not configured'), 'x')).toBe('RPC URL or USDC contract not configured');
+  });
+
+  it('saving the config form unchanged gives zero changes', async () => {
+    const got = (await req('GET', '/api/config', { cookie })).json.data;
+    for (const file of ['limits', 'mandate', 'fees', 'server', 'categories']) {
+      const value = got.config[file];
+      const preview = (await req('POST', `/api/config/${file}/preview`, { cookie, body: { value } })).json.data;
+      expect({ file, ...preview }).toEqual({ file, valid: true, issues: [], changes: [], raises: false });
+      const saved = await req('PUT', `/api/config/${file}`, { cookie, body: { value, expectedSha256: got.hashes[file] } });
+      expect({ file, data: saved.json.data }).toEqual({ file, data: { changes: [], raises: [] } });
+    }
+    // The masked Telegram token sent back unchanged keeps the stored value
+    expect(core.configService.getConfig()?.server.notify.telegram.bot_token).toBe('');
+  });
+
+  it('restore is reviewed like an edit: restoring a looser version is classified raises; the hash is checked', async () => {
+    const got = (await req('GET', '/api/config', { cookie })).json.data;
+    const initial = (await req('GET', '/api/config/limits/history', { cookie })).json.data[0];
+    const lowered = structuredClone(got.config.limits);
+    lowered.global.daily_loss_limit_usd = 40;
+    lowered.per_market.max_exposure_usd = 20;
+    expect((await req('PUT', '/api/config/limits', { cookie, body: { value: lowered, expectedSha256: got.hashes.limits } })).status).toBe(200);
+
+    expect(await statuses('POST', '/api/config/limits/restore/preview', { versionId: initial.versionId })).toEqual([200, 403, 403]);
+    const preview = (await req('POST', '/api/config/limits/restore/preview', { cookie, body: { versionId: initial.versionId } })).json.data;
+    expect(preview).toMatchObject({ valid: true, raises: true });
+    expect(preview.changes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'global.daily_loss_limit_usd', old: 40, new: 100, effect: 'raises' }),
+        expect.objectContaining({ path: 'per_market.max_exposure_usd', old: 20, new: 50, effect: 'raises' }),
+      ])
+    );
+    expect((await req('POST', '/api/config/limits/restore/preview', { cookie, body: { versionId: '20990101T000000000Z' } })).json.data.valid).toBe(false);
+
+    const stale = await req('POST', '/api/config/limits/restore', { cookie, body: { versionId: initial.versionId, expectedSha256: got.hashes.limits } });
+    expect(stale.json.success).toBe(false);
+    expect(stale.json.error).toMatch(/changed on disk/);
+    expect(core.configService.getConfig()?.limits.global.daily_loss_limit_usd).toBe(40);
+
+    const hash = (await req('GET', '/api/config', { cookie })).json.data.hashes.limits;
+    const ok = await req('POST', '/api/config/limits/restore', { cookie, body: { versionId: initial.versionId, expectedSha256: hash } });
+    expect(ok.json.data.raises).toEqual(expect.arrayContaining(['limits.global.daily_loss_limit_usd']));
+    expect(core.configService.getConfig()?.limits.global.daily_loss_limit_usd).toBe(100);
   });
 
   it('audit log: admin and readonly, not the agent; paged newest first', async () => {

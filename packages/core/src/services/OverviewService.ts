@@ -21,6 +21,8 @@ import type { Reconciler } from '../reconcile/Reconciler';
 import { RiskEngine, daysToSettlement, isLongHorizon } from '../risk/RiskEngine';
 import type { BotStage } from '../risk/types';
 import { unfilledNotional } from '../orders/DbRiskStateProvider';
+import { publicLookupError, scrubPublicText } from './redact';
+import logger from '../utils/logger';
 
 const EQUITY_CACHE_MS = 30_000;
 const EQUITY_TIMEOUT_MS = 10_000;
@@ -138,7 +140,9 @@ export class OverviewService {
           this.equityCache =
             Number.isFinite(cash) && cash >= 0 ? { at: this.now(), cash, error: null } : { at: this.now(), cash: null, error: 'balance not a number' };
         } catch (err) {
-          this.equityCache = { at: this.now(), cash: null, error: err instanceof Error ? err.message : String(err) };
+          // Library errors carry the RPC URL (API key) and request body: log them, return a short message
+          logger.warning(`[Overview] Equity cash lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+          this.equityCache = { at: this.now(), cash: null, error: publicLookupError(err, 'balance lookup') };
         } finally {
           clearTimeout(timer);
           this.equityInflight = null;
@@ -262,13 +266,13 @@ export class OverviewService {
         locked: reconciler === null,
         lastRunAt: last?.at ?? null,
         lastRunOk: last ? last.result.ok : null,
-        lastErrors: last?.result.errors.slice(0, 10) ?? [],
+        lastErrors: last?.result.errors.slice(0, 10).map(scrubPublicText) ?? [],
         consecutiveFailures: last?.consecutiveFailures ?? 0,
         mismatches: last?.result.mismatches.length ?? 0,
         clock: {
           ok: clock ? !clock.skewed : false,
           reason: clock?.reason ?? (clock ? null : 'reconciler not running'),
-          detail: clock?.detail ?? null,
+          detail: clock?.detail ? scrubPublicText(clock.detail) : null,
           skewMs: last?.result.clockSkewMs ?? null,
         },
       },

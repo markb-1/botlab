@@ -64,8 +64,14 @@ export class ConfigFileService {
     return { versionId: id, text };
   }
 
-  /** Human only */
-  async restore(file: unknown, versionId: unknown, actor: HumanActor): Promise<ConfigChangeSummary> {
-    return summary(await this.config.restore(asFile(file), String(versionId), actor));
+  /** What restoring a version would change, classified like an edit. Human only. */
+  previewRestore(file: unknown, versionId: unknown, actor: HumanActor) {
+    requireActor(actor, ['human'], 'config.previewRestore');
+    return this.config.previewRestore(asFile(file), String(versionId));
+  }
+
+  /** Human only. `expectedSha256`: as in `write` */
+  async restore(file: unknown, versionId: unknown, actor: HumanActor, expectedSha256?: unknown): Promise<ConfigChangeSummary> {
+    return summary(await this.config.restore(asFile(file), String(versionId), actor, typeof expectedSha256 === 'string' ? expectedSha256 : undefined));
   }
 }

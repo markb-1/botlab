@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import { marketApi, reconcileApi } from '../lib/api';
-import { Badge, Card, Empty, ErrorBox, Facts, Notice, PageHeader, btnPrimary, btnSecondary, inputCls, tdCls, thCls } from '../components/ui';
+import { useConfig } from '../hooks/useRisk';
+import { Badge, Card, ConfirmDialog, Empty, ErrorBox, Facts, Notice, PageHeader, btnPrimary, btnSecondary, inputCls, tdCls, thCls } from '../components/ui';
 import { dateOnly, dateTime, errorMessage, shortId, usd } from '../lib/format';
 import type { MarketSearchRow, MarketView, WatchlistEntry } from '../types';
 
@@ -192,11 +193,36 @@ function MarketDetail({ id, onClose }: { id: string; onClose: () => void }) {
 
 function AmbiguityForm({ market }: { market: MarketView }) {
   const qc = useQueryClient();
-  const [score, setScore] = useState(String(market.assessedAmbiguity ?? 0));
+  // No default: the score must be an explicit choice (an unassessed market blocks buys, R51)
+  const [score, setScore] = useState('');
   const [note, setNote] = useState(market.ambiguityNote ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const [confirm, setConfirm] = useState<string[] | null>(null);
+  const { data: cfg } = useConfig();
+  const maxAllowed = (cfg?.config?.mandate as { markets?: { max_ambiguity_score?: number } } | undefined)?.markets?.max_ambiguity_score ?? null;
+
+  /** Reasons to confirm: the score unblocks buys, or lowers the current assessment */
+  const confirmReasons = (n: number): string[] => {
+    const reasons: string[] = [];
+    if (maxAllowed === null) reasons.push('The mandate could not be read, so it is unknown whether this score allows buys.');
+    else if (n <= maxAllowed)
+      reasons.push(
+        `A score of ${n} is within the mandate's max_ambiguity_score (${maxAllowed}): bots may buy this market${market.ambiguityScore !== null && market.ambiguityScore > n ? ` once the server raise (${market.ambiguityRaisedBecause ?? 'rules change / dispute'}) lapses` : ''}.`
+      );
+    if (market.assessedAmbiguity !== null && n < market.assessedAmbiguity)
+      reasons.push(`This lowers the current assessment (${market.assessedAmbiguity} by ${market.ambiguitySource ?? 'unknown'}).`);
+    return reasons;
+  };
+
+  const requestSave = () => {
+    if (score === '') return;
+    const reasons = confirmReasons(Number(score));
+    if (reasons.length > 0) setConfirm(reasons);
+    else void save();
+  };
+
   const save = async () => {
     setBusy(true);
     setError(null);
@@ -238,6 +264,9 @@ function AmbiguityForm({ market }: { market: MarketView }) {
         <label className="text-sm text-gray-400">
           Score
           <select className={`${inputCls} mt-1`} value={score} onChange={(e) => setScore(e.target.value)}>
+            <option value="" disabled>
+              choose…
+            </option>
             {['0', '1', '2', '3'].map((s) => (
               <option key={s} value={s}>
                 {s}
@@ -249,12 +278,33 @@ function AmbiguityForm({ market }: { market: MarketView }) {
           Note
           <input type="text" className={`${inputCls} mt-1`} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Why (optional)" />
         </label>
-        <button type="button" className={btnPrimary} onClick={save} disabled={busy}>
+        <button type="button" className={btnPrimary} onClick={requestSave} disabled={busy || score === ''}>
           {busy ? 'Saving…' : 'Set ambiguity'}
         </button>
       </div>
       <ErrorBox>{error}</ErrorBox>
       {done && <Notice tone="green">Saved.</Notice>}
+      {confirm && (
+        <ConfirmDialog
+          title={`Set ambiguity ${score}?`}
+          confirmLabel="Set ambiguity"
+          body={
+            <>
+              {confirm.map((r) => (
+                <p key={r}>{r}</p>
+              ))}
+              <p>Only do this after reading the resolution rules above.</p>
+            </>
+          }
+          onConfirm={async () => {
+            await marketApi.setAmbiguity(market.marketId, Number(score), note.trim() || undefined);
+            qc.invalidateQueries({ queryKey: ['market', market.marketId] });
+            qc.invalidateQueries({ queryKey: ['marketSearch'] });
+            setDone(true);
+          }}
+          onClose={() => setConfirm(null)}
+        />
+      )}
     </div>
   );
 }

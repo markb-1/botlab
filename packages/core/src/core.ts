@@ -74,6 +74,7 @@ import { ReconcileService } from './services/ReconcileService';
 import { MarketService } from './services/MarketService';
 import { OverviewService } from './services/OverviewService';
 import { AuditLogService } from './services/AuditLogService';
+import { PublicError, publicLookupError } from './services/redact';
 import { getBalance } from './exchange/polymarket/trading';
 import { getBinanceBalance } from './exchange/binance/client';
 
@@ -420,7 +421,7 @@ export function createCore(options: CoreOptions): Core {
       getReconciler: () => reconciler,
       // Cash of the (non-paper) wallets live bots use, plus Binance USDT when credentials are set
       getLiveCashUsd: async () => {
-        if (!botManager) throw new Error('locked: the master key is not loaded');
+        if (!botManager) throw new PublicError('locked: the master key is not loaded');
         const settings = botManager.getSettings();
         const walletIds = new Set(
           botRepo
@@ -432,11 +433,22 @@ export function createCore(options: CoreOptions): Core {
         for (const id of walletIds) {
           const w = walletRepo.findById(id);
           if (!w || w.is_paper === 1) continue;
-          if (!settings.rpcUrl || !settings.usdcContractAddress) throw new Error('RPC URL or USDC contract not configured');
-          cash += await getBalance(w.proxy_address || w.address, settings.rpcUrl, settings.usdcContractAddress);
+          if (!settings.rpcUrl || !settings.usdcContractAddress) throw new PublicError('RPC URL or USDC contract not configured');
+          try {
+            cash += await getBalance(w.proxy_address || w.address, settings.rpcUrl, settings.usdcContractAddress);
+          } catch (err) {
+            // The ethers error holds the RPC URL (API key) and the request body: log it, return a short message
+            console.error(`[Overview] Polygon balance of wallet ${w.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+            throw new PublicError(publicLookupError(err, 'polygon balance lookup'));
+          }
         }
         if (settings.binanceApiKey && settings.binanceApiSecret) {
-          cash += await getBinanceBalance({ apiKey: settings.binanceApiKey, apiSecret: settings.binanceApiSecret }, 'USDT');
+          try {
+            cash += await getBinanceBalance({ apiKey: settings.binanceApiKey, apiSecret: settings.binanceApiSecret }, 'USDT');
+          } catch (err) {
+            console.error(`[Overview] Binance USDT balance failed: ${err instanceof Error ? err.message : String(err)}`);
+            throw new PublicError(publicLookupError(err, 'binance balance lookup'));
+          }
         }
         return cash;
       },
