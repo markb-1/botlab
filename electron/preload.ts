@@ -146,6 +146,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('risk:killSwitch', reason),
   },
 
+  // === Config (limits, mandate, fees, server) ===
+  config: {
+    get: () =>
+      ipcRenderer.invoke('config:get'),
+    write: (file: string, value: unknown) =>
+      ipcRenderer.invoke('config:write', file, value),
+    history: (file: string) =>
+      ipcRenderer.invoke('config:history', file),
+    restore: (file: string, versionId: string) =>
+      ipcRenderer.invoke('config:restore', file, versionId),
+  },
+
   // === Real-time Events (replaces Socket.io) ===
   onBotEvent: (callback: (event: any) => void) => {
     const listener = (_event: any, data: any) => callback(data);
@@ -164,6 +176,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event: any, data: any) => callback(data);
     ipcRenderer.on('risk:halt', listener);
     return () => ipcRenderer.removeListener('risk:halt', listener);
+  },
+
+  onConfigChanged: (callback: (event: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('config:changed', listener);
+    return () => ipcRenderer.removeListener('config:changed', listener);
   },
 
   // === App Info ===
@@ -245,6 +263,13 @@ declare global {
         clearHalt: (scope: string, reason: string) => Promise<any>;
         killSwitch: (reason: string) => Promise<any>;
       };
+      config: {
+        get: () => Promise<any>;
+        write: (file: string, value: unknown) => Promise<any>;
+        history: (file: string) => Promise<any>;
+        restore: (file: string, versionId: string) => Promise<any>;
+      };
+      onConfigChanged: (callback: (event: any) => void) => () => void;
       onBotEvent: (callback: (event: any) => void) => () => void;
       onBotLog: (callback: (log: any) => void) => () => void;
       onRiskHalt: (callback: (event: any) => void) => () => void;

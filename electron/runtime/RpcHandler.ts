@@ -50,8 +50,8 @@ export interface RpcHandlerDeps {
    * order goes through OrderService and the RiskEngine. Missing ⇒ order methods fail.
    */
   orderService?: OrderService;
-  /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist); default list if unset */
-  fetchAllowlist?: readonly string[];
+  /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist); default list if unset. A function is read on every call (hot reload). */
+  fetchAllowlist?: readonly string[] | (() => readonly string[] | undefined);
   /** Test hook: replaces the global fetch used by ctx.fetch */
   fetchImpl?: typeof fetch;
 }
@@ -257,7 +257,7 @@ export class RpcHandler {
         }
         this.fetchesInFlight++;
         try {
-          return await scriptFetch(args[0], args[1], { allowlist: this.deps.fetchAllowlist, fetchImpl: this.deps.fetchImpl });
+          return await scriptFetch(args[0], args[1], { allowlist: typeof this.deps.fetchAllowlist === 'function' ? this.deps.fetchAllowlist() : this.deps.fetchAllowlist, fetchImpl: this.deps.fetchImpl });
         } finally {
           this.fetchesInFlight--;
         }

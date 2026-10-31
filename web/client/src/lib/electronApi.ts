@@ -305,6 +305,31 @@ export const backtestApi = {
 };
 
 /**
+ * Config API (limits, mandate, fees, server). No UI yet (chunk 3c).
+ */
+export const configApi = {
+  get: async () => {
+    if (isElectron) return unwrapResponse(await window.electronAPI.config.get());
+    throw new Error('Not in Electron environment');
+  },
+
+  write: async (file: 'limits' | 'mandate' | 'fees' | 'server', value: unknown) => {
+    if (isElectron) return unwrapResponse(await window.electronAPI.config.write(file, value));
+    throw new Error('Not in Electron environment');
+  },
+
+  history: async (file: 'limits' | 'mandate' | 'fees' | 'server') => {
+    if (isElectron) return unwrapResponse(await window.electronAPI.config.history(file));
+    throw new Error('Not in Electron environment');
+  },
+
+  restore: async (file: 'limits' | 'mandate' | 'fees' | 'server', versionId: string) => {
+    if (isElectron) return unwrapResponse(await window.electronAPI.config.restore(file, versionId));
+    throw new Error('Not in Electron environment');
+  },
+};
+
+/**
  * Real-time events (replaces Socket.io)
  */
 export const events = {

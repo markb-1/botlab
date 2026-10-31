@@ -20,11 +20,13 @@ import { DEFAULT_LIMITS_YAML, DEFAULT_MANDATE_YAML } from './defaults';
  * - Invalid file (YAML syntax, schema, or cross-file rule) or any fs error ⇒ throws ConfigError.
  *   Callers keep their previously loaded config in that case.
  *
- * No hot reload yet (chunk 1e).
+ * Hot reload and the other files (fees, server) live in ConfigService.
  */
 
 export const LIMITS_FILE = 'limits.yaml';
 export const MANDATE_FILE = 'mandate.yaml';
+export const FEES_FILE_NAME = 'fees.yaml';
+export const SERVER_FILE = 'server.yaml';
 
 export class ConfigError extends Error {
   constructor(

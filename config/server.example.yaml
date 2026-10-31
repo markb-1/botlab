@@ -1,0 +1,9 @@
+# BotLab server settings (spec §3, §11). Human-owned.
+# Copy to server.yaml (or start the app once and it is created with these defaults).
+timezone: Europe/Dublin              # time zone of the daily digest
+digest_time: "08:00"                 # local time (HH:MM) of the daily digest
+notify:
+  telegram:
+    enabled: false
+    bot_token: ""                    # from BotFather; the TELEGRAM_BOT_TOKEN environment variable overrides it
+    chat_id: ""                      # your private chat id; messages from any other chat are ignored

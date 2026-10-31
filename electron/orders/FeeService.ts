@@ -112,6 +112,11 @@ export class FeeService {
     this.config = config;
   }
 
+  /** Replace the fee table (hot reload). */
+  setConfig(config: FeesConfig): void {
+    this.config = config;
+  }
+
   /** Fee category for a market given its Gamma category/tag labels; null when nothing matches. */
   feeCategoryFor(labels: string[]): FeeCategory | null {
     const slugs = labels.map(slugify).filter((s) => s.length > 0);

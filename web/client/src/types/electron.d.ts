@@ -84,6 +84,15 @@ interface ElectronAPI {
     clearHalt: (scope: string, reason: string) => Promise<IpcResponse>;
     killSwitch: (reason: string) => Promise<IpcResponse>;
   };
+  /** Config files (spec §3). Human only. `file` is 'limits' | 'mandate' | 'fees' | 'server'. */
+  config: {
+    get: () => Promise<IpcResponse>;
+    write: (file: string, value: unknown) => Promise<IpcResponse>;
+    history: (file: string) => Promise<IpcResponse>;
+    restore: (file: string, versionId: string) => Promise<IpcResponse>;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onConfigChanged: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onRiskHalt: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

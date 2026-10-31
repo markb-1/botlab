@@ -35,6 +35,7 @@ import type { DbRiskStateProvider } from './DbRiskStateProvider';
 import type { FeeCategory, FeeService } from './FeeService';
 import { mandateCategory, type MarketDataService, type MarketInfo, type MarketQualityProvider } from './MarketDataService';
 import type { AuditService } from '../audit/AuditService';
+import type { OrderEventSink, OrderFillEvent } from '../notify/events';
 import logger from '../../src/utils/logger';
 
 const MS_PER_MINUTE = 60_000;
@@ -168,6 +169,8 @@ export interface OrderServiceDeps {
   getBinanceBook: (symbol: string) => Promise<BinanceOrderBook>;
   /** Risk rejections are recorded here (actor bot:<id>) */
   audit?: AuditService;
+  /** Fill / rejection notifications. Called after commit; failures are swallowed. */
+  events?: OrderEventSink;
   now?: () => number;
 }
 
@@ -672,6 +675,17 @@ export class OrderService {
         simulated: this.paper,
       });
       if (!decision.allowed) {
+        try {
+          this.deps.events?.orderRejected({
+            botId: order.botId,
+            botName: this.bot.botName,
+            failedCheck: String(decision.failedCheck ?? 'unknown'),
+            reason: String(decision.reason ?? ''),
+            simulated: this.paper,
+          });
+        } catch (err) {
+          logger.error(`[OrderService] Rejection notification failed: ${err instanceof Error ? err.message : err}`);
+        }
         logger.warning(
           `[OrderService] ${this.bot.botName}: ${order.side} ${order.tokenId} rejected (${decision.failedCheck}): ${decision.reason}`
         );
@@ -752,6 +766,7 @@ export class OrderService {
 
     // Expected fee on what actually filled
     const fee = fill ? feeRate * fill.notional : 0;
+    this.pendingFills = [];
     const tx = this.deps.db.transaction(() => {
       const updated = this.deps.orderRepo.update(row.id, {
         status,
@@ -766,10 +781,42 @@ export class OrderService {
     });
     const updated = tx() ?? row;
     if (fill) this.deps.provider.invalidateCash();
+    this.emitPendingFills();
     return updated;
   }
 
+  /** Fills recorded in the running transaction; emitted to the notifier only after it commits. */
+  private pendingFills: OrderFillEvent[] = [];
+
+  private emitPendingFills(): void {
+    const events = this.pendingFills;
+    this.pendingFills = [];
+    if (!this.deps.events) return;
+    for (const e of events) {
+      try {
+        this.deps.events.orderFilled(e);
+      } catch (err) {
+        logger.error(`[OrderService] Fill notification failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
   private recordFill(row: OrderRow, fill: Fill, feeUsd: number, info: MarketInfo | null, category: string | null): void {
+    if (!this.paper) {
+      this.pendingFills.push({
+        botId: this.bot.botId,
+        botName: this.bot.botName,
+        exchange: row.exchange,
+        side: row.side === 'buy' ? 'BUY' : 'SELL',
+        symbol: row.token_id,
+        market: info?.question || undefined,
+        outcome: info?.outcome || undefined,
+        quantity: fill.size,
+        price: fill.size > 0 ? fill.notional / fill.size : row.price,
+        notionalUsd: fill.notional,
+        simulated: false,
+      });
+    }
     this.deps.tradeRepo.create({
       botId: this.bot.botId,
       botName: this.bot.botName,
@@ -942,6 +989,7 @@ export class OrderService {
    * fill is recorded exactly once even if two syncs saw the same exchange state.
    */
   private applyExchangeState(orderId: string, ex: { status: string; sizeMatched: number; originalSize: number; price: number }): void {
+    this.pendingFills = [];
     const filled = this.deps.db.transaction((): boolean => {
       const row = this.deps.orderRepo.findById(orderId);
       if (!row || !OPEN_STATUSES.includes(row.status)) return false;
@@ -969,6 +1017,7 @@ export class OrderService {
       return delta > QTY_EPS;
     })();
     if (filled) this.deps.provider.invalidateCash();
+    this.emitPendingFills();
   }
 
   private ownOpenOrder(orderId: string): OrderRow {

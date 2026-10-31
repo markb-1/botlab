@@ -12,6 +12,8 @@ import {
   ConfigError,
   DEFAULT_LIMITS_YAML,
   DEFAULT_MANDATE_YAML,
+  DEFAULT_SERVER_YAML,
+  ServerSchema,
   parseConfigYaml,
 } from '../../electron/config';
 
@@ -63,6 +65,8 @@ describe('config schema defaults', () => {
     const configDir = path.join(__dirname, '..', '..', 'config');
     expect(fs.readFileSync(path.join(configDir, 'limits.example.yaml'), 'utf8')).toBe(DEFAULT_LIMITS_YAML);
     expect(fs.readFileSync(path.join(configDir, 'mandate.example.yaml'), 'utf8')).toBe(DEFAULT_MANDATE_YAML);
+    expect(fs.readFileSync(path.join(configDir, 'server.example.yaml'), 'utf8').replace(/\r\n/g, '\n')).toBe(DEFAULT_SERVER_YAML);
+    expect(parseConfigYaml(ServerSchema, DEFAULT_SERVER_YAML, 'server')).toEqual(ServerSchema.parse({}));
   });
 
   it('a partial file keeps defaults for missing fields', () => {

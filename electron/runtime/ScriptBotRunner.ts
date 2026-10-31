@@ -41,7 +41,7 @@ export interface ScriptBotRunnerDeps {
   /** Without it the bot runs but every order call fails (fail closed) */
   createOrderService?: OrderServiceFactory;
   /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist) */
-  fetchAllowlist?: readonly string[];
+  fetchAllowlist?: readonly string[] | (() => readonly string[] | undefined);
 }
 
 const DEFAULT_PAPER_BALANCE = 10_000;

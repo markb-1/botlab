@@ -31,7 +31,9 @@ import { createBinanceAdapter, createPolymarketAdapter } from '../../electron/or
 import type { PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
 import type { AuditActor, AuditService } from '../../electron/audit/AuditService';
 import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
-import type { LimitsConfig } from '../../electron/config';
+import type { LimitsConfig, AppConfig } from '../../electron/config';
+import type { OrderEventSink } from '../../electron/notify/events';
+import type { ConfigService } from '../../electron/config/ConfigService';
 import { getBalance } from '../../electron/sdk/trading';
 import { getBinanceBalance, getBinanceOrderBook } from '../../electron/sdk/binance';
 import { decrypt } from '../../electron/security/crypto';
@@ -44,6 +46,10 @@ export interface BotManagerOrderDeps {
   orderRepo: OrderRepository;
   riskStateRepo: RiskStateRepository;
   audit?: AuditService;
+  /** Live config (hot reload). Without it the config is read once in initialize(). */
+  config?: ConfigService;
+  /** Fill / rejection notifications (Telegram) */
+  events?: OrderEventSink;
 }
 
 /**
@@ -61,10 +67,11 @@ export class BotManager extends EventEmitter {
   private instances: Map<string, BaseBotRunner> = new Map();
   private clobClients: Map<string, ClobClient> = new Map();
   private orderDeps: BotManagerOrderDeps | null;
-  /** Loaded once in initialize() (hot reload: chunk 1e). null ⇒ every order fails. */
+  /** Created in initialize(), updated in place on config changes. null ⇒ every order fails. */
   private riskEngine: RiskEngine | null = null;
   private fees: FeeService | null = null;
   private configError: string | null = 'not loaded';
+  private unsubscribeConfig: (() => void) | null = null;
   private marketData = new MarketDataService();
   /** Running bots' OrderServices (used to cancel their orders on a halt) */
   private orderServices: Map<string, { service: OrderService; simulated: boolean }> = new Map();
@@ -97,23 +104,45 @@ export class BotManager extends EventEmitter {
    */
   async initialize(): Promise<void> {
     // Risk config (limits/mandate) and fee table. A bad file disables all orders (fail closed)
-    // rather than falling back to defaults the human did not choose.
-    try {
-      const dir = resolveConfigDir();
-      this.riskEngine = new RiskEngine(loadConfig(dir));
-      this.fees = new FeeService(loadFees(dir));
-      this.configError = null;
-      logger.info(`Risk config loaded from ${dir}`);
-      this.orderDeps?.audit?.record('system', 'config.load', dir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml'] }, 'ok');
-    } catch (err) {
-      this.riskEngine = null;
-      this.fees = null;
-      this.configError = err instanceof Error ? err.message : String(err);
-      logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
-      this.orderDeps?.audit?.record('system', 'config.load', resolveConfigDir(), { error: this.configError }, 'error');
+    // rather than falling back to defaults the human did not choose. With a ConfigService the
+    // engine and fee table are updated in place on every valid change (spec §3); an invalid edit
+    // keeps the previous config.
+    const config = this.orderDeps?.config;
+    if (config) {
+      const initial = config.getConfig();
+      if (initial) this.applyConfig(initial);
+      else this.configError = config.getLastError() ?? 'not loaded';
+      if (!initial) logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
+      this.unsubscribeConfig = config.onChange((e) => {
+        this.applyConfig(e.after);
+        logger.info('Risk config updated');
+      });
+    } else {
+      try {
+        const dir = resolveConfigDir();
+        this.applyConfig({ ...loadConfig(dir), fees: loadFees(dir) });
+        logger.info(`Risk config loaded from ${dir}`);
+        this.orderDeps?.audit?.record('system', 'config.load', dir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml'] }, 'ok');
+      } catch (err) {
+        this.riskEngine = null;
+        this.fees = null;
+        this.configError = err instanceof Error ? err.message : String(err);
+        logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
+        this.orderDeps?.audit?.record('system', 'config.load', resolveConfigDir(), { error: this.configError }, 'error');
+      }
     }
     this.warnUnlinkedPositions();
     logger.info('BotManager initialized');
+  }
+
+  /** Install a validated config: the shared RiskEngine / FeeService objects are updated in place, so running bots' OrderServices see it at once. */
+  private applyConfig(config: Pick<AppConfig, 'limits' | 'mandate' | 'fees'>): void {
+    const risk = { limits: config.limits, mandate: config.mandate };
+    if (this.riskEngine) this.riskEngine.setConfig(risk);
+    else this.riskEngine = new RiskEngine(risk);
+    if (this.fees) this.fees.setConfig(config.fees);
+    else this.fees = new FeeService(config.fees);
+    this.configError = null;
   }
 
   /**
@@ -190,6 +219,7 @@ export class BotManager extends EventEmitter {
         orderRepo,
         tradeRepo: this.tradeRepo,
         audit: this.orderDeps.audit,
+        events: this.orderDeps.events,
         riskEngine: this.riskEngine,
         provider,
         fees: this.fees,
@@ -493,7 +523,7 @@ export class BotManager extends EventEmitter {
       binanceApiKey: settings.binanceApiKey,
       binanceApiSecret: settings.binanceApiSecret,
       createOrderService: this.createOrderService,
-      fetchAllowlist: this.getLimits()?.server.script_fetch_allowlist,
+      fetchAllowlist: () => this.getLimits()?.server.script_fetch_allowlist,
     });
 
     // Forward events
@@ -713,6 +743,8 @@ export class BotManager extends EventEmitter {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down all bots...');
+    this.unsubscribeConfig?.();
+    this.unsubscribeConfig = null;
 
     const stopPromises = Array.from(this.instances.keys()).map((botId) =>
       this.stopBot(botId).catch((error) => {

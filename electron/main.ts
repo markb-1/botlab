@@ -34,7 +34,12 @@ import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl 
 import { KillSwitch } from './risk/KillSwitch';
 import { RiskMonitor } from './risk/RiskMonitor';
 import { ShutdownMarker, applyStartupHalt, recoverOpenOrders } from './risk/StartupRecovery';
-import { loadLimits, resolveConfigDir } from './config';
+import { resolveConfigDir } from './config';
+import { ConfigService } from './config/ConfigService';
+import { registerConfigHandlers } from './ipc/handlers/configHandlers';
+import { TelegramNotifier, telegramSettingsFrom } from './notify/TelegramNotifier';
+import { NotificationService } from './notify/NotificationService';
+import { unfilledNotional } from './orders/DbRiskStateProvider';
 import { getBinanceOrderBook } from './sdk/binance';
 
 // Load environment variables
@@ -63,6 +68,11 @@ let killSwitch: KillSwitch;
 let canceller: OrderCanceller;
 let riskMonitor: RiskMonitor | null = null;
 let shutdownMarker: ShutdownMarker | null = null;
+
+// Config (hot reload) and notifications (Telegram); both work without credentials
+let configService: ConfigService;
+let telegram: TelegramNotifier;
+let notifications: NotificationService;
 
 const isDev = !app.isPackaged;
 
@@ -157,14 +167,59 @@ async function initializePhaseA(): Promise<void> {
     });
   }
 
-  // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
-  let startHaltedAfterCrash: boolean | null = null;
+  // Config: limits, mandate, fees, server. Loaded and validated here, then hot-reloaded on file edits.
+  // An unreadable config is audited; everything that needs it fails closed.
+  configService = new ConfigService({ audit, historyDir: path.join(getDataDir(), 'config-history') });
   try {
-    startHaltedAfterCrash = loadLimits(resolveConfigDir()).server.start_halted_after_crash;
+    configService.load();
+    audit.record('system', 'config.load', configService.configDir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml', 'server.yaml'], stage: 'startup' }, 'ok');
   } catch (err) {
-    console.error('[Main] Could not read limits config for startup:', err);
-    audit.record('system', 'config.load', resolveConfigDir(), { stage: 'startup', error: err instanceof Error ? err.message : String(err) }, 'error');
+    console.error('[Main] Could not read config at startup:', err);
+    audit.record('system', 'config.load', configService.configDir, { stage: 'startup', error: err instanceof Error ? err.message : String(err) }, 'error');
   }
+  configService.start();
+  configService.onChange((e) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('config:changed', { changes: e.changes, raises: e.raises.map((c) => `${c.file}.${c.path}`), source: e.source });
+    }
+  });
+
+  // Telegram notifications (no-op unless enabled in server.yaml). Created before the startup halt
+  // below so that a halt after a crash is announced.
+  telegram = new TelegramNotifier({
+    getSettings: () => {
+      const server = configService.getConfig()?.server;
+      return server ? telegramSettingsFrom(server) : { enabled: false, token: '', chatId: '' };
+    },
+    onUpdate: (u) => notifications.handleUpdate(u),
+  });
+  notifications = new NotificationService({
+    notifier: telegram,
+    audit,
+    halts,
+    killSwitch,
+    botRepo,
+    riskStateRepo,
+    getLimits: () => configService.getConfig()?.limits ?? null,
+    getServer: () => configService.getConfig()?.server ?? null,
+    getExposureUsd: () => {
+      const positions = tradeRepo.getRiskPositions({ simulated: false }).reduce((n, p) => n + p.cost_basis, 0);
+      const openBuys = orderRepo.findOpen(undefined, false).filter((o) => o.side === 'buy').reduce((n, o) => n + unfilledNotional(o), 0);
+      return positions + openBuys;
+    },
+    stopBot: async (id, actor) => {
+      if (!botManager) throw new Error('App is locked: unlock BotLab first');
+      await botManager.stopBot(id, actor);
+    },
+    isRunning: (id) => botManager?.isRunning(id) ?? false,
+    stateFile: path.join(getDataDir(), 'notify-state.json'),
+  });
+  notifications.attachConfig(configService);
+  notifications.start();
+  telegram.start();
+
+  // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
+  const startHaltedAfterCrash: boolean | null = configService.getConfig()?.limits.server.start_halted_after_crash ?? null;
   shutdownMarker = new ShutdownMarker(getDataDir());
   applyStartupHalt({ marker: shutdownMarker, startHaltedAfterCrash, halts, audit });
 
@@ -194,6 +249,9 @@ async function initializePhaseA(): Promise<void> {
 
   // 9. Risk handlers (halts, kill switch) — available before unlock
   registerRiskHandlers(halts, killSwitch, botRepo, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
+
+  // 9b. Config handlers (human only, main window only)
+  registerConfigHandlers(configService, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
 
   // 10. App info handlers
   ipcMain.handle('app:version', () => app.getVersion());
@@ -237,7 +295,7 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     scriptRepo,
     storageRepo,
     tradeRepo,
-    { db: database, orderRepo, riskStateRepo, audit }
+    { db: database, orderRepo, riskStateRepo, audit, config: configService, events: notifications }
   );
   await botManager.initialize();
   console.log('[Main] BotManager initialized');
@@ -367,6 +425,9 @@ async function gracefulShutdown(): Promise<void> {
     await botManager.shutdown();
   }
   if (shutdownTimedOut) return;
+  await notifications?.stop().catch((error) => console.error('[Main] Error stopping notifications:', error));
+  await telegram?.stop().catch((error) => console.error('[Main] Error stopping Telegram:', error));
+  await configService?.stop().catch((error) => console.error('[Main] Error stopping config watcher:', error));
   try {
     shutdownMarker?.markClean();
     audit?.record('system', 'app.shutdown', null, undefined, 'clean');
