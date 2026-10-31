@@ -4,6 +4,8 @@
 # Rules are checked top to bottom; the FIRST matching rule wins. A market matching no rule is
 # "other", which can never be allowed (fail closed). Denied categories are listed first so a
 # market that looks like sports/crypto/US elections is never mistaken for an allowed one.
+# Denied / never-allowed rules match on a keyword ALONE (no when_tags): a false deny is acceptable,
+# a false allow is not.
 #
 # A rule matches when any of `tags` is on the market (Gamma tag slugs, lowercase), or when one
 # of `keywords` appears in the question/event title (case-insensitive, whole words) and the
@@ -14,24 +16,28 @@
 rules:
   - name: sports
     tags: [sports, nba, nfl, nhl, mlb, wnba, ncaa, cfb, cbb, soccer, football, epl, premier-league, champions-league, la-liga, serie-a, bundesliga, mls, tennis, golf, ufc, mma, boxing, f1, formula-1, cricket, esports, olympics, chess, nascar]
+    keywords: [nba, nfl, nhl, mlb, super bowl, world cup, premier league, champions league, stanley cup, world series, grand slam, wimbledon, grand prix, playoffs, ufc, olympics]
   - name: crypto-price
     tags: [crypto, crypto-prices, bitcoin, ethereum, solana, xrp, dogecoin, memecoins, airdrops, stablecoins, defi, nft]
-    keywords: [bitcoin, btc, ethereum, eth, solana, dogecoin, xrp]
-    when_tags: [finance, business, economy]
+    keywords: [bitcoin, btc, ethereum, eth, solana, dogecoin, xrp, crypto, cryptocurrency, memecoin]
   - name: mentions
     tags: [mentions, mention-markets]
+    keywords: [say, says, said, mention, mentions, tweet, tweets]
   - name: us-elections-headline
     # Any US political market lands here (denied) unless a human maps it elsewhere.
+    # Unambiguously US-political words deny on their own (an economics market mentioning Trump is denied too).
     tags: [us-presidential-election, us-election, us-elections, presidential-election, midterms, us-midterms, us-politics, us-senate, us-house, congress, trump, trump-presidency, biden, scotus]
+    keywords: [senate, senator, congress, congressional, house of representatives, electoral college, midterm, midterms, gop, republican, republicans, democrat, democrats, democratic party, trump, vance, harris, biden, newsom, desantis, white house, supreme court, scotus]
+  - name: us-elections-headline
+    # Generic US words (would also hit US CPI/jobs markets) deny only on political markets.
     when_tags: [politics, elections, us-government]
-    keywords: [u.s., us, usa, united states, america, american, senate, congress, house of representatives, governor, electoral college, midterm, midterms, gop, republican, republicans, democrat, democrats, democratic party, trump, vance, harris, biden, newsom, desantis, white house, supreme court]
+    keywords: [u.s., us, usa, united states, america, american, governor]
   - name: culture-entertainment
     tags: [pop-culture, culture, entertainment, movies, music, awards, oscars, grammys, emmys, celebrities, tv, television, box-office, youtube, tiktok, streaming, video-games, gaming]
   - name: fed-headline
     # Spec §3.3: economics excludes the headline Fed meeting. Not in any mandate list ⇒ never allowed.
-    tags: [fed-rates, fomc]
-    when_tags: [fed, economy, economics, finance]
-    keywords: [fed, fomc, federal reserve, powell]
+    tags: [fed, fed-rates, fomc]
+    keywords: [fed, fomc, federal reserve, powell, fed funds]
   - name: geopolitics
     tags: [geopolitics, middle-east, ukraine, russia, israel, iran, gaza, china, taiwan, north-korea, nato, war, ceasefire, foreign-policy]
   - name: weather-climate

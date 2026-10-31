@@ -16,7 +16,7 @@
 
 import { z } from 'zod';
 import type { AuditActor, AuditService } from '../audit/AuditService';
-import type { MandateConfig } from '../config/schema';
+import type { LimitsConfig, MandateConfig } from '../config/schema';
 import { MAX_HORIZON_DAYS } from '../config/schema';
 import { generateId } from '../database/index';
 import type { CategoryRightsRepository, CategoryRightsRow } from '../database/repositories/CategoryRightsRepository';
@@ -28,8 +28,10 @@ import type { CategoryRightsState, ForecastEdgeInfo, HorizonBucket } from '../ri
 import { AUTO_RAISE_MIN_SCORE, autoRaiseReason } from './ambiguity';
 import type { MarketCacheService, MarketView } from './MarketCacheService';
 import {
+  activeWeight,
   convergenceScore,
   decideRights,
+  MIN_STATS_DISAGREEMENT,
   eventVotes,
   expectedThresholdDate,
   mandateListing,
@@ -48,6 +50,12 @@ export const SCORER_INTERVAL_MS = 3_600_000;
 export const MIN_HOURS_BEFORE_END = 6;
 export const MAX_RATIONALE_CHARS = 4000;
 export const CONVERGENCE_DAYS = 7;
+/** A token's forecast can be replaced at most this often (withdrawing is always allowed) */
+export const MIN_SUPERSEDE_INTERVAL_MS = 6 * 3_600_000;
+/** Forecasts need a tight book: the mid is the skill baseline */
+export const MAX_FORECAST_SPREAD = 0.1;
+/** Without a settled UMA status, a final price must be seen on two runs this far apart before scoring */
+export const RESOLUTION_CONFIRM_MS = 24 * 3_600_000;
 const DAY_MS = 86_400_000;
 const LOOKUP_TIMEOUT_MS = 10_000;
 const BUCKET_ORDER: HorizonBucket[] = ['short', 'medium', 'long'];
@@ -186,12 +194,14 @@ export interface ScorerRunResult {
   convergence: number;
   rightsChanges: Array<{ category: string; bucket: HorizonBucket; from: CategoryRightsState; to: CategoryRightsState; reason: string }>;
   marketsFailed: number;
+  /** Markets with a final price waiting for confirmation */
+  pendingConfirmation: number;
 }
 
 export interface LedgerDeps {
   forecastRepo: ForecastRepository;
   rightsRepo: CategoryRightsRepository;
-  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'refreshMany' | 'setAmbiguity'>;
+  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'refreshMany' | 'recordForecastAmbiguity' | 'setResolutionSeen'>;
   audit?: Pick<AuditService, 'record'>;
   /** CLOB top of book for the snapshot; throw when unavailable */
   getTopOfBook: (tokenId: string) => Promise<{ bestBid: number | null; bestAsk: number | null }>;
@@ -199,6 +209,8 @@ export interface LedgerDeps {
   getMid: (tokenId: string) => Promise<number | null>;
   /** Mandate in force; null = config unavailable (rights are not changed) */
   getMandate: () => MandateConfig | null;
+  /** Limits in force (max_spread, min_liquidity_usd for the forecast gate); null = use the mandate / fixed caps only */
+  getLimits?: () => LimitsConfig | null;
   /** Called after a forecast is written/withdrawn (bots' ctx.events later) */
   onForecastChanged?: (f: ForecastView) => void;
   now?: () => number;
@@ -214,19 +226,28 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
 
 const parseTime = (iso: string | null): number => (iso ? Date.parse(iso) : NaN);
 
-/** Forecasts of one bucket → skill and convergence votes (one per event). */
+/**
+ * Forecasts of one bucket → skill and convergence votes (one per event). Each version is weighted by
+ * its active time (creation → superseded / withdrawn / resolved, capped at the market end) within its
+ * token; versions within 0.02 of the market price are left out (no information, not tradeable).
+ */
 export function bucketVotes(rows: readonly ForecastRow[]): { skill: EventVote[]; convergence: EventVote[] } {
   const skill: ScoredItem[] = [];
   const conv: ScoredItem[] = [];
   for (const r of rows) {
     if (r.status === 'void') continue;
+    if (Math.abs(r.probability - r.market_price_at_forecast) < MIN_STATS_DISAGREEMENT) continue;
+    const created = parseTime(r.created_at);
+    const end = created + r.days_to_resolution_at_forecast * DAY_MS;
+    const until = parseTime(r.active_until ?? null);
+    const weight = Number.isNaN(created) ? 1 : activeWeight(created, Number.isNaN(until) ? null : until, end);
     if (r.outcome !== null && r.skill !== null) {
       const at = parseTime(r.resolved_at);
-      skill.push({ eventId: r.event_id, value: r.skill, at: Number.isNaN(at) ? 0 : at });
+      skill.push({ eventId: r.event_id, tokenId: r.token_id, value: r.skill, weight, at: Number.isNaN(at) ? 0 : at });
     }
     if (r.convergence !== null) {
       const at = parseTime(r.price_at_7d_at);
-      conv.push({ eventId: r.event_id, value: r.convergence, at: Number.isNaN(at) ? 0 : at });
+      conv.push({ eventId: r.event_id, tokenId: r.token_id, value: r.convergence, weight, at: Number.isNaN(at) ? 0 : at });
     }
   }
   return { skill: eventVotes(skill), convergence: eventVotes(conv) };
@@ -262,6 +283,17 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     }
     if (!market) throw new LedgerValidationError(`Unknown token ${f.tokenId}`);
     if (market.closed || !market.active) throw new LedgerValidationError('Market is not open');
+    // Any UMA activity means resolution has started (or is contested): the market price is no baseline
+    if (market.umaResolutionStatus || market.disputed) {
+      throw new LedgerValidationError(`Market has a UMA resolution status (${market.umaResolutionStatus ?? 'disputed'}); no new forecasts`);
+    }
+    const mandateNow = this.deps.getMandate();
+    if (!mandateNow) throw new LedgerValidationError('Mandate unavailable (config invalid); cannot check the market');
+    const limitsNow = this.deps.getLimits?.() ?? null;
+    const minLiquidity = Math.max(mandateNow.markets.min_liquidity_usd, limitsNow?.per_market.min_liquidity_usd ?? 0);
+    if (market.volume24hUsd === null || market.volume24hUsd < minLiquidity) {
+      throw new LedgerValidationError(`Market liquidity ${market.volume24hUsd ?? 'unknown'} (24h volume) < ${minLiquidity}`);
+    }
 
     const now = this.now();
     const end = market.endDate ? Date.parse(market.endDate) : NaN;
@@ -282,14 +314,26 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     if (!validPrice(bestBid) || !validPrice(bestAsk) || bestBid > bestAsk) {
       throw new LedgerValidationError('No usable two-sided order book: the market price cannot be captured');
     }
+    const maxSpread = Math.min(MAX_FORECAST_SPREAD, limitsNow?.per_market.max_spread ?? MAX_FORECAST_SPREAD);
+    if (bestAsk - bestBid > maxSpread + 1e-9) {
+      throw new LedgerValidationError(`Spread ${(bestAsk - bestBid).toFixed(3)} > ${maxSpread}: the mid is not a usable market price`);
+    }
     const mid = (bestBid + bestAsk) / 2;
+
+    const current = this.deps.forecastRepo.findActiveByToken(f.tokenId);
+    if (current) {
+      const age = now - parseTime(current.created_at);
+      if (!(age >= MIN_SUPERSEDE_INTERVAL_MS)) {
+        const nextAt = new Date(parseTime(current.created_at) + MIN_SUPERSEDE_INTERVAL_MS).toISOString();
+        throw new LedgerValidationError(`Forecast ${current.id} on this token is less than 6 hours old; it can be replaced from ${nextAt} (withdrawing is allowed now)`);
+      }
+    }
 
     const bucket = horizonBucket(days);
     const category = market.category;
     const nowIso = new Date(now).toISOString();
     const rights = this.deps.rightsRepo.ensure(category, bucket, nowIso);
-    const mandate = this.deps.getMandate();
-    const tradeable = rights.state === 'trading' && !!mandate && mandateListing(category, mandate) === 'allow';
+    const tradeable = rights.state === 'trading' && mandateListing(category, mandateNow) === 'allow';
 
     // Server raise (§7.4) applies to the recorded score; the market keeps the raw assessment
     const raise = autoRaiseReason({ rulesChangedAt: market.rulesChangedAt, disputed: market.disputed }, now);
@@ -318,7 +362,7 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     });
 
     try {
-      await this.deps.marketCache.setAmbiguity(market.marketId, f.ambiguityScore, actor, `forecast ${id}`);
+      await this.deps.marketCache.recordForecastAmbiguity(market.marketId, f.ambiguityScore, actor, id);
     } catch (err) {
       logger.error(`[Ledger] Could not record ambiguity for ${market.marketId}: ${err instanceof Error ? err.message : err}`);
     }
@@ -381,10 +425,32 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     return r ? toForecastView(r) : null;
   }
 
-  /** ForecastSource (OrderService): only an active, tradeable forecast; the complementary token of a binary market gets 1 − p. */
+  /** The bucket's current rights state and whether the forecast can be traded now (active, bucket trading, category allowed). */
+  liveRights(f: ForecastRow): { bucketState: CategoryRightsState | null; tradeableNow: boolean } {
+    const bucketState = this.deps.rightsRepo.get(f.category, f.horizon_bucket)?.state ?? null;
+    const mandate = this.deps.getMandate();
+    const tradeableNow = f.status === 'active' && bucketState === 'trading' && !!mandate && mandateListing(f.category, mandate) === 'allow';
+    return { bucketState, tradeableNow };
+  }
+
+  /** ctx.ledger: active forecasts with the bucket's current state and live `tradeable`. */
+  botForecasts(filter: { category?: string; tradeableOnly?: boolean } = {}): Array<ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }> {
+    const rows = this.deps.forecastRepo.list({ status: 'active', ...(filter.category ? { category: filter.category } : {}) });
+    return rows.map((r) => ({ ...toForecastView(r), ...this.liveRights(r) })).filter((f) => !filter.tradeableOnly || f.tradeableNow);
+  }
+
+  botForecast(tokenId: string): (ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }) | null {
+    const r = this.deps.forecastRepo.findActiveByToken(tokenId);
+    return r ? { ...toForecastView(r), ...this.liveRights(r) } : null;
+  }
+
+  /**
+   * ForecastSource (OrderService): only an active forecast that is tradeable now (same live rule as
+   * ctx.ledger; the engine re-checks the bucket). The complementary token of a binary market gets 1 − p.
+   */
   async get(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null> {
     const f = this.deps.forecastRepo.findById(forecastId);
-    if (!f || f.status !== 'active' || f.tradeable !== 1) return null;
+    if (!f || !this.liveRights(f).tradeableNow) return null;
     if (f.token_id === tokenId) return { forecastId, probability: f.probability };
     const tokens = this.deps.marketCache.getCached(f.market_id)?.tokens ?? [];
     if (tokens.length === 2 && tokens.some((t) => t.tokenId === f.token_id) && tokens.some((t) => t.tokenId === tokenId)) {
@@ -478,7 +544,7 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
   }
 
   private async runUnsafe(): Promise<ScorerRunResult> {
-    const result: ScorerRunResult = { scored: 0, voided: 0, convergence: 0, rightsChanges: [], marketsFailed: 0 };
+    const result: ScorerRunResult = { scored: 0, voided: 0, convergence: 0, rightsChanges: [], marketsFailed: 0, pendingConfirmation: 0 };
     const marketIds = this.deps.forecastRepo.unresolvedMarketIds();
     if (marketIds.length > 0) {
       const r = await this.deps.marketCache.refreshMany(marketIds);
@@ -490,10 +556,32 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
       const market = this.deps.marketCache.getCached(marketId);
       if (!market) continue;
       const res = parseResolution(market);
-      if (res.kind === 'unresolved') continue;
+      if (res.kind === 'unresolved') {
+        if (market.resolutionSeen !== null) this.deps.marketCache.setResolutionSeen(marketId, null, null);
+        continue;
+      }
+      // Confirmation (R54): a settled UMA status scores at once; otherwise the same final result must be
+      // seen on runs at least 24 h apart (the UMA field names are unverified)
+      const signature = JSON.stringify(res);
+      const umaSettled = /resolved|settled/i.test(market.umaResolutionStatus ?? '');
+      if (!umaSettled) {
+        const seenAt = parseTime(market.resolutionSeenAt);
+        if (market.resolutionSeen !== signature || Number.isNaN(seenAt)) {
+          this.deps.marketCache.setResolutionSeen(marketId, signature, nowIso);
+          result.pendingConfirmation++;
+          continue;
+        }
+        if (this.now() - seenAt < RESOLUTION_CONFIRM_MS) {
+          result.pendingConfirmation++;
+          continue;
+        }
+      }
+      // Resolution time = when the final result was first seen
+      const resolvedIso = umaSettled || !market.resolutionSeenAt ? nowIso : market.resolutionSeenAt;
+      const resolvedMs = parseTime(resolvedIso);
       const forecasts = this.deps.forecastRepo.unscoredForMarket(marketId);
       if (res.kind === 'void') {
-        for (const f of forecasts) this.deps.forecastRepo.setVoid(f.id, nowIso);
+        for (const f of forecasts) this.deps.forecastRepo.setVoid(f.id, resolvedIso);
         result.voided += forecasts.length;
         if (forecasts.length) this.deps.audit?.record('system', 'ledger.void', marketId, { forecasts: forecasts.map((f) => f.id) }, 'void');
         continue;
@@ -506,10 +594,10 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
         }
         const outcome = res.payouts[idx];
         const s = scoreForecast(f.probability, f.market_price_at_forecast, outcome);
-        this.deps.forecastRepo.setScore(f.id, { outcome, brierAgent: s.brierAgent, brierMarket: s.brierMarket, skill: s.skill, resolvedAt: nowIso });
+        this.deps.forecastRepo.setScore(f.id, { outcome, brierAgent: s.brierAgent, brierMarket: s.brierMarket, skill: s.skill, resolvedAt: resolvedIso });
         // Resolved before the 7-day mark: the resolution price is the convergence price
-        if (f.price_at_7d === null && parseTime(f.created_at) + CONVERGENCE_DAYS * DAY_MS > this.now()) {
-          this.deps.forecastRepo.setConvergence(f.id, outcome, nowIso, convergenceScore(f.probability, f.market_price_at_forecast, outcome));
+        if (f.price_at_7d === null && parseTime(f.created_at) + CONVERGENCE_DAYS * DAY_MS > resolvedMs) {
+          this.deps.forecastRepo.setConvergence(f.id, outcome, resolvedIso, convergenceScore(f.probability, f.market_price_at_forecast, outcome));
           result.convergence++;
         }
         result.scored++;
@@ -521,6 +609,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     for (const f of this.deps.forecastRepo.needingConvergence()) {
       const due = parseTime(f.created_at) + CONVERGENCE_DAYS * DAY_MS;
       if (Number.isNaN(due) || due > this.now()) continue;
+      // Closed market (resolution pending confirmation): the book is no market price
+      if (this.deps.marketCache.getCached(f.market_id)?.closed) continue;
       let mid: number | null = null;
       try {
         mid = await withTimeout(this.deps.getMid(f.token_id), LOOKUP_TIMEOUT_MS, 'mid');

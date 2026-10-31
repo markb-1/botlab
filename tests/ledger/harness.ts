@@ -11,7 +11,7 @@ import { AuditRepository } from '../../electron/database/repositories/AuditRepos
 import { AuditService } from '../../electron/audit/AuditService';
 import { MarketCacheService } from '../../electron/ledger/MarketCacheService';
 import { LedgerService } from '../../electron/ledger/LedgerService';
-import { defaultCategories, MandateSchema, type MandateConfig } from '../../electron/config';
+import { defaultCategories, LimitsSchema, MandateSchema, type MandateConfig } from '../../electron/config';
 import { FeeService } from '../../electron/orders/FeeService';
 
 export const DAY = 86_400_000;
@@ -122,6 +122,7 @@ export function openLedgerHarness(): LedgerHarness {
     },
     getMid: async (tokenId) => mids.get(tokenId) ?? null,
     getMandate: () => mandate.value,
+    getLimits: () => LimitsSchema.parse({}),
     now: () => clock.now,
   });
   return {

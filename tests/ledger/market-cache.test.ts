@@ -113,6 +113,22 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     expect(await h.cache.get(info('m2', ['Sports']))).toEqual({ category: 'sports', ambiguityScore: null, rulesChangedAt: null });
   });
 
+  it('order path: a row not refreshed for 2 h ⇒ ambiguity unknown (buys rejected)', async () => {
+    h.gamma.set('m1', gammaMarket('m1'));
+    await h.cache.setAmbiguity('m1', 0, 'human');
+    h.gammaDown.value = true;
+    h.clock.now += 2 * 3_600_000 - 1000;
+    expect((await h.cache.get(info('m1'))).ambiguityScore).toBe(0);
+    h.clock.now += 2000;
+    expect(await h.cache.get(info('m1'))).toMatchObject({ category: 'economics', ambiguityScore: null });
+    // Gamma no longer returns the market: same
+    h.gammaDown.value = false;
+    h.gamma.delete('m1');
+    expect((await h.cache.get(info('m1'))).ambiguityScore).toBeNull();
+    h.gamma.set('m1', gammaMarket('m1'));
+    expect((await h.cache.get(info('m1'))).ambiguityScore).toBe(0);
+  });
+
   it('periodic refresh batches watched markets; re-categorizes after a mapping change', async () => {
     for (const id of ['a', 'b', 'c']) h.gamma.set(id, gammaMarket(id));
     const cache2 = h.cache;

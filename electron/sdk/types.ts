@@ -219,8 +219,12 @@ export interface BotForecast {
   bestAsk: number | null;
   /** 0-3, after the server raise */
   ambiguityScore: number;
-  /** The (category, horizon) bucket was trading when the forecast was written */
+  /** Tradeable now: active, its (category, horizon) bucket is trading and the category is allowed */
   tradeable: boolean;
+  /** The bucket was trading when the forecast was written */
+  tradeableAtForecast: boolean;
+  /** Current rights state of the forecast's (category, horizon) bucket; null if unknown */
+  bucketState: string | null;
   horizonBucket: 'short' | 'medium' | 'long';
   daysToResolutionAtForecast: number;
   status: string;

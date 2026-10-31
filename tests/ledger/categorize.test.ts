@@ -32,6 +32,20 @@ describe('categorize (config/categories.yaml)', () => {
     // Denied category listed before an allowed one wins when both match
     ['sports + weather tags ⇒ sports', { question: 'Will rain delay the match?', tags: ['weather', 'tennis'] }, 'sports'],
     ['Fed headline is not economics', { question: 'Fed decision in December?', tags: ['economy', 'fed'] }, 'fed-headline'],
+    // Deny rules match on a keyword alone (no tag needed); a false deny is acceptable
+    ['Fed decision, rate tags', { question: 'Fed decision in December?', tags: ['interest-rates', 'central-banks'] }, 'fed-headline'],
+    ['Fed cut, economy tag', { question: 'Will the Fed cut rates by 50 bps?', tags: ['economy'] }, 'fed-headline'],
+    ['Powell, no tags', { question: 'Powell out as chair in 2026?', tags: [] }, 'fed-headline'],
+    ['FOMC, economics tag', { question: 'How many FOMC dissents?', tags: ['economics'] }, 'fed-headline'],
+    ['Fed tag alone', { question: 'Rates unchanged in March?', tags: ['fed'] }, 'fed-headline'],
+    ['ECB is still economics', { question: 'Will the ECB cut rates in December?', tags: ['interest-rates', 'central-banks'] }, 'economics'],
+    ['bitcoin, economy tag', { question: 'Bitcoin above $100k?', tags: ['economy'] }, 'crypto-price'],
+    ['crypto keyword, no tags', { question: 'Will ETH flip BTC?', tags: [] }, 'crypto-price'],
+    ['Senate, economy tag', { question: 'Will the Senate pass the budget bill?', tags: ['economy'] }, 'us-elections-headline'],
+    ['Trump tariffs on an economics market', { question: 'Will Trump tariffs push CPI above 3%?', tags: ['economy', 'inflation'] }, 'us-elections-headline'],
+    ['generic "US" only on political markets', { question: 'US CPI above 3%?', tags: ['economy'] }, 'economics'],
+    ['sports keyword, no tags', { question: 'Who wins the Super Bowl?', tags: [] }, 'sports'],
+    ['mentions keyword, economy tag', { question: 'Will Lagarde say "tariff" at the press conference?', tags: ['economy'] }, 'mentions'],
     // Fail closed
     ['generic election, no country', { question: 'Who will win the presidential election?', tags: ['politics', 'elections'] }, 'other'],
     ['no tags, no keyword', { question: 'Will it happen?', tags: [] }, 'other'],

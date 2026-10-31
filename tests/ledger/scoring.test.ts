@@ -63,8 +63,8 @@ describe('one vote per event + bootstrap', () => {
       { eventId: 'e2', value: -0.4, at: 1 },
     ]);
     expect(votes).toEqual([
-      { eventId: 'e2', value: -0.4, at: 1 },
-      { eventId: 'e1', value: expect.closeTo(0.2, 10), at: 5 },
+      { eventId: 'e2', value: -0.4, at: 1, firstAt: 1 },
+      { eventId: 'e1', value: expect.closeTo(0.2, 10), at: 5, firstAt: 3 },
     ]);
     // Many correlated forecasts on one event do not outvote other events
     const s = voteStats(eventVotes([...Array.from({ length: 50 }, (_, i) => ({ eventId: 'big', value: 1, at: i })), { eventId: 'small', value: -1, at: 0 }]), 1);
@@ -88,7 +88,10 @@ describe('one vote per event + bootstrap', () => {
 
 /** n events with the given skill values (cycled), scored one per day ending at `endAt`. */
 function votes(n: number, values: number[], endAt = NOW): EventVote[] {
-  return Array.from({ length: n }, (_, i) => ({ eventId: `e${i}`, value: values[i % values.length], at: endAt - (n - 1 - i) * DAY }));
+  return Array.from({ length: n }, (_, i) => {
+    const at = endAt - (n - 1 - i) * DAY;
+    return { eventId: `e${i}`, value: values[i % values.length], at, firstAt: at };
+  });
 }
 const GOOD = [0.05, 0.06, 0.04, 0.07]; // clearly positive skill
 const BAD = [-0.05, -0.06, -0.04, -0.07];
@@ -151,6 +154,25 @@ describe('category rights transitions', () => {
     expect(back.qualifiedN).toBe(90);
     // Only old good events: stays suspended
     expect(decideRights(input({ state: 'suspended', current: { changedAt: suspendedAt }, skillVotes: before })).state).toBe('suspended');
+  });
+
+  it('entering trading also needs mean skill of the last 20 events ≥ 0', () => {
+    // Strong early record, recent 20 events slightly negative: lower bound > 0 but recent mean < 0
+    const v = votes(30, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, ...Array(20).fill(-0.01)]);
+    const d = decideRights(input({ skillVotes: v }));
+    expect(d.skill.lowerBound!).toBeGreaterThan(0);
+    expect(d.state).toBe('shadow');
+    // Same for re-entry after suspension
+    const suspendedAt = NOW - 40 * DAY;
+    expect(decideRights(input({ state: 'suspended', current: { changedAt: suspendedAt }, skillVotes: v })).state).toBe('suspended');
+  });
+
+  it('re-qualification ignores events with any forecast resolved before the suspension', () => {
+    const suspendedAt = NOW - 40 * DAY;
+    // 30 good events whose latest resolution is after the suspension but whose first is before it
+    const straddling = votes(30, GOOD).map((v) => ({ ...v, firstAt: suspendedAt - DAY }));
+    expect(decideRights(input({ state: 'suspended', current: { changedAt: suspendedAt }, skillVotes: straddling })).state).toBe('suspended');
+    expect(decideRights(input({ state: 'suspended', current: { changedAt: suspendedAt }, skillVotes: votes(30, GOOD) })).state).toBe('trading');
   });
 
   it('allocationFor and mandateListing', () => {

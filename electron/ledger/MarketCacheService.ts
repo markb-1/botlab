@@ -10,9 +10,10 @@
  *   emitted as `market:rulesChanged`.
  * - Refresh on demand with a 10-minute TTL (order path, forecasts) and every 30 minutes for markets
  *   that are held, have open orders or active forecasts.
- * - Ambiguity: the assessed score (from a forecast or a human) is stored here; the effective score
- *   adds the server raise (≥ 2 within 7 days of a rules change or on a UMA dispute). Not assessed ⇒
- *   null ⇒ the risk engine rejects buys.
+ * - Ambiguity: the assessed score is stored here with its source. A human assessment always wins
+ *   until a human changes it; a forecast may only raise a forecast-sourced score. The effective score
+ *   adds the server raise (≥ 2 within 7 days of a rules change or on a UMA dispute). Not assessed, or
+ *   the row not refreshed for 2 h ⇒ null ⇒ the risk engine rejects buys.
  *
  * Gamma failures never throw into the order path: the cached row (if any) is used and buys of an
  * unassessed / unknown market stay rejected.
@@ -32,6 +33,8 @@ import logger from '../../src/utils/logger';
 export const MARKET_RULES_CHANGED_EVENT = 'market:rulesChanged';
 export const MARKET_CACHE_TTL_MS = 10 * 60_000;
 export const MARKET_REFRESH_INTERVAL_MS = 30 * 60_000;
+/** Order path: a row not refreshed for this long is too stale to buy on (ambiguity treated as unknown) */
+export const MARKET_STALE_FOR_BUYS_MS = 2 * 3_600_000;
 const FETCH_TIMEOUT_MS = 10_000;
 /** On-demand refresh inside the order path waits at most this long */
 const ORDER_PATH_REFRESH_TIMEOUT_MS = 5_000;
@@ -78,6 +81,9 @@ export interface MarketView {
   /** Assessed score after the server raise; null = not assessed */
   ambiguityScore: number | null;
   ambiguityRaisedBecause: string | null;
+  /** First time the scorer saw the current final resolution, and what it was (JSON) */
+  resolutionSeenAt: string | null;
+  resolutionSeen: string | null;
   updatedAt: string;
 }
 
@@ -252,6 +258,8 @@ export function toMarketView(row: MarketCacheRow, now: number): MarketView {
     ambiguityNote: row.ambiguity_note,
     ambiguityScore: effectiveAmbiguity({ assessed: row.market_ambiguity, rulesChangedAt: row.rules_changed_at, disputed }, now),
     ambiguityRaisedBecause: autoRaiseReason({ rulesChangedAt: row.rules_changed_at, disputed }, now),
+    resolutionSeenAt: row.resolution_seen_at ?? null,
+    resolutionSeen: row.resolution_seen ?? null,
     updatedAt: row.updated_at,
   };
 }
@@ -339,6 +347,12 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       };
     }
     const view = toMarketView(row, this.now());
+    // Refresh failed (or Gamma no longer returns the market) for too long: rules and disputes are unknown,
+    // so the ambiguity is treated as unknown ⇒ buys rejected; sells do not depend on it
+    const age = this.now() - Date.parse(row.updated_at);
+    if (!(age < MARKET_STALE_FOR_BUYS_MS)) {
+      return { category: view.category, ambiguityScore: null, rulesChangedAt: view.rulesChangedAt };
+    }
     return { category: view.category, ambiguityScore: view.ambiguityScore, rulesChangedAt: view.rulesChangedAt };
   }
 
@@ -500,25 +514,58 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
 
   // ── Ambiguity ────────────────────────────────────────────────────
 
-  /**
-   * Record an assessed ambiguity score (0–3). The market is fetched first when not cached.
-   * `source` is who assessed it (`agent` via a forecast, `human` via IPC).
-   */
-  async setAmbiguity(marketId: string, score: number, actor: AuditActor, note: string | null = null): Promise<MarketView> {
-    if (!Number.isInteger(score) || score < 0 || score > 3) throw new Error('ambiguity score must be an integer 0-3');
+  private async requireRow(marketId: string): Promise<MarketCacheRow> {
     if (typeof marketId !== 'string' || !marketId) throw new Error('marketId required');
-    const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 2000) : null;
     let row = this.deps.repo.get(marketId);
     if (!row) {
       await this.refresh(marketId);
       row = this.deps.repo.get(marketId);
       if (!row) throw new Error(`Unknown market ${marketId}`);
     }
+    return row;
+  }
+
+  /**
+   * Human assessment (0–3). Always replaces the stored score; from then on forecasts cannot change it
+   * until a human sets it again. The market is fetched first when not cached.
+   */
+  async setAmbiguity(marketId: string, score: number, actor: AuditActor, note: string | null = null): Promise<MarketView> {
+    if (!Number.isInteger(score) || score < 0 || score > 3) throw new Error('ambiguity score must be an integer 0-3');
+    if (actor !== 'human') throw new Error('Only a human can set a market assessment directly (forecasts use recordForecastAmbiguity)');
+    const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 2000) : null;
+    const row = await this.requireRow(marketId);
     const at = new Date(this.now()).toISOString();
-    this.deps.repo.setAmbiguity(marketId, score, actor, cleanNote, at);
+    this.deps.repo.setAmbiguity(marketId, score, 'human', cleanNote, at);
     const view = toMarketView(this.deps.repo.get(marketId)!, this.now());
-    this.deps.audit?.record(actor, 'market.ambiguity', marketId, { from: row.market_ambiguity, to: score, effective: view.ambiguityScore, raisedBecause: view.ambiguityRaisedBecause, note: cleanNote }, 'ok');
+    this.deps.audit?.record(actor, 'market.ambiguity', marketId, { from: row.market_ambiguity, fromSource: row.ambiguity_source, to: score, source: 'human', effective: view.ambiguityScore, raisedBecause: view.ambiguityRaisedBecause, note: cleanNote }, 'ok');
     return view;
+  }
+
+  /**
+   * A forecast's ambiguity score. Ignored when a human assessed the market; otherwise it can only
+   * raise the stored score (never lower it). Returns whether the stored score changed.
+   */
+  async recordForecastAmbiguity(marketId: string, score: number, actor: AuditActor, forecastId: string): Promise<boolean> {
+    if (!Number.isInteger(score) || score < 0 || score > 3) throw new Error('ambiguity score must be an integer 0-3');
+    const row = await this.requireRow(marketId);
+    let result: string;
+    let changed = false;
+    if (row.ambiguity_source === 'human') {
+      result = 'kept: human assessment';
+    } else if (row.market_ambiguity !== null && score <= row.market_ambiguity) {
+      result = 'kept: forecasts can only raise the score';
+    } else {
+      this.deps.repo.setAmbiguity(marketId, score, 'forecast', `forecast ${forecastId}`, new Date(this.now()).toISOString());
+      result = 'ok';
+      changed = true;
+    }
+    this.deps.audit?.record(actor, 'market.ambiguity', marketId, { from: row.market_ambiguity, fromSource: row.ambiguity_source, proposed: score, source: 'forecast', forecastId }, result);
+    return changed;
+  }
+
+  /** Scorer bookkeeping: the resolution first seen (null clears it). */
+  setResolutionSeen(marketId: string, signature: string | null, at: string | null): void {
+    this.deps.repo.setResolutionSeen(marketId, signature, at);
   }
 
   // ── Periodic refresh ─────────────────────────────────────────────

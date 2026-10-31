@@ -35,6 +35,8 @@ export interface ForecastRow {
   brier_agent: number | null;
   brier_market: number | null;
   skill: number | null;
+  /** When this version stopped being active (superseded / withdrawn / resolved); null while active */
+  active_until: string | null;
 }
 
 export interface ForecastInsert {
@@ -105,7 +107,7 @@ export class ForecastRepository {
   insertSuperseding(f: ForecastInsert): { supersededId: string | null } {
     return this.db.transaction(() => {
       const prev = this.findActiveByToken(f.tokenId);
-      if (prev) this.db.prepare("UPDATE forecasts SET status = 'superseded' WHERE id = ?").run(prev.id);
+      if (prev) this.db.prepare("UPDATE forecasts SET status = 'superseded', active_until = ? WHERE id = ?").run(f.createdAt, prev.id);
       this.db
         .prepare(
           `INSERT INTO forecasts (id, market_id, token_id, event_id, category, probability, market_price_at_forecast, best_bid,
@@ -125,8 +127,8 @@ export class ForecastRepository {
 
   withdraw(id: string, reason: string, at: string): boolean {
     const r = this.db
-      .prepare("UPDATE forecasts SET status = 'withdrawn', withdrawn_at = ?, withdrawn_reason = ? WHERE id = ? AND status = 'active'")
-      .run(at, reason, id);
+      .prepare("UPDATE forecasts SET status = 'withdrawn', withdrawn_at = ?, withdrawn_reason = ?, active_until = ? WHERE id = ? AND status = 'active'")
+      .run(at, reason, at, id);
     return r.changes > 0;
   }
 
@@ -154,14 +156,15 @@ export class ForecastRepository {
     this.db
       .prepare(
         `UPDATE forecasts SET outcome = ?, brier_agent = ?, brier_market = ?, skill = ?, resolved_at = ?,
+           active_until = COALESCE(active_until, ?),
            status = CASE WHEN status = 'active' THEN 'resolved' ELSE status END
          WHERE id = ?`
       )
-      .run(s.outcome, s.brierAgent, s.brierMarket, s.skill, s.resolvedAt, id);
+      .run(s.outcome, s.brierAgent, s.brierMarket, s.skill, s.resolvedAt, s.resolvedAt, id);
   }
 
   setVoid(id: string, resolvedAt: string): void {
-    this.db.prepare("UPDATE forecasts SET status = 'void', resolved_at = ? WHERE id = ?").run(resolvedAt, id);
+    this.db.prepare("UPDATE forecasts SET status = 'void', resolved_at = ?, active_until = COALESCE(active_until, ?) WHERE id = ?").run(resolvedAt, resolvedAt, id);
   }
 
   /** Unresolved forecasts without a convergence price yet (resolved ones get it from the outcome when scored). */

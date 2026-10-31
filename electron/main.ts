@@ -276,6 +276,7 @@ async function initializePhaseA(): Promise<void> {
     getTopOfBook: (tokenId) => fetchPolymarketTop(settingsRepo.get().clob_http_url, tokenId),
     getMid: (tokenId) => fetchPolymarketMid(settingsRepo.get().clob_http_url, tokenId),
     getMandate: () => configService.getConfig()?.mandate ?? null,
+    getLimits: () => configService.getConfig()?.limits ?? null,
   });
   registerLedgerHandlers(ledger, marketCache, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
   marketCache.start();

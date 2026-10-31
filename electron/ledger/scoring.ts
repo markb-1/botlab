@@ -55,33 +55,62 @@ export function convergenceScore(p: number, m: number, priceAt7d: number): numbe
 
 export interface ScoredItem {
   eventId: string;
+  /** Token the forecast is on; versions of the same token are weighted against each other. Default: one token per event */
+  tokenId?: string;
   value: number;
+  /** How long this version was the active forecast (ms); default 1 (equal weights) */
+  weight?: number;
   /** When the item was scored (ms); for skill the resolution time, for convergence the capture time */
   at: number;
 }
 
 export interface EventVote {
   eventId: string;
-  /** Mean of the event's item values */
+  /** Mean over the event's tokens of each token's active-time-weighted mean */
   value: number;
   /** Latest `at` among the event's items */
   at: number;
+  /** Earliest `at` among the event's items */
+  firstAt: number;
 }
 
-/** Group by event: each event contributes the mean of its items. Sorted by time (then id). */
+/**
+ * One vote per event (spec §6.2), robust to superseding: within a token each forecast version is
+ * weighted by how long it was active, so many quick re-forecasts cannot dilute one call; the event
+ * vote is the mean over its tokens. Sorted by time (then id).
+ */
 export function eventVotes(items: readonly ScoredItem[]): EventVote[] {
-  const groups = new Map<string, { sum: number; n: number; at: number }>();
+  const events = new Map<string, { tokens: Map<string, { sum: number; w: number }>; at: number; firstAt: number }>();
   for (const it of items) {
     if (!Number.isFinite(it.value)) continue;
-    const g = groups.get(it.eventId) ?? { sum: 0, n: 0, at: -Infinity };
-    g.sum += it.value;
-    g.n += 1;
-    g.at = Math.max(g.at, it.at);
-    groups.set(it.eventId, g);
+    const w = it.weight === undefined ? 1 : it.weight;
+    if (!Number.isFinite(w) || w <= 0) continue;
+    const e = events.get(it.eventId) ?? { tokens: new Map(), at: -Infinity, firstAt: Infinity };
+    const key = it.tokenId ?? '';
+    const t = e.tokens.get(key) ?? { sum: 0, w: 0 };
+    t.sum += it.value * w;
+    t.w += w;
+    e.tokens.set(key, t);
+    e.at = Math.max(e.at, it.at);
+    e.firstAt = Math.min(e.firstAt, it.at);
+    events.set(it.eventId, e);
   }
-  return [...groups]
-    .map(([eventId, g]) => ({ eventId, value: g.sum / g.n, at: g.at }))
+  return [...events]
+    .map(([eventId, e]) => {
+      const means = [...e.tokens.values()].map((t) => t.sum / t.w);
+      return { eventId, value: means.reduce((a, b) => a + b, 0) / means.length, at: e.at, firstAt: e.firstAt };
+    })
     .sort((a, b) => a.at - b.at || (a.eventId < b.eventId ? -1 : a.eventId > b.eventId ? 1 : 0));
+}
+
+/** A forecast this close to the market price carries no information and cannot be traded: excluded from stats. */
+export const MIN_STATS_DISAGREEMENT = 0.02;
+
+/** Active time of one version (ms): creation until it stopped being active, capped at the market end; at least 1 ms. */
+export function activeWeight(createdAt: number, activeUntil: number | null, marketEnd: number): number {
+  const until = Math.min(activeUntil ?? marketEnd, marketEnd);
+  const w = until - createdAt;
+  return Number.isFinite(w) && w > 0 ? w : 1;
 }
 
 /** mulberry32: small seeded PRNG in [0, 1). */
@@ -155,6 +184,8 @@ export const ALLOCATION_STEP_USD = 50;
 export const ALLOCATION_STEP_EVENTS = 20;
 export const SUSPEND_WINDOW_EVENTS = 20;
 export const DEPRIORITISE_MIN_EVENTS = 20;
+/** Entering trading also needs mean skill over the last 20 events ≥ 0 */
+export const RECENT_WINDOW_EVENTS = 20;
 
 export type MandateListing = 'allow' | 'later' | 'deny' | 'none';
 
@@ -204,6 +235,11 @@ export interface RightsDecision {
 }
 
 const mean = (xs: readonly number[]) => xs.reduce((s, v) => s + v, 0) / xs.length;
+/** Mean of the last 20 votes (null when none). */
+export function recentMean(votes: readonly EventVote[]): number | null {
+  const last = votes.slice(-RECENT_WINDOW_EVENTS).map((v) => v.value);
+  return last.length > 0 ? mean(last) : null;
+}
 const fmt = (n: number | null) => (n === null ? 'n/a' : n.toFixed(4));
 
 /** Allocation for a trading bucket: 50, +50 per further 20 scored events since qualifying, capped by the budget. */
@@ -216,10 +252,11 @@ export function allocationFor(nScored: number, qualifiedN: number, budgetUsd: nu
  * Next rights state of one bucket (spec §6.3):
  * - only categories in the mandate allow list can be `trading` (a trading bucket whose category leaves
  *   the allow list goes back to `shadow`);
- * - shadow → trading: n ≥ 30 (medium: 20 if the short bucket trades) and skill lower bound > 0;
+ * - shadow → trading: n ≥ 30 (medium: 20 if the short bucket trades), skill lower bound > 0 and mean
+ *   skill of the last 20 events ≥ 0;
  * - trading: allocation grows +50 per 20 further events while the lower bound is > 0 (never above the
  *   budget); mean skill of the last 20 events < 0 ⇒ suspended;
- * - suspended → trading: re-qualify on events scored after the suspension only;
+ * - suspended → trading: re-qualify (same rules) on events whose forecasts all resolved after the suspension;
  * - shadow → deprioritised: ≥ 20 convergence events, convergence lower bound < 0 and mean < 0;
  * - deprioritised is left only by a human. A human-forced state blocks automatic promotion and
  *   deprioritisation; suspension and the mandate rule still apply.
@@ -271,8 +308,9 @@ export function decideRights(input: RightsInput): RightsDecision {
     }
     case 'shadow': {
       if (current.forced) return keep('forced by a human');
-      if (canTrade && skill.n >= required && skill.lowerBound !== null && skill.lowerBound > 0) {
-        return to('trading', Math.min(INITIAL_MAX_ALLOCATION_USD, budgetUsd), skill.n, `qualified: n=${skill.n} >= ${required}, skill lower bound ${fmt(skill.lowerBound)} > 0`);
+      const recent = recentMean(input.skillVotes);
+      if (canTrade && skill.n >= required && skill.lowerBound !== null && skill.lowerBound > 0 && recent !== null && recent >= 0) {
+        return to('trading', Math.min(INITIAL_MAX_ALLOCATION_USD, budgetUsd), skill.n, `qualified: n=${skill.n} >= ${required}, skill lower bound ${fmt(skill.lowerBound)} > 0, recent mean ${fmt(recent)} >= 0`);
       }
       if (convergence.n >= DEPRIORITISE_MIN_EVENTS && convergence.lowerBound !== null && convergence.lowerBound < 0 && convergence.mean !== null && convergence.mean < 0) {
         return to('deprioritised', 0, null, `convergence n=${convergence.n}, mean ${fmt(convergence.mean)} < 0, lower bound ${fmt(convergence.lowerBound)} < 0`);
@@ -282,9 +320,11 @@ export function decideRights(input: RightsInput): RightsDecision {
     case 'suspended': {
       if (current.forced) return keep('forced by a human');
       if (!canTrade) return keep();
-      const after = input.skillVotes.filter((v) => v.at > current.changedAt);
+      // Only events whose forecasts all resolved after the suspension
+      const after = input.skillVotes.filter((v) => v.firstAt > current.changedAt);
       const s = voteStats(after, input.seed);
-      if (s.n >= required && s.lowerBound !== null && s.lowerBound > 0) {
+      const recent = recentMean(after);
+      if (s.n >= required && s.lowerBound !== null && s.lowerBound > 0 && recent !== null && recent >= 0) {
         return to('trading', Math.min(INITIAL_MAX_ALLOCATION_USD, budgetUsd), skill.n, `re-qualified on ${s.n} events scored after suspension, lower bound ${fmt(s.lowerBound)} > 0`);
       }
       return keep();

@@ -38,6 +38,10 @@ export interface MarketCacheRow {
   ambiguity_at: string | null;
   created_at: string;
   updated_at: string;
+  /** First time the scorer saw the current final resolution (see LedgerService) */
+  resolution_seen_at: string | null;
+  /** JSON of the resolution seen then (to detect a change) */
+  resolution_seen: string | null;
 }
 
 /** Fields written by a Gamma refresh (ambiguity is never touched by a refresh). */
@@ -133,6 +137,10 @@ export class MarketCacheRepository {
   /** Re-categorize (categories.yaml changed) without touching anything else. */
   setCategory(marketId: string, category: string): void {
     this.db.prepare('UPDATE market_cache SET category = ? WHERE market_id = ?').run(category, marketId);
+  }
+
+  setResolutionSeen(marketId: string, signature: string | null, at: string | null): void {
+    this.db.prepare('UPDATE market_cache SET resolution_seen = ?, resolution_seen_at = ? WHERE market_id = ?').run(signature, at, marketId);
   }
 
   setAmbiguity(marketId: string, score: number, source: string, note: string | null, at: string): void {

@@ -457,6 +457,11 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       changed_reason TEXT,
       PRIMARY KEY (category, horizon_bucket)
     )`,
+    // 2a review: when a forecast version stopped being active (superseded / withdrawn / resolved) — weights
+    // versions in the stats; first time the scorer saw a final resolution (scored only once confirmed)
+    'ALTER TABLE forecasts ADD COLUMN active_until TEXT',
+    'ALTER TABLE market_cache ADD COLUMN resolution_seen_at TEXT',
+    'ALTER TABLE market_cache ADD COLUMN resolution_seen TEXT',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

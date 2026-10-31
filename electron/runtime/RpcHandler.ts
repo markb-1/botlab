@@ -12,7 +12,6 @@ import type { BotStorageRepository } from '../database/repositories/BotStorageRe
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
 import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast } from '../sdk/types';
 import type { ForecastView } from '../ledger/LedgerService';
-import type { ForecastFilter } from '../database/repositories/ForecastRepository';
 import type { PaperTradingState } from './PaperTradingState';
 import {
   getOrderBook,
@@ -33,14 +32,17 @@ import { scriptFetch } from './scriptFetch';
 export const MAX_CONCURRENT_FETCHES = 6;
 import logger from '../../src/utils/logger';
 
+/** A forecast with its bucket's current rights (live). */
+export type LiveForecast = ForecastView & { bucketState: string | null; tradeableNow: boolean };
+
 /** Read-only ledger access for bots (spec §5.2: bots may read ledger data, never write it). */
 export interface LedgerReader {
-  list(filter?: ForecastFilter): ForecastView[];
-  getActiveForToken(tokenId: string): ForecastView | null;
+  botForecasts(filter?: { category?: string; tradeableOnly?: boolean }): LiveForecast[];
+  botForecast(tokenId: string): LiveForecast | null;
 }
 
-/** The forecast as a bot sees it. */
-export function toBotForecast(f: ForecastView): BotForecast {
+/** The forecast as a bot sees it: `tradeable` is computed now from the bucket's current state. */
+export function toBotForecast(f: LiveForecast): BotForecast {
   return {
     id: f.id,
     marketId: f.marketId,
@@ -52,7 +54,9 @@ export function toBotForecast(f: ForecastView): BotForecast {
     bestBid: f.bestBid,
     bestAsk: f.bestAsk,
     ambiguityScore: f.ambiguityScore,
-    tradeable: f.tradeable,
+    tradeable: f.tradeableNow,
+    tradeableAtForecast: f.tradeable,
+    bucketState: f.bucketState,
     horizonBucket: f.horizonBucket,
     daysToResolutionAtForecast: f.daysToResolutionAtForecast,
     status: f.status,
@@ -227,8 +231,7 @@ export class RpcHandler {
       case 'ledger:getActiveForecasts': {
         const filter = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as { category?: unknown; tradeableOnly?: unknown };
         return this.ledger
-          .list({
-            status: 'active',
+          .botForecasts({
             ...(typeof filter.category === 'string' && filter.category ? { category: filter.category } : {}),
             tradeableOnly: filter.tradeableOnly === true,
           })
@@ -238,7 +241,7 @@ export class RpcHandler {
       case 'ledger:getForecast': {
         const tokenId = args[0];
         if (typeof tokenId !== 'string' || !tokenId) throw new Error('tokenId required');
-        const f = this.ledger.getActiveForToken(tokenId);
+        const f = this.ledger.botForecast(tokenId);
         return f ? toBotForecast(f) : null;
       }
 
