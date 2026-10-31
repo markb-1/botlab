@@ -9,7 +9,7 @@
  */
 
 import { parentPort as maybeParentPort, workerData } from 'worker_threads';
-import { createBotContext, handleRpcResponse } from './BotContextProxy';
+import { createBotContext, dispatchBotEvent, handleRpcResponse } from './BotContextProxy';
 import { evaluateScript, hardenWorkerRealm } from './sandbox';
 import type {
   MainToWorkerMessage,
@@ -152,6 +152,11 @@ parentPort.on('message', async (msg: MainToWorkerMessage) => {
 
     case 'rpc-response':
       handleRpcResponse(msg.response as RpcResponse);
+      break;
+
+    case 'bot-event':
+      // Not awaited: a slow handler must not delay RPC responses
+      void dispatchBotEvent(msg.name, msg.data);
       break;
   }
 });

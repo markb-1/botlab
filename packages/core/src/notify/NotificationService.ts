@@ -53,6 +53,8 @@ export interface NotificationDeps {
   isRunning: (botId: string) => boolean;
   /** Agent lines of the daily digest (runs in the last 24 h, month-to-date budget); omitted when absent */
   getAgentDigest?: () => string | null;
+  /** Copy-trading leader lines of the daily digest (5c); omitted when there are no copy bots */
+  getCopyDigest?: () => string | null;
   /** Where the last digest date is kept so a restart does not repeat it */
   stateFile?: string;
   now?: () => number;
@@ -329,6 +331,12 @@ export class NotificationService implements OrderEventSink {
         );
         break;
       }
+      case 'copy.leader_dropped':
+        this.send(
+          `Copy leader dropped on ${String(p.botName ?? this.botName(target))}: ${String(p.leader ?? '?')} (${short(String(p.reason ?? 'losing copies'))}). ` +
+            'The bot stops copying it; a human can re-activate it on the bot page.'
+        );
+        break;
       case 'bot.error':
         this.send(`[BOT ERROR] ${this.botName(target)} stopped: ${short(String(p.message ?? p.reason ?? 'worker error'))}`, { priority: 'high' });
         break;
@@ -427,7 +435,25 @@ export class NotificationService implements OrderEventSink {
     } catch (err) {
       agent = `Agent: unavailable (${short(err instanceof Error ? err.message : String(err), 100)})`;
     }
-    return [`Daily digest ${date}`, '', this.pnlText(), '', this.exposureText(), '', this.haltsText(), '', this.botsByStageText(), ...(agent ? ['', agent] : [])].join('\n');
+    let copy: string | null = null;
+    try {
+      copy = this.deps.getCopyDigest?.() ?? null;
+    } catch (err) {
+      copy = `Copy leaders: unavailable (${short(err instanceof Error ? err.message : String(err), 100)})`;
+    }
+    return [
+      `Daily digest ${date}`,
+      '',
+      this.pnlText(),
+      '',
+      this.exposureText(),
+      '',
+      this.haltsText(),
+      '',
+      this.botsByStageText(),
+      ...(copy ? ['', copy] : []),
+      ...(agent ? ['', agent] : []),
+    ].join('\n');
   }
 
   private readDigestState(): string | null {

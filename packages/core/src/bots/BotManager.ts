@@ -19,7 +19,13 @@ import type { SettingsRepository } from '../db/repositories/SettingsRepository';
 import type { ScriptRepository } from '../db/repositories/ScriptRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import { ScriptBotRunner, type OrderServiceFactory } from '../runtime/ScriptBotRunner';
+import { ScriptBotRunner, DEFAULT_PAPER_BALANCE, type OrderServiceFactory } from '../runtime/ScriptBotRunner';
+import { PaperTradingState } from '../runtime/PaperTradingState';
+import { builtinRoleOf, isStandingRole, type BuiltinRole } from '../db/repositories/ScriptRepository';
+import type { PositionExitFlagRepository } from '../db/repositories/AgentRepository';
+import { PortfolioService, type ExitOrderService } from '../orders/PortfolioService';
+import type { BotPushEventName, MandateSummary } from '../sdk/types';
+import type { CopyLeaderService } from '../services/CopyLeaderService';
 import type { Database } from '../db/index';
 import type { OrderRepository } from '../db/repositories/OrderRepository';
 import type { RiskStateRepository } from '../db/repositories/RiskStateRepository';
@@ -40,6 +46,35 @@ import type { LimitsConfig, AppConfig } from '../config';
 import type { OrderEventSink } from '../notify/events';
 import type { ConfigService } from '../config/ConfigService';
 import { getBalance } from '../exchange/polymarket/trading';
+import type { MarketView } from '../ledger/MarketCacheService';
+import type { ExitPolicy } from '../sdk/types';
+import { POSITION_MANAGER_AMBIGUITY_EXIT, POSITION_MANAGER_EXIT_WINDOW_FALLBACK } from '../runtime/RpcHandler';
+
+/** Emitted (with { botId, reason }) when a script calls ctx.requestRetire; the core retires the bot (5b) */
+export const BOT_RETIRE_REQUEST_EVENT = 'bot:retire-request';
+
+/** bots.market_ids JSON → list (null = unscoped; unreadable = no market) */
+export function parseMarketIdList(raw: string | null | undefined): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** ctx.polymarket.getMarket backend: a condition id (0x…) or a token id; a failed refresh falls back to the cache */
+function marketLookup(cache: MarketCacheService): (idOrTokenId: string) => Promise<MarketView | null> {
+  return async (id) => {
+    const byId = /^0x[0-9a-fA-F]+$/.test(id);
+    try {
+      return byId ? await cache.getMarket(id) : await cache.getMarketByToken(id);
+    } catch {
+      return byId ? cache.getCached(id) : cache.getCachedByToken(id);
+    }
+  };
+}
 import { getBinanceBalance, getBinanceOrderBook } from '../exchange/binance/client';
 import { decrypt } from '../security/crypto';
 import { keyManager } from '../security/keyManager';
@@ -61,12 +96,33 @@ export interface BotManagerOrderDeps {
   ledger?: LedgerService;
   /** Clock skew guard (Reconciler): live orders are refused while the clock is off (spec §15) */
   clock?: ClockSkewGuard;
+  /** position_exit_flags (R140): read and closed by the builtin position manager (ctx.portfolio) */
+  exitFlags?: PositionExitFlagRepository;
+  /** Copy-trading leaders (5c): ctx.copy and order attribution for the builtin Copy Trading template */
+  copyLeaders?: Pick<CopyLeaderService, 'statusFor' | 'recordOrder' | 'holdings'>;
 }
 
 /**
  * BotManager orchestrates all bot instances.
  * Handles starting, stopping, and monitoring bots.
  */
+
+/**
+ * ctx.risk.getFlaggedTokens: open exit flags on any bot's position in ONE mode (filtered in SQL), latest per token,
+ * without reasons or owners (they are another bot's business).
+ */
+export function flaggedTokensInMode(
+  flags: Pick<PositionExitFlagRepository, 'listOpen'>,
+  simulated: boolean
+): Array<{ tokenId: string; marketId: string | null; flaggedAt: string }> {
+  const byToken = new Map<string, { tokenId: string; marketId: string | null; flaggedAt: string }>();
+  for (const f of flags.listOpen(simulated)) {
+    const prev = byToken.get(f.token_id);
+    if (!prev || f.created_at > prev.flaggedAt) byToken.set(f.token_id, { tokenId: f.token_id, marketId: f.market_id ?? prev?.marketId ?? null, flaggedAt: f.created_at });
+  }
+  return [...byToken.values()];
+}
+
 export class BotManager extends EventEmitter {
   private walletManager: WalletManager;
   private botRepo: BotRepository;
@@ -88,6 +144,10 @@ export class BotManager extends EventEmitter {
   private orderServices: Map<string, { service: OrderService; simulated: boolean }> = new Map();
   /** Startup orphan-order recovery running: bots may not start until it finishes */
   private recoveryInProgress = false;
+  /** Running bots on standing builtin templates: one per role and mode (spec §9.1, §9.2) */
+  private roles: Map<string, { role: BuiltinRole; mode: 'live' | 'paper' }> = new Map();
+  /** ctx.portfolio backend (builtin position manager only) */
+  private portfolio: PortfolioService | null = null;
 
   constructor(
     walletManager: WalletManager,
@@ -184,6 +244,12 @@ export class BotManager extends EventEmitter {
    * Throws (so the bot does not start) when the risk config or order store is unavailable.
    */
   private createOrderService: OrderServiceFactory = (args) => {
+    const service = this.buildOrderService(args);
+    this.orderServices.set(args.botId, { service, simulated: args.mode === 'paper' });
+    return service;
+  };
+
+  private buildOrderService(args: Parameters<OrderServiceFactory>[0]): OrderService {
     if (!this.orderDeps) throw new Error('Order store not configured; orders are disabled');
     if (!this.riskEngine || !this.fees) throw new Error(`Risk config not loaded: ${this.configError}`);
 
@@ -252,11 +318,149 @@ export class BotManager extends EventEmitter {
         paperState: ps ?? null,
       }
     );
-    this.orderServices.set(args.botId, { service, simulated: paper });
     return service;
-  };
+  }
+
+  /**
+   * The OrderService a position-manager exit is placed through: the owning bot's running service in this
+   * mode, else a transient one for that bot built the same way (its wallet's client; in paper, its paper
+   * state loaded from storage). Not registered as running. Throws if the bot or its wallet is unavailable.
+   */
+  async getExitOrderService(botId: string, simulated: boolean): Promise<ExitOrderService> {
+    const running = this.getRunningOrderService(botId, simulated);
+    if (running) return running;
+    const row = this.botRepo.findById(botId);
+    if (!row) throw new Error(`Bot not found: ${botId}`);
+    const creds = await this.walletManager.getWallet(row.wallet_id);
+    const clobClient = await this.getClobClient(creds, simulated);
+    let paperState: PaperTradingState | undefined;
+    if (simulated) {
+      let balance = DEFAULT_PAPER_BALANCE;
+      try {
+        const cfg = JSON.parse(row.config || '{}') as { paperBalance?: unknown };
+        if (typeof cfg.paperBalance === 'number' && cfg.paperBalance > 0) balance = cfg.paperBalance;
+      } catch {
+        /* default */
+      }
+      paperState = new PaperTradingState(botId, balance, this.storageRepo);
+      paperState.load();
+    }
+    const script = this.scriptRepo.findById(row.script_id);
+    return this.buildOrderService({
+      botId,
+      botName: row.name,
+      scriptName: script?.name ?? 'script',
+      mode: simulated ? 'paper' : 'live',
+      clobClient,
+      walletAddress: creds.address,
+      proxyAddress: creds.proxyAddress,
+      paperState,
+    });
+  }
+
+  private getPortfolio(): PortfolioService {
+    if (!this.orderDeps?.exitFlags) throw new Error('Exit flags store not configured');
+    if (!this.portfolio) {
+      this.portfolio = new PortfolioService({
+        botRepo: this.botRepo,
+        tradeRepo: this.tradeRepo,
+        orderRepo: this.orderDeps.orderRepo,
+        flagRepo: this.orderDeps.exitFlags,
+        ledger: this.orderDeps.ledger,
+        markets: this.orderDeps.marketCache,
+        audit: this.orderDeps.audit,
+        getExitService: (botId, simulated) => this.getExitOrderService(botId, simulated),
+        // The running forecast executor's last unfunded demand (spec §9.2 "a better use of capital is queued")
+        capitalDemand: (simulated) => {
+          for (const [id, r] of this.roles) {
+            if (r.role === 'forecast-executor' && r.mode === (simulated ? 'paper' : 'live') && this.instances.has(id)) {
+              return this.storageRepo.get(id, 'executor:demand');
+            }
+          }
+          return null;
+        },
+      });
+    }
+    return this.portfolio;
+  }
+
+  /**
+   * The Position Manager's exit thresholds for bots in this mode (ctx.risk.getExitPolicy, 5b review): the largest
+   * `exit_before_end_minutes` among non-retired Position Manager bots of the mode (any mode if none), else the
+   * template's configSchema default; the ambiguity threshold is the one the template reads from here too.
+   */
+  getExitPolicy(simulated: boolean): ExitPolicy {
+    const pmBots: Array<{ config: string; paper: boolean }> = [];
+    let schemaDefault: number | null = null;
+    for (const b of this.botRepo.findAll()) {
+      if (b.stage === 'retired') continue;
+      const script = this.scriptRepo.findById(b.script_id);
+      if (builtinRoleOf(script) !== 'position-manager') continue;
+      pmBots.push({ config: b.config, paper: b.mode === 'paper' || b.stage === 'paper' });
+    }
+    const windowOf = (raw: string): number | null => {
+      try {
+        const v = (JSON.parse(raw || '{}') as Record<string, unknown>).exit_before_end_minutes;
+        const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+        return Number.isFinite(n) && n >= 0 ? n : null;
+      } catch {
+        return null;
+      }
+    };
+    const sameMode = pmBots.filter((b) => b.paper === simulated);
+    const windows = (sameMode.length ? sameMode : pmBots).map((b) => windowOf(b.config));
+    // A PM bot without its own value uses the template default
+    const pmScript = this.scriptRepo.findAll().find((s) => builtinRoleOf(s) === 'position-manager');
+    if (pmScript) {
+      try {
+        const d = (JSON.parse(pmScript.config_schema || '{}') as { properties?: Record<string, { default?: unknown }> }).properties?.exit_before_end_minutes?.default;
+        if (typeof d === 'number' && Number.isFinite(d)) schemaDefault = d;
+      } catch {
+        /* no default */
+      }
+    }
+    const base = schemaDefault ?? POSITION_MANAGER_EXIT_WINDOW_FALLBACK;
+    if (windows.length === 0) return { exitBeforeEndMinutes: base, ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT, source: 'template-default' };
+    return {
+      exitBeforeEndMinutes: Math.max(...windows.map((w) => w ?? base)),
+      ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT,
+      source: 'position-manager',
+    };
+  }
+
+  /** ctx.events (spec §5.2): push an event to every running script bot. Never throws. */
+  broadcastScriptEvent(name: BotPushEventName, data: Record<string, unknown>): void {
+    for (const [id, instance] of this.instances) {
+      if (!(instance instanceof ScriptBotRunner)) continue;
+      try {
+        instance.pushEvent(name, data);
+      } catch (err) {
+        logger.warning(`Could not push ${name} to bot ${id}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  /** Standing role of a running bot (executor / position manager), if any. */
+  getRunningRole(botId: string): BuiltinRole | null {
+    return this.instances.has(botId) ? (this.roles.get(botId)?.role ?? null) : null;
+  }
 
   /** Limits currently in force; null when the config failed to load. */
+  /** The mandate's market filters as bots see them (ctx.risk.getMandateSummary); null when the config is invalid */
+  getMandateSummary(): MandateSummary | null {
+    const cfg = this.riskEngine?.getConfig();
+    if (!cfg) return null;
+    const { mandate, limits } = cfg;
+    return {
+      categoriesAllow: [...mandate.categories.allow],
+      resolvesWithinDays: [mandate.markets.resolves_within_days[0], mandate.markets.resolves_within_days[1]],
+      longHorizonDays: [mandate.markets.long_horizon_days[0], mandate.markets.long_horizon_days[1]],
+      minLiquidityUsd: Math.max(mandate.markets.min_liquidity_usd, limits.per_market.min_liquidity_usd),
+      maxAmbiguityScore: mandate.markets.max_ambiguity_score,
+      strategiesAllow: [...mandate.strategies.allow],
+    };
+  }
+
   getLimits(): LimitsConfig | null {
     return this.riskEngine?.getConfig().limits ?? null;
   }
@@ -540,6 +744,17 @@ export class BotManager extends EventEmitter {
       );
     }
 
+    // Standing builtin templates (executor, position manager) run once per mode; the role comes from the
+    // script row (origin builtin), never from the script itself
+    const role = builtinRoleOf(script);
+    if (isStandingRole(role)) {
+      for (const [otherId, r] of this.roles) {
+        if (otherId !== botId && r.role === role && r.mode === mode && this.instances.has(otherId)) {
+          throw new Error(`A ${role} bot is already running in ${mode} mode (${this.botRepo.findById(otherId)?.name ?? otherId}); it is a single-instance template`);
+        }
+      }
+    }
+
     const settings = this.getSettings();
     const instance: BaseBotRunner = new ScriptBotRunner({ ...bot, mode }, this.walletManager, clobClient, {
       compiledCode: script.compiled,
@@ -555,6 +770,40 @@ export class BotManager extends EventEmitter {
       createOrderService: this.createOrderService,
       fetchAllowlist: () => this.getLimits()?.server.script_fetch_allowlist,
       ledger: this.orderDeps?.ledger,
+      role,
+      ...(role === 'position-manager' ? { createPortfolio: ({ botId: id, simulated }) => this.getPortfolio().forBot(id, simulated) } : {}),
+      ...(this.orderDeps?.marketCache ? { getMarket: marketLookup(this.orderDeps.marketCache) } : {}),
+      marketScope: () => parseMarketIdList(this.botRepo.findById(botId)?.market_ids),
+      ...(this.orderDeps?.exitFlags
+        ? {
+            exitFlags: (simulated: boolean) =>
+              this.orderDeps!.exitFlags!.list({ status: 'open', limit: 1000 })
+                .filter((f) => f.bot_id === botId && (f.simulated === 1) === simulated)
+                .map((f) => ({ id: f.id, tokenId: f.token_id, marketId: f.market_id, reason: f.reason, createdBy: f.created_by, createdAt: f.created_at })),
+          }
+        : {}),
+      ...(this.orderDeps?.exitFlags
+        ? {
+            flaggedTokens: (simulated: boolean) => flaggedTokensInMode(this.orderDeps!.exitFlags!, simulated),
+          }
+        : {}),
+      exitPolicy: (simulated: boolean) => this.getExitPolicy(simulated),
+      ...(this.orderDeps?.marketCache ? { eventMarketIds: (eventId: string) => this.orderDeps!.marketCache!.getEventMarketIds(eventId) } : {}),
+      mandateSummary: () => this.getMandateSummary(),
+      // Copy Trading template only (role from the script row): leader status and order attribution, bound to this bot
+      ...(role === 'copy' && this.orderDeps?.copyLeaders
+        ? {
+            copy: {
+              getLeaders: (addresses: unknown) => this.orderDeps!.copyLeaders!.statusFor(botId, addresses),
+              getHoldings: (tokenId: string, simulated: boolean) => this.orderDeps!.copyLeaders!.holdings(botId, tokenId, simulated),
+              recordOrder: (orderId: string, info: Parameters<CopyLeaderService['recordOrder']>[2]) => this.orderDeps!.copyLeaders!.recordOrder(botId, orderId, info),
+            },
+          }
+        : {}),
+      // Retire runs after the RPC reply (it stops this very worker), via the core's BotService (audited as the bot)
+      requestRetire: (reason: string) => {
+        setImmediate(() => this.emit(BOT_RETIRE_REQUEST_EVENT, { botId, reason }));
+      },
     });
 
     // Forward events
@@ -582,6 +831,8 @@ export class BotManager extends EventEmitter {
 
     // Store instance
     this.instances.set(botId, instance);
+    if (role) this.roles.set(botId, { role, mode });
+    else this.roles.delete(botId);
 
     // Start the bot
     try {

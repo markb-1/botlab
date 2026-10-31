@@ -23,6 +23,8 @@ export interface Bot {
   templateVersion?: number | null;
   scriptRevision?: number | null;
   scriptTrust?: string | null;
+  /** Builtin role: forecast-executor | position-manager (standing) | consistency | resolution-rule (per opportunity) */
+  role?: string | null;
   stageChangedAt?: string | null;
   lastStartedAt?: string | null;
   lastStoppedAt?: string | null;
@@ -149,6 +151,28 @@ export interface BotStats {
   pnlAllTime: number | null;
   pnl24h: number;
   mode: 'live' | 'paper';
+}
+
+// Copy-trading leader with its score (GET /api/bots/:id/copy-leaders, 5c)
+export interface CopyLeader {
+  address: string;
+  status: 'active' | 'dropped' | 'removed';
+  addedAt: string;
+  addedBy: string;
+  activeSince: string;
+  droppedAt: string | null;
+  droppedReason: string | null;
+  ordersCopied: number;
+  closedTrades: number;
+  openTrades: number;
+  wins: number;
+  hitRate: number | null;
+  realisedPnlUsd: number;
+  unrealisedPnlUsd: number | null;
+  openCostUsd: number;
+  window: { trades: number; size: number; pnlUsd: number; hitRate: number | null };
+  /** Dropped on some bot (this or another): blocked for the agent until re-activated */
+  blocked: boolean;
 }
 
 // Dashboard stats per bot (batch endpoint)

@@ -26,6 +26,7 @@ import {
   BotListFilterSchema,
   BotUpdateSchema,
   ClearHaltSchema,
+  CopyLeaderReactivateSchema,
   ConfigFileSchema,
   ForecastListFilterSchema,
   KillSwitchSchema,
@@ -265,14 +266,16 @@ export const MARKET_SEARCH_PER_MINUTE = 30;
 /** Sliding one-minute window per principal (session or token) */
 function perPrincipalLimiter(perMinute: number) {
   const hits = new Map<string, number[]>();
-  return (principal: Principal, now = Date.now()): void => {
+  /** `weight`: how many searches this request counts as (a category fan-out queries several Gamma tags) */
+  return (principal: Principal, weight = 1, now = Date.now()): void => {
     const key = principal.via === 'session' ? `s:${principal.sessionId}` : `t:${principal.tokenId}`;
     const recent = (hits.get(key) ?? []).filter((t) => now - t < 60_000);
-    if (recent.length >= perMinute) {
+    const w = Math.max(Math.floor(weight), 1);
+    if (recent.length + w > perMinute) {
       hits.set(key, recent);
       throw new HttpError(429, 'rate_limited', `Too many market searches (max ${perMinute} per minute); try again shortly`);
     }
-    recent.push(now);
+    for (let i = 0; i < w; i++) recent.push(now);
     hits.set(key, recent);
     if (hits.size > 1000) for (const [k, v] of hits) if (v.every((t) => now - t >= 60_000)) hits.delete(k);
   };
@@ -337,7 +340,7 @@ export function ledgerRoutes(ledger: CoreServices['ledger'], markets: CoreServic
       path: '/api/markets/search',
       allow: READ_ALL,
       handler: ({ query, principal }) => {
-        searchLimit(principal);
+        searchLimit(principal, markets.searchCost({ q: query('q'), category: query('category') }));
         return markets.searchLive({ q: query('q') ?? '', active: queryBool(query('active')) ?? true, category: query('category'), limit: queryNumber(query('limit')) });
       },
     },
@@ -459,9 +462,25 @@ export function agentControlRoutes(control: AgentControl): RouteDef[] {
   ];
 }
 
+// ── Copy-trading leaders (5c): per-leader scores; re-activating a dropped leader is a human action ──
+
+export function copyRoutes(copy: CoreServices['copy']): RouteDef[] {
+  return [
+    { method: 'get', path: '/api/bots/:id/copy-leaders', allow: READ_ALL, handler: ({ param }) => copy.leaders(param('id')) },
+    {
+      method: 'post',
+      path: '/api/bots/:id/copy-leaders/reactivate',
+      allow: ADMIN,
+      domainErrors: 'conflict',
+      handler: ({ param, body, actor }) => copy.reactivate(param('id'), parseInput(CopyLeaderReactivateSchema, body).address, actor()),
+    },
+  ];
+}
+
 export function apiRoutes(services: CoreServices): RouteDef[] {
   return [
     ...botRoutes(services.bots),
+    ...copyRoutes(services.copy),
     ...walletRoutes(services.wallets),
     ...settingsRoutes(services.settings),
     ...scriptRoutes(services.scripts),

@@ -97,6 +97,15 @@ export class LedgerValidationError extends Error {
   }
 }
 
+/** A forecast as bots read it: live rights, the binary market's other token and its end date (cache). */
+export type BotForecastRow = ForecastView & {
+  bucketState: CategoryRightsState | null;
+  tradeableNow: boolean;
+  complementTokenId: string | null;
+  endDate: string | null;
+  bucketAllocationUsd: number | null;
+};
+
 export interface ForecastView {
   id: string;
   marketId: string;
@@ -203,7 +212,7 @@ export interface ScorerRunResult {
 export interface LedgerDeps {
   forecastRepo: ForecastRepository;
   rightsRepo: CategoryRightsRepository;
-  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'refreshMany' | 'recordForecastAmbiguity' | 'setResolutionSeen'>;
+  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'getCachedByToken' | 'refreshMany' | 'recordForecastAmbiguity' | 'setResolutionSeen'>;
   audit?: Pick<AuditService, 'record'>;
   /** CLOB top of book for the snapshot; throw when unavailable */
   getTopOfBook: (tokenId: string) => Promise<{ bestBid: number | null; bestAsk: number | null }>;
@@ -447,14 +456,36 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
   }
 
   /** ctx.ledger: active forecasts with the bucket's current state and live `tradeable`. */
-  botForecasts(filter: { category?: string; tradeableOnly?: boolean } = {}): Array<ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }> {
+  botForecasts(filter: { category?: string; tradeableOnly?: boolean } = {}): BotForecastRow[] {
     const rows = this.deps.forecastRepo.list({ status: 'active', ...(filter.category ? { category: filter.category } : {}) });
-    return rows.map((r) => ({ ...toForecastView(r), ...this.liveRights(r) })).filter((f) => !filter.tradeableOnly || f.tradeableNow);
+    return rows.map((r) => this.toBotRow(r)).filter((f) => !filter.tradeableOnly || f.tradeableNow);
   }
 
-  botForecast(tokenId: string): (ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }) | null {
+  botForecast(tokenId: string): BotForecastRow | null {
     const r = this.deps.forecastRepo.findActiveByToken(tokenId);
-    return r ? { ...toForecastView(r), ...this.liveRights(r) } : null;
+    return r ? this.toBotRow(r) : null;
+  }
+
+  private toBotRow(r: ForecastRow): BotForecastRow {
+    const market = this.deps.marketCache.getCached(r.market_id);
+    const tokens = market?.tokens ?? [];
+    const complement = tokens.length === 2 && tokens.some((t) => t.tokenId === r.token_id) ? (tokens.find((t) => t.tokenId !== r.token_id)?.tokenId ?? null) : null;
+    const bucketAllocationUsd = this.deps.rightsRepo.get(r.category, r.horizon_bucket)?.max_allocation_usd ?? null;
+    return { ...toForecastView(r), ...this.liveRights(r), complementTokenId: complement, endDate: market?.endDate ?? null, bucketAllocationUsd };
+  }
+
+  /**
+   * The active forecast that prices a held token (position manager, 5a): the token's own forecast, else the
+   * forecast on the other token of its binary market as 1 − p. null when neither exists.
+   */
+  heldTokenForecast(tokenId: string): { forecast: BotForecastRow; probability: number; onComplement: boolean } | null {
+    const own = this.botForecast(tokenId);
+    if (own) return { forecast: own, probability: own.probability, onComplement: false };
+    const tokens = this.deps.marketCache.getCachedByToken(tokenId)?.tokens ?? [];
+    if (tokens.length !== 2) return null;
+    const other = tokens.find((t) => t.tokenId !== tokenId)?.tokenId;
+    const f = other ? this.botForecast(other) : null;
+    return f ? { forecast: f, probability: 1 - f.probability, onComplement: true } : null;
   }
 
   /**
@@ -631,8 +662,11 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     return result;
   }
 
-  /** Recompute stats for every bucket and apply rights transitions. Short buckets first (medium relaxation). */
-  evaluateRights(): ScorerRunResult['rightsChanges'] {
+  /**
+   * Recompute stats for every bucket (or just `only`) and apply rights transitions. Short buckets first (medium
+   * relaxation).
+   */
+  evaluateRights(only?: { category: string; bucket: HorizonBucket }): ScorerRunResult['rightsChanges'] {
     const changes: ScorerRunResult['rightsChanges'] = [];
     const nowMs = this.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -644,6 +678,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
       .sort((a, b) => BUCKET_ORDER.indexOf(a.horizon_bucket) - BUCKET_ORDER.indexOf(b.horizon_bucket));
 
     for (const row of rows) {
+      // A short bucket's state drives the medium relaxation: re-evaluate that category's medium bucket with it
+      if (only && (row.category !== only.category || (row.horizon_bucket !== only.bucket && !(only.bucket === 'short' && row.horizon_bucket === 'medium')))) continue;
       const votes = bucketVotes(groups.get(`${row.category}|${row.horizon_bucket}`) ?? []);
       const shortTrading = this.deps.rightsRepo.get(row.category, 'short')?.state === 'trading';
       const decision = decideRights({
@@ -728,8 +764,23 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     }
 
     if (state === 'auto') {
-      this.deps.rightsRepo.setState(category, bucket, { state: row.state, maxAllocationUsd: row.max_allocation_usd, qualifiedN: row.qualified_n, forced: false, reason: why, at: nowIso, stateChanged: false });
-      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state: 'auto', reason: why }, 'ok');
+      // Back to the rules (Mac test leftover): a forced `trading` never qualified on its own, so it restarts from
+      // shadow; other forced states just lose the force. The rules then run for this bucket at once (a qualified
+      // bucket is promoted again; before, a forced trading bucket kept trading with its allocation until the next
+      // scorer run, and the rules never demote a healthy trading bucket).
+      const resetToShadow = row.forced === 1 && row.state === 'trading';
+      this.deps.rightsRepo.setState(category, bucket, {
+        state: resetToShadow ? 'shadow' : row.state,
+        maxAllocationUsd: resetToShadow ? 0 : row.max_allocation_usd,
+        qualifiedN: resetToShadow ? null : row.qualified_n,
+        forced: false,
+        reason: `human: back to auto: ${why}`,
+        at: nowIso,
+        stateChanged: resetToShadow,
+      });
+      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state: 'auto', reason: why, ...(resetToShadow ? { from: 'trading', to: 'shadow' } : {}) }, 'ok');
+      if (resetToShadow) this.auditRightsChange(actor, row, 'shadow', 0, `back to auto (was forced trading): ${why}`, false);
+      this.evaluateRights({ category, bucket });
     } else {
       const alloc = state === 'trading' ? Math.max(row.max_allocation_usd, Math.min(INITIAL_MAX_ALLOCATION_USD, mandate?.budget_usd ?? 0)) : 0;
       const qualifiedN = state === 'trading' ? (row.qualified_n ?? row.n_scored) : row.qualified_n;

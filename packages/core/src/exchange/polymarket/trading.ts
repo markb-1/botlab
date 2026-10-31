@@ -21,9 +21,11 @@ export async function getOrderBook(
   tokenId: string
 ): Promise<OrderBook> {
   const book = await clobClient.getOrderBook(tokenId);
+  const tick = (book as { tick_size?: unknown }).tick_size;
   return {
     bids: book.bids || [],
     asks: book.asks || [],
+    ...(typeof tick === 'string' || typeof tick === 'number' ? { tick_size: String(tick) } : {}),
   };
 }
 

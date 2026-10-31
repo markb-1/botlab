@@ -33,11 +33,29 @@ import type {
   OrderResult,
   OpenOrder,
   FeeRates,
+  MarketDetail,
+  BotExitFlag,
+  ExitPolicy,
   RiskBudget,
   RpcRequest,
   RpcResponse,
   ScriptFetchInit,
   ScriptResponse,
+  BotPushEventName,
+  BotPushEventHandler,
+  EventsContext,
+  PortfolioContext,
+  PortfolioPosition,
+  PortfolioExitFlag,
+  ExitRequest,
+  OrderHistoryEntry,
+  CapitalDemand,
+  MandateSummary,
+  FlaggedToken,
+  RecentStop,
+  CopyContext,
+  CopyLeaderStatus,
+  CopyHoldings,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../utils/kellyCalculator';
 
@@ -73,6 +91,35 @@ export function handleRpcResponse(response: RpcResponse): void {
       pending.reject(new Error(response.error));
     } else {
       pending.resolve(response.result);
+    }
+  }
+}
+
+// ─── Push events (ctx.events, spec §5.2) ───────────────────────────────
+const PUSH_EVENTS: readonly BotPushEventName[] = ['forecast_changed', 'rules_changed', 'halt'];
+const eventHandlers = new Map<BotPushEventName, Set<BotPushEventHandler>>();
+
+const eventsContext: EventsContext = {
+  on(name, handler) {
+    if (!PUSH_EVENTS.includes(name)) throw new Error(`Unknown event ${String(name)} (expected ${PUSH_EVENTS.join(', ')})`);
+    if (typeof handler !== 'function') throw new Error('handler must be a function');
+    let set = eventHandlers.get(name);
+    if (!set) eventHandlers.set(name, (set = new Set()));
+    set.add(handler);
+  },
+  off(name, handler) {
+    eventHandlers.get(name)?.delete(handler);
+  },
+};
+
+/** Called by the bootstrap for a 'bot-event' message: runs the script's handlers; errors go to the bot log. */
+export async function dispatchBotEvent(name: BotPushEventName, data: Record<string, unknown>): Promise<void> {
+  const handlers = [...(eventHandlers.get(name) ?? [])];
+  for (const h of handlers) {
+    try {
+      await h(data ?? {});
+    } catch (err) {
+      void rpcCall('log', 'error', `ctx.events ${name} handler failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
     }
   }
 }
@@ -239,12 +286,29 @@ export function createBotContext(params: {
       cancel: (orderId: string) => rpcCall('polymarket:cancel', orderId) as Promise<void>,
       cancelAll: () => rpcCall('polymarket:cancelAll') as ReturnType<PolymarketContext['cancelAll']>,
       getOpenOrders: () => rpcCall('polymarket:getOpenOrders') as Promise<OpenOrder[]>,
+      getOrderHistory: (days?: number) => rpcCall('polymarket:getOrderHistory', days) as Promise<OrderHistoryEntry[]>,
       getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
+      getMarket: (idOrTokenId: string) => rpcCall('polymarket:getMarket', idOrTokenId) as Promise<MarketDetail | null>,
+      getEventMarketIds: (eventId: string) => rpcCall('polymarket:getEventMarketIds', eventId) as Promise<string[] | null>,
     } as PolymarketContext,
 
     risk: {
       getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
+      getExitFlags: () => rpcCall('risk:getExitFlags') as Promise<BotExitFlag[]>,
+      getExitPolicy: () => rpcCall('risk:getExitPolicy') as Promise<ExitPolicy>,
+      getMandateSummary: () => rpcCall('risk:getMandateSummary') as Promise<MandateSummary | null>,
+      getFlaggedTokens: () => rpcCall('risk:getFlaggedTokens') as Promise<FlaggedToken[]>,
+      getRecentStops: (tokenId?: string) => rpcCall('risk:getRecentStops', tokenId) as Promise<RecentStop[]>,
     } as RiskContext,
+
+    // Copy Trading template only: the server refuses it for any other bot
+    copy: {
+      getLeaders: (addresses: string[]) => rpcCall('copy:getLeaders', addresses) as Promise<CopyLeaderStatus[]>,
+      getHoldings: (tokenId: string) => rpcCall('copy:getHoldings', tokenId) as Promise<CopyHoldings>,
+    } as CopyContext,
+
+    // Retire this bot (server-side, audited as the bot); the worker is stopped shortly after
+    requestRetire: (reason: string) => rpcCall('bot:requestRetire', reason) as Promise<{ accepted: boolean }>,
 
     // Forecast ledger: read-only
     ledger: {
@@ -252,6 +316,18 @@ export function createBotContext(params: {
         rpcCall('ledger:getActiveForecasts', filter) as Promise<BotForecast[]>,
       getForecast: (tokenId: string) => rpcCall('ledger:getForecast', tokenId) as Promise<BotForecast | null>,
     } as LedgerContext,
+
+    events: eventsContext,
+
+    // Position manager only: the server refuses these RPCs for any other bot
+    portfolio: {
+      getAllPositions: () => rpcCall('portfolio:getAllPositions') as Promise<PortfolioPosition[]>,
+      getExitFlags: () => rpcCall('portfolio:getExitFlags') as Promise<PortfolioExitFlag[]>,
+      getCapitalDemand: () => rpcCall('portfolio:getCapitalDemand') as Promise<CapitalDemand>,
+      ackExitFlag: (flagId: string, note: string) => rpcCall('portfolio:ackExitFlag', flagId, note) as Promise<boolean>,
+      exit: (req: ExitRequest) => rpcCall('portfolio:exit', req) as Promise<OrderResult>,
+      cancelExit: (orderId: string) => rpcCall('portfolio:cancelExit', orderId) as Promise<void>,
+    } as PortfolioContext,
 
     // Kelly Criterion (pure math, runs locally in worker)
     kelly: {

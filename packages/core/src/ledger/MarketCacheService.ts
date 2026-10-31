@@ -29,11 +29,14 @@ import { slugify } from '../orders/FeeService';
 import { parseMarketFeeSchedule, parseStoredFeeSchedule, type MarketFeeSchedule } from '../orders/feeModel';
 import { GAMMA_API_URL, type MarketInfo, type MarketQuality, type MarketQualityProvider } from '../orders/MarketDataService';
 import { autoRaiseReason, effectiveAmbiguity, rulesHash } from './ambiguity';
-import { categorize } from './categorize';
+import { categorize, categorySearchTags } from './categorize';
+import { fetchGammaEvent } from './polymarketPublic';
 import logger from '../utils/logger';
 
 export const MARKET_RULES_CHANGED_EVENT = 'market:rulesChanged';
 export const MARKET_CACHE_TTL_MS = 10 * 60_000;
+/** How long an event's market list is trusted (exclusive_sum / exhaustive checks) */
+export const EVENT_MARKETS_TTL_MS = 6 * 3_600_000;
 export const MARKET_REFRESH_INTERVAL_MS = 30 * 60_000;
 /** Order path: a row not refreshed for this long is too stale to buy on (ambiguity treated as unknown) */
 export const MARKET_STALE_FOR_BUYS_MS = 2 * 3_600_000;
@@ -41,6 +44,13 @@ const FETCH_TIMEOUT_MS = 10_000;
 /** On-demand refresh inside the order path waits at most this long */
 const ORDER_PATH_REFRESH_TIMEOUT_MS = 5_000;
 const BATCH_SIZE = 20;
+/** Category search (no text): Gamma tags queried per search, events per page, pages per tag, parallel requests */
+export const CATEGORY_SEARCH_MAX_TAGS = 24;
+export const CATEGORY_SEARCH_PAGE_SIZE = 50;
+export const CATEGORY_SEARCH_MAX_PAGES = 2;
+/** Total time for a category fan-out; tags finished by then are returned (partial result) */
+export const CATEGORY_SEARCH_DEADLINE_MS = 15_000;
+const CATEGORY_SEARCH_CONCURRENCY = 4;
 
 export interface RulesChangedEvent {
   marketId: string;
@@ -101,6 +111,34 @@ export class GammaHttpError extends Error {
     super(message);
     this.name = 'GammaHttpError';
   }
+}
+
+/** `p`, or a rejection as soon as `signal` aborts (a fetch implementation that ignores its signal cannot hold the deadline). */
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      }
+    );
+  });
+}
+
+/** Gamma events (with their `markets`) → the markets, each carrying its event (title, tags) for categorizing. */
+function flattenEvents(events: unknown[]): unknown[] {
+  return events.flatMap((e) => {
+    if (!e || typeof e !== 'object' || !Array.isArray((e as Record<string, unknown>).markets)) return [];
+    const { markets, ...event } = e as Record<string, unknown>;
+    return (markets as unknown[]).map((m) => (m && typeof m === 'object' ? { ...(m as object), events: [event] } : m));
+  });
 }
 
 function gammaHttpError(what: string, resp: Response): GammaHttpError {
@@ -321,6 +359,8 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
   private now: () => number;
   private ttlMs: number;
   private inflight = new Map<string, Promise<MarketView | null>>();
+  /** Condition ids of every market of an event (Gamma `/events/{id}`), in memory for EVENT_MARKETS_TTL_MS */
+  private eventMarkets = new Map<string, { at: number; ids: string[] }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private periodic: Promise<void> | null = null;
 
@@ -404,18 +444,52 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
     return { category: view.category, ambiguityScore: view.ambiguityScore, rulesChangedAt: view.rulesChangedAt };
   }
 
+  // ── Event membership (5b: exclusive_sum / exhaustive checks) ──────
+
+  /** Remember an event's market list (MarketService.detail fetches the event for get_market). */
+  recordEventMarkets(eventId: string, marketIds: string[]): void {
+    this.eventMarkets.set(eventId, { at: this.now(), ids: [...new Set(marketIds)] });
+  }
+
+  /** The event's market list from memory if fetched within the TTL, else null (no network). */
+  getEventMarketIdsCached(eventId: string): string[] | null {
+    const e = this.eventMarkets.get(eventId);
+    return e && this.now() - e.at < EVENT_MARKETS_TTL_MS ? [...e.ids] : null;
+  }
+
+  /** Every market (condition id) of an event, open or closed, from Gamma (cached); null when Gamma has no answer. */
+  async getEventMarketIds(eventId: string): Promise<string[] | null> {
+    const cached = this.getEventMarketIdsCached(eventId);
+    if (cached) return cached;
+    try {
+      const ev = await fetchGammaEvent(this.baseUrl, eventId, this.fetchFn);
+      if (!ev) return null;
+      const ids = ev.markets.map((m) => parseGammaMarketFull(m)?.marketId).filter((x): x is string => !!x);
+      if (ids.length === 0) return null;
+      this.recordEventMarkets(eventId, ids);
+      return ids;
+    } catch {
+      return null;
+    }
+  }
+
   // ── Live search (Markets page) ───────────────────────────────────
 
   /**
-   * Search Polymarket via Gamma (not the cache): text ⇒ `/public-search` (events with their markets),
-   * no text ⇒ the most traded open markets (`/markets?order=volume24hr`). Each market is categorized
-   * with categories.yaml; `category` filters on that BotLab category, `active` drops closed markets.
-   * Nothing is written to the cache (opening a market does that). Throws on network / HTTP errors.
+   * Search Polymarket via Gamma (not the cache): text ⇒ `/public-search` (events with their markets, relevance
+   * order); no text and a category ⇒ the category's Gamma tags (categories.yaml `tags` + `when_tags`) via
+   * `/events?tag_slug=…` ordered by 24h volume, a few pages per tag, merged and ranked by 24h volume (Mac test F6:
+   * the global top 100 by volume held no in-mandate market); no text and no category ⇒ the most traded open markets
+   * (`/markets?order=volume24hr`). Each market is categorized with categories.yaml; `category` filters on that
+   * BotLab category, `active` drops closed markets. Nothing is written to the cache (opening a market does that).
+   * Throws on network / HTTP errors (a category search tolerates single tags failing, not a 429).
    */
   async searchGamma(opts: { q?: string; active?: boolean; category?: string; limit?: number } = {}): Promise<GammaSearchHit[]> {
     const q = (opts.q ?? '').trim().slice(0, 200);
     const limit = Math.min(Math.max(Math.floor(opts.limit ?? 50), 1), 100);
     const active = opts.active !== false;
+    const cfg = this.deps.getCategories();
+    const categoryTags = !q && opts.category ? categorySearchTags(opts.category, cfg).slice(0, CATEGORY_SEARCH_MAX_TAGS) : [];
     let raws: unknown[];
     if (q) {
       const params = new URLSearchParams({ q, limit_per_type: String(Math.min(limit, 50)), search_tags: 'false', search_profiles: 'false' });
@@ -423,12 +497,9 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       const resp = await this.fetchFn(`${this.baseUrl}/public-search?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       if (!resp.ok) throw gammaHttpError('Gamma search', resp);
       const body = (await resp.json()) as { events?: unknown };
-      const events = Array.isArray(body?.events) ? (body.events as Array<Record<string, unknown>>) : [];
-      raws = events.flatMap((e) => {
-        if (!e || typeof e !== 'object' || !Array.isArray(e.markets)) return [];
-        const { markets, ...event } = e;
-        return (markets as unknown[]).map((m) => (m && typeof m === 'object' ? { ...(m as object), events: [event] } : m));
-      });
+      raws = flattenEvents(Array.isArray(body?.events) ? body.events : []);
+    } else if (categoryTags.length > 0) {
+      raws = await this.gammaEventsByTags(categoryTags, active);
     } else {
       const params = new URLSearchParams({ limit: String(limit), order: 'volume24hr', ascending: 'false', include_tag: 'true' });
       if (active) {
@@ -440,7 +511,6 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       const body = (await resp.json()) as unknown;
       raws = Array.isArray(body) ? body : [];
     }
-    const cfg = this.deps.getCategories();
     const now = this.now();
     const out: GammaSearchHit[] = [];
     const seen = new Set<string>();
@@ -468,9 +538,85 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
         tokens: p.tokens,
         outcomePrices: p.outcomePrices,
       });
-      if (out.length >= limit) break;
     }
-    return out;
+    // Tag searches merge several lists: rank the merged set by 24h volume (text search keeps relevance order)
+    if (categoryTags.length > 0) out.sort((a, b) => (b.volume24hUsd ?? 0) - (a.volume24hUsd ?? 0));
+    return out.slice(0, limit);
+  }
+
+  /**
+   * Events carrying any of `tags` (Gamma `/events?tag_slug=`, ordered by 24h volume, up to
+   * CATEGORY_SEARCH_MAX_PAGES pages of CATEGORY_SEARCH_PAGE_SIZE per tag), flattened to their markets.
+   * VERIFY: `tag_slug` and `order=volume24hr` on `/events` are from knowledge of the Gamma API, not checked against
+   * live data. A failing tag is skipped unless every tag failed; a 429 is thrown at once (the caller backs off).
+   */
+  /** Tags a category-only search would query (MarketService weighs the search rate limit by it). */
+  categorySearchTagCount(category: string): number {
+    return Math.min(categorySearchTags(category, this.deps.getCategories()).length, CATEGORY_SEARCH_MAX_TAGS);
+  }
+
+  /** Total deadline of a category fan-out (ms); a field so tests can shorten it */
+  categorySearchDeadlineMs = CATEGORY_SEARCH_DEADLINE_MS;
+
+  private async gammaEventsByTags(tags: string[], active: boolean): Promise<unknown[]> {
+    const deadline = AbortSignal.timeout(this.categorySearchDeadlineMs);
+    const fetchTag = async (tag: string): Promise<unknown[]> => {
+      const raws: unknown[] = [];
+      for (let page = 0; page < CATEGORY_SEARCH_MAX_PAGES; page++) {
+        if (deadline.aborted) break;
+        const params = new URLSearchParams({
+          tag_slug: tag,
+          order: 'volume24hr',
+          ascending: 'false',
+          limit: String(CATEGORY_SEARCH_PAGE_SIZE),
+          offset: String(page * CATEGORY_SEARCH_PAGE_SIZE),
+        });
+        if (active) {
+          params.set('active', 'true');
+          params.set('closed', 'false');
+        }
+        let resp: Response;
+        try {
+          resp = await abortable(
+            this.fetchFn(`${this.baseUrl}/events?${params.toString()}`, { signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), deadline]) }),
+            deadline
+          );
+        } catch (err) {
+          // Out of time: keep the pages this tag already returned
+          if (deadline.aborted && raws.length > 0) break;
+          throw err;
+        }
+        if (!resp.ok) throw gammaHttpError(`Gamma events (tag ${tag})`, resp);
+        const body = (await resp.json()) as unknown;
+        const events = Array.isArray(body) ? body : [];
+        raws.push(...flattenEvents(events));
+        if (events.length < CATEGORY_SEARCH_PAGE_SIZE) break;
+      }
+      return raws;
+    };
+    const results: Array<{ ok: true; raws: unknown[] } | { ok: false; err: unknown }> = [];
+    for (let i = 0; i < tags.length; i += CATEGORY_SEARCH_CONCURRENCY) {
+      if (deadline.aborted) break; // partial result: the tags finished so far
+      const batch = await Promise.all(
+        tags.slice(i, i + CATEGORY_SEARCH_CONCURRENCY).map((t) =>
+          fetchTag(t).then(
+            (raws) => ({ ok: true as const, raws }),
+            (err: unknown) => ({ ok: false as const, err })
+          )
+        )
+      );
+      for (const r of batch) {
+        if (!r.ok && r.err instanceof GammaHttpError && r.err.status === 429) throw r.err;
+      }
+      results.push(...batch);
+    }
+    const ok = results.filter((r): r is { ok: true; raws: unknown[] } => r.ok);
+    if (ok.length === 0) {
+      if (deadline.aborted) throw new Error(`Gamma category search timed out after ${Math.round(this.categorySearchDeadlineMs / 1000)} s`);
+      const first = results.find((r): r is { ok: false; err: unknown } => !r.ok);
+      throw first ? first.err : new Error('Gamma: no tags to search');
+    }
+    return ok.flatMap((r) => r.raws);
   }
 
   // ── Refreshing ───────────────────────────────────────────────────

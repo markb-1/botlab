@@ -38,6 +38,8 @@ export interface IpcBot {
   /** The script's current revision and trust (the bot runs the latest compiled code, R20) */
   scriptRevision?: number | null;
   scriptTrust?: string | null;
+  /** Standing builtin role of the script: forecast-executor | position-manager (5a); null otherwise */
+  role?: string | null;
   stageChangedAt?: string | null;
   lastStartedAt?: string | null;
   lastStoppedAt?: string | null;

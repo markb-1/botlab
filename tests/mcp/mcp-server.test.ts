@@ -87,6 +87,7 @@ const EXPECTED_TOOLS = [
   'get_notes',
   'get_run_history',
   'get_leaderboard',
+  'get_copy_leaders',
   'validate_script',
   'create_template',
   'update_template',
@@ -131,6 +132,9 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
       vi.fn(async (input: string | URL | Request) => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         if (url.includes('gamma-api.polymarket.com/markets?')) {
+          if (url.includes('333') || url.includes('0xcafe02')) {
+            return new Response(JSON.stringify([gammaMarket({ conditionId: '0xcafe02', question: 'Will CPI exceed 4%?', clobTokenIds: '["333","444"]' })]), { status: 200 });
+          }
           return new Response(JSON.stringify(url.includes(YES) || url.includes(MARKET_ID) ? [gammaMarket()] : []), { status: 200 });
         }
         if (url.includes('gamma-api.polymarket.com/events/')) {
@@ -269,6 +273,137 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     const own = core.services.bots.list().find((x) => x.createdBy === 'agent' && x.stage !== 'retired')!;
     expect((await call('update_bot_config', { botId: own.id, config: {}, name: 'renamed' })).text).toMatch(/Unrecognized key/);
     expect((await call('update_bot_config', { botId: own.id, config: { symbol: 'ETHUSDT' } })).json.config).toEqual({ symbol: 'ETHUSDT' });
+  });
+
+  it('create_bot on the consistency / resolution-rule templates (5b): paper, config checked, marketIds must cover every token; standing roles refused', async () => {
+    const byName = (n: string) => core.services.scripts.templates().find((t) => t.name === n)!;
+    const cons = byName('Consistency');
+    const rr = byName('Resolution Rule');
+    for (const standing of ['Position Manager', 'Forecast Executor']) {
+      expect((await call('create_bot', { templateId: byName(standing).id, name: 'x' })).text).toMatch(/standing bot only a human can create/);
+    }
+    const consConfig = { constraint: 'implies', tokens: [YES, '333'], min_gap: 0.04 };
+    // A token's market missing from marketIds ⇒ refused (server-side, audited)
+    const partial = await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig, marketIds: [MARKET_ID] });
+    expect(partial.text).toMatch(/token 333 belongs to market 0xcafe02, which is not in the bot's marketIds/);
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig })).text).toMatch(/need marketIds covering every token/);
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, tokens: [YES, '999'] }, marketIds: [MARKET_ID] })).text).toMatch(
+      /token 999 is unknown to the market cache/
+    );
+    // The template's configSchema: enum, types, bounds
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, constraint: 'shorts' }, marketIds: [MARKET_ID, '0xcafe02'] })).text).toMatch(
+      /constraint must be one of/
+    );
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, min_gap: 0.001 }, marketIds: [MARKET_ID, '0xcafe02'] })).text).toMatch(/min_gap must be >= 0.01/);
+    expect(audit('bot.create').filter((r) => r.actor === 'agent' && String(r.result).startsWith('denied')).length).toBeGreaterThanOrEqual(5);
+
+    const ok = await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig, marketIds: [MARKET_ID, '0xcafe02'] });
+    expect(ok.isError).toBe(false);
+    expect(ok.json).toMatchObject({ mode: 'paper', stage: 'paper', createdBy: 'agent', role: 'consistency' });
+
+    const rrConfig = { token_id: YES, target_entry_price: 0.4, max_size_usd: 10, thesis: 'Rules resolve on the BLS first print only.' };
+    expect((await call('create_bot', { templateId: rr.id, name: 'r1', config: { ...rrConfig, thesis: '' }, marketIds: [MARKET_ID] })).text).toMatch(/thesis is required/);
+    expect((await call('create_bot', { templateId: rr.id, name: 'r1', config: { ...rrConfig, thesis: 'x'.repeat(2001) }, marketIds: [MARKET_ID] })).text).toMatch(/at most 2000/);
+    const r = await call('create_bot', { templateId: rr.id, name: 'r1', config: rrConfig, marketIds: [MARKET_ID] });
+    expect(r.json).toMatchObject({ mode: 'paper', stage: 'paper', role: 'resolution-rule' });
+    // Config updates stay within the bot's marketIds and the schema
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, token_id: '333' } })).text).toMatch(/not in the bot's marketIds/);
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 2 } })).text).toMatch(/target_entry_price must be <= 0.99/);
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 0.42 } })).json.config).toMatchObject({ target_entry_price: 0.42 });
+  });
+
+  it('copy bots (5c): only when the mandate allows copy; leaders validated; own bots only; dropped leaders not re-added; get_copy_leaders', async () => {
+    const copyTpl = core.services.scripts.templates().find((t) => t.name === 'Copy Trading')!;
+    expect(copyTpl).toMatchObject({ trust: 'new' });
+    const A = '0x' + 'aa'.repeat(20);
+    const B = '0x' + 'bb'.repeat(20);
+    // Copy is off in the default mandate (spec §3.2): refused server-side, audited
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A] } })).text).toMatch(/strategy copy is not in mandate.strategies.allow/);
+    expect(audit('bot.create').some((r) => r.actor === 'agent' && String(r.result).includes('strategy copy'))).toBe(true);
+
+    // The mandate now allows copy (the test's partial limits.yaml cannot be reloaded, so the config read is stubbed)
+    const cfg = core.configService.getConfig()!;
+    vi.spyOn(core.configService, 'getConfig').mockReturnValue({ ...cfg, mandate: { ...cfg.mandate, strategies: { ...cfg.mandate.strategies, allow: [...cfg.mandate.strategies.allow, 'copy'] } } });
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: ['0x123'] } })).text).toMatch(/leaders must be 0x addresses/);
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [] } })).text).toMatch(/names no leader/);
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A], ttl_minutes: 1 } })).text).toMatch(/ttl_minutes must be >= 3/);
+    const ok = await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A], copy_fraction: 0.05 } });
+    expect(ok.json).toMatchObject({ mode: 'paper', stage: 'paper', createdBy: 'agent', role: 'copy' });
+    // Leaders recorded as added by the agent; the agent adds one through update_bot_config
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).isError).toBe(false);
+    const leaders = await call('get_copy_leaders', { botId: ok.json.id });
+    expect(leaders.text.startsWith('<untrusted_data')).toBe(true);
+    expect(leaders.json.leaders.map((l: { address: string; status: string; addedBy: string }) => [l.address, l.status, l.addedBy])).toEqual([
+      [A, 'active', 'agent'],
+      [B, 'active', 'agent'],
+    ]);
+    // A dropped leader cannot be re-added by the agent
+    core.db.prepare("UPDATE copy_leaders SET status = 'dropped', dropped_reason = 'auto-drop' WHERE address = ?").run(B);
+    core.db.prepare("INSERT INTO copy_leader_blocks (address, bot_id, reason, blocked_at) VALUES (?, ?, 'auto-drop', '2026-01-01')").run(B, ok.json.id);
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A] } })).isError).toBe(false);
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).text).toMatch(/was dropped for losing copies/);
+    // Review: a new bot with that leader is refused too, also after the dropping bot is deleted
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp2', config: { leaders: [B] } })).text).toMatch(/was dropped for losing copies/);
+    await core.services.bots.delete(ok.json.id, asHuman('test'));
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp3', config: { leaders: [B] } })).text).toMatch(/was dropped for losing copies/);
+    expect(core.db.prepare('SELECT COUNT(*) AS n FROM copy_leader_blocks WHERE address = ?').get(B)).toEqual({ n: 1 });
+    const again = await call('create_bot', { templateId: copyTpl.id, name: 'cp4', config: { leaders: [A] } });
+    expect(again.json).toMatchObject({ role: 'copy' });
+    // A human's copy bot: the agent cannot reconfigure or start it
+    const human = await core.services.bots.create({ name: 'human copy', scriptId: copyTpl.id, config: { leaders: [A] } }, asHuman('test'));
+    expect((await call('update_bot_config', { botId: human.id, config: { leaders: [B] } })).text).toMatch(/only do this for bots it created/);
+    expect((await call('start_bot', { botId: human.id })).text).toMatch(/only do this for bots it created/);
+    // Re-activation is a human action over HTTP (agent token refused)
+    const res = await app.request(`/api/bots/${again.json.id}/copy-leaders/reactivate`, {
+      method: 'POST',
+      headers: { host: HOST, authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ address: B }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('5b review: exclusive_sum legs must share an event; exhaustive needs the whole negRisk event; forecast_id must be the token\'s', async () => {
+    const orig = globalThis.fetch;
+    // tokens 555 / 666: negRisk markets of different events; 777 / 888: two of the three markets of event ev-3
+    const extra: Record<string, { conditionId: string; ev: string }> = {
+      '555': { conditionId: '0xd1', ev: 'ev-a' },
+      '666': { conditionId: '0xd2', ev: 'ev-b' },
+      '777': { conditionId: '0xd3', ev: 'ev-3' },
+      '888': { conditionId: '0xd4', ev: 'ev-3' },
+    };
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const hit = Object.entries(extra).find(([tok, x]) => url.includes('/markets?') && (url.includes(tok) || url.includes(x.conditionId)));
+      const gm = (tok: string, x: { conditionId: string; ev: string }) =>
+        gammaMarket({ conditionId: x.conditionId, clobTokenIds: JSON.stringify([tok, `${tok}-no`]), negRisk: true, events: [{ id: x.ev, title: x.ev }] });
+      if (hit) return new Response(JSON.stringify([gm(hit[0], hit[1])]), { status: 200 });
+      if (url.includes('/events/ev-3')) {
+        return new Response(JSON.stringify({ id: 'ev-3', title: 'ev-3', markets: [gm('777', extra['777']), gm('888', extra['888']), gammaMarket({ conditionId: '0xd5', clobTokenIds: '["999","999-no"]' })] }), {
+          status: 200,
+        });
+      }
+      return orig(input, init);
+    });
+    const cons = core.services.scripts.templates().find((t) => t.name === 'Consistency')!;
+    const diff = await call('create_bot', { templateId: cons.id, name: 'x1', config: { constraint: 'exclusive_sum', tokens: ['555', '666'], exhaustive: true }, marketIds: ['0xd1', '0xd2'] });
+    expect(diff.text).toMatch(/same event/);
+    const notAll = await call('create_bot', { templateId: cons.id, name: 'x2', config: { constraint: 'exclusive_sum', tokens: ['777', '888'], exhaustive: true }, marketIds: ['0xd3', '0xd4'] });
+    expect(notAll.text).toMatch(/event has 3 markets but the config has 2 legs/);
+    // Not exhaustive: one event is enough
+    expect((await call('create_bot', { templateId: cons.id, name: 'x3', config: { constraint: 'exclusive_sum', tokens: ['777', '888'] }, marketIds: ['0xd3', '0xd4'] })).isError).toBe(false);
+
+    // forecast_id: must exist, be active and be on the token or its complement
+    const rr = core.services.scripts.templates().find((t) => t.name === 'Resolution Rule')!;
+    const base = { token_id: YES, target_entry_price: 0.4, max_size_usd: 10, thesis: 'BLS first print only.' };
+    expect((await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, forecast_id: 'nope' }, marketIds: [MARKET_ID] })).text).toMatch(/forecast nope not found/);
+    const fc = await call('submit_forecast', { tokenId: YES, probability: 0.62, rationale: 'Base effects.', sources: ['https://www.bls.gov/cpi'], ambiguityScore: 1 });
+    expect(fc.isError).toBe(false);
+    await call('get_market', { marketId: '0xcafe02' });
+    expect(
+      (await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, token_id: '333', forecast_id: fc.json.id }, marketIds: ['0xcafe02'] })).text
+    ).toMatch(/is on token 111111, not 333 or its complement/);
+    const ok = await call('create_bot', { templateId: rr.id, name: 'r', config: { ...base, forecast_id: fc.json.id }, marketIds: [MARKET_ID] });
+    expect(ok.isError).toBe(false);
   });
 
   it('assess_market can set or raise a score, never lower it, never override a human', async () => {

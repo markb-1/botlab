@@ -25,8 +25,41 @@ export interface ScriptRow {
   revision: number;
   trust: ScriptTrust;
   source_hash: string | null;
+  /** Builtin template role (5a standing roles, 5b strategy roles), set only by the seed for origin builtin; null otherwise */
+  builtin_role?: BuiltinRole | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Roles of builtin templates, set by the seed from the template's `meta.role`. Two kinds:
+ * - standing (spec §9.1, §9.2): forecast executor, position manager — one running instance per mode, human-operated
+ *   (the agent may only pause them, R168);
+ * - per-opportunity strategies (spec §9.3, §9.4; 5b): consistency, resolution-rule — any number of bots, the agent
+ *   creates them (its bots' `market_ids` must cover every token in the config, checked by BotService); copy (5c,
+ *   spec §9.5) — follows leaders across markets, so it is not market-scoped.
+ */
+export type StandingRole = 'forecast-executor' | 'position-manager';
+export type StrategyRole = 'consistency' | 'resolution-rule' | 'copy';
+export type BuiltinRole = StandingRole | StrategyRole;
+export const STANDING_ROLES: readonly StandingRole[] = ['forecast-executor', 'position-manager'];
+export const STRATEGY_ROLES: readonly StrategyRole[] = ['consistency', 'resolution-rule', 'copy'];
+export const BUILTIN_ROLES: readonly BuiltinRole[] = [...STANDING_ROLES, ...STRATEGY_ROLES];
+
+/** A standing (single-instance, human-operated) role */
+export function isStandingRole(role: BuiltinRole | null | undefined): role is StandingRole {
+  return !!role && (STANDING_ROLES as readonly string[]).includes(role);
+}
+
+/** A per-opportunity strategy role (consistency, resolution-rule, copy) */
+export function isStrategyRole(role: BuiltinRole | null | undefined): role is StrategyRole {
+  return !!role && (STRATEGY_ROLES as readonly string[]).includes(role);
+}
+
+/** The script's standing role, only for builtin templates (a human or agent script can never claim one). */
+export function builtinRoleOf(row: Pick<ScriptRow, 'origin' | 'is_template' | 'builtin_role'> | null | undefined): BuiltinRole | null {
+  if (!row || row.origin !== 'builtin' || row.is_template !== 1) return null;
+  return row.builtin_role && BUILTIN_ROLES.includes(row.builtin_role) ? row.builtin_role : null;
 }
 
 export interface ScriptVersionRow {
@@ -168,6 +201,11 @@ export class ScriptRepository {
         now
       );
     }
+  }
+
+  /** Seed only: the standing role of a builtin template (ignored for any other script). */
+  setBuiltinRole(id: string, role: BuiltinRole | null): void {
+    this.db.prepare("UPDATE scripts SET builtin_role = ? WHERE id = ? AND origin = 'builtin' AND is_template = 1").run(role, id);
   }
 
   setTrust(id: string, trust: ScriptTrust): void {

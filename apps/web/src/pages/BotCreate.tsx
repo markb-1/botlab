@@ -248,7 +248,7 @@ export function BotCreate() {
           {prop.description && <p className="text-xs text-gray-500 mb-1">{prop.description}</p>}
           <input type="number" value={value as number ?? ''}
             onChange={(e) => setConfig({ ...config, [key]: e.target.value === '' ? undefined : parseFloat(e.target.value) })}
-            min={prop.minimum} max={prop.maximum} step={prop.type === 'integer' ? 1 : 0.01}
+            min={prop.minimum} max={prop.maximum} step={prop.type === 'integer' ? 1 : 'any'}
             className="mt-1 block w-full rounded-md border-[#2a2a2a] bg-[#111] text-white shadow-sm focus:border-accent focus:ring-accent sm:text-sm" />
         </div>
       );

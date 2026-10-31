@@ -6,6 +6,22 @@ import { useOverview } from '../hooks/useRisk';
 import { Badge, ErrorBox, StageBadge } from '../components/ui';
 import { usd } from '../lib/format';
 
+/** Builtin roles: standing (spec §9.1, §9.2; one running instance per mode) and per-opportunity strategies (§9.3, §9.4) */
+const ROLE_LABELS: Record<string, string> = {
+  'forecast-executor': 'executor',
+  'position-manager': 'position manager',
+  consistency: 'consistency',
+  'resolution-rule': 'resolution rule',
+  copy: 'copy',
+};
+const ROLE_TITLES: Record<string, string> = {
+  'forecast-executor': 'Standing forecast executor: bids on tradeable ledger forecasts (one per mode)',
+  'position-manager': "Standing position manager: exits every bot's positions as risk exits (one per mode)",
+  consistency: 'Consistency bot: trades violations of a constraint between markets with hedged baskets',
+  'resolution-rule': 'Resolution-rule bot: bids up to a target on one outcome per its thesis, holds to resolution',
+  copy: 'Copy-trading bot: mirrors selected leaders with limits near their fill; leaders are scored and dropped when their copies lose',
+};
+
 function StatusBadge({ status }: { status: Bot['status'] }) {
   const colors = {
     running: 'bg-green-500/10 text-green-400',
@@ -164,6 +180,13 @@ export function Bots() {
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
                     {bot.scriptName || bot.scriptId}
+                    {bot.role && (
+                      <span className="block mt-1">
+                        <Badge tone="blue" title={ROLE_TITLES[bot.role] ?? 'Standing builtin bot'}>
+                          {ROLE_LABELS[bot.role] ?? bot.role}
+                        </Badge>
+                      </span>
+                    )}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <span className="inline-flex items-center gap-1.5">

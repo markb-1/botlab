@@ -11,6 +11,8 @@ import { botApi, ledgerApi, scriptApi } from '../lib/api';
 import { useOverview } from '../hooks/useRisk';
 import { ClearHaltButton } from '../components/HaltControls';
 import { DiffView } from '../components/DiffView';
+import { StrategyPanel } from '../components/StrategyPanel';
+import { LeadersPanel } from '../components/LeadersPanel';
 import { ForecastDetail } from './Ledger';
 import { Badge, Empty, ErrorBox, Notice, StageBadge, Tabs, tdCls, thCls } from '../components/ui';
 import { dateTime, errorMessage, pct, shortId, usd } from '../lib/format';
@@ -213,6 +215,8 @@ export function BotDetail() {
           )}
           {overview?.halts.global.halted && <Notice tone="red">Global halt active: no bot can start ({overview.halts.global.reason}).</Notice>}
           {bot.stage === 'retired' && <Notice tone="yellow">Retired{bot.retireReason ? `: ${bot.retireReason}` : ''}. Retired bots never trade again.</Notice>}
+          <StrategyPanel bot={bot} events={customEvents} />
+          <LeadersPanel bot={bot} />
           <div className="bg-surface border border-[#2a2a2a] rounded-xl p-4 sm:p-6">
             <h3 className="text-lg font-medium text-white mb-4">Risk & ramp</h3>
             <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-sm">

@@ -46,7 +46,7 @@ import { verifyMasterKey } from './security/masterKey';
 import { AdminAuthStore } from './security/adminAuth';
 import { BackupJob } from './ops/BackupJob';
 import { WalletManager } from './bots/WalletManager';
-import { BotManager } from './bots/BotManager';
+import { BotManager, BOT_RETIRE_REQUEST_EVENT } from './bots/BotManager';
 import { seedTemplates, getBuiltinTemplates } from './db/seed';
 import { AuditService } from './audit/AuditService';
 import { OrderCanceller } from './orders/OrderCanceller';
@@ -54,7 +54,7 @@ import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/Market
 import { BotActivityLog } from './bots/BotActivityLog';
 import { FeeService } from './orders/FeeService';
 import type { FeeRates } from './orders/feeModel';
-import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
+import { MarketCacheService, MARKET_RULES_CHANGED_EVENT, type MarketView } from './ledger/MarketCacheService';
 import { LedgerService } from './ledger/LedgerService';
 import { defaultCategories } from './config/categoriesSchema';
 import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from './risk/HaltService';
@@ -70,7 +70,7 @@ import type { ClockSkewGuard } from './orders/OrderService';
 import { Reconciler } from './reconcile/Reconciler';
 import { fetchDataApiPositions, fetchDataApiTrades } from './reconcile/dataApi';
 import { Recorder } from './recorder/Recorder';
-import { BotService } from './services/BotService';
+import { BotService, type StrategyMarketInfo } from './services/BotService';
 import { WalletService } from './services/WalletService';
 import { ScriptService } from './services/ScriptService';
 import { SettingsService } from './services/SettingsService';
@@ -86,6 +86,8 @@ import type { AgentTrigger } from './agent/schedule';
 import { PublicError, publicLookupError } from './services/redact';
 import { getBalance } from './exchange/polymarket/trading';
 import { getBinanceBalance } from './exchange/binance/client';
+import { CopyLeaderRepository } from './db/repositories/CopyLeaderRepository';
+import { CopyLeaderService } from './services/CopyLeaderService';
 
 export interface CoreOptions {
   /** Directory for the database, shutdown marker, notify state and config history (created if missing) */
@@ -148,6 +150,8 @@ export interface CoreServices {
   auditLog: AuditLogService;
   /** Agent runs, notes, budget and exit flags (spec §7) */
   agent: AgentService;
+  /** Copy-trading leaders and their scores (spec §9.5, 5c) */
+  copy: CopyLeaderService;
 }
 
 export interface Core {
@@ -182,6 +186,11 @@ export interface Core {
 }
 
 const QTY_EPSILON = 1e-9;
+
+/** The market facts BotService checks for agent strategy bots (5b) */
+function strategyMarketInfo(m: MarketView | null): StrategyMarketInfo | null {
+  return m ? { marketId: m.marketId, eventId: m.eventId, negRisk: m.negRisk, endDate: m.endDate, question: m.question, tokens: m.tokens } : null;
+}
 
 export function createCore(options: CoreOptions): Core {
   const dataDir = path.resolve(options.dataDir);
@@ -314,14 +323,17 @@ export function createCore(options: CoreOptions): Core {
     },
     isRunning: (id) => botManager?.isRunning(id) ?? false,
     getAgentDigest: () => agentService.digestText(),
+    getCopyDigest: () => copyLeaders.digestText(),
     stateFile: path.join(dataDir, 'notify-state.json'),
   });
+
+  const exitFlagRepo = new PositionExitFlagRepository(db);
 
   // ── Agent runs, notes, budget (spec §7); created early: the services below ask it about event runs ──
   const agentService: AgentService = new AgentService({
     runRepo: new AgentRunRepository(db),
     noteRepo: new AgentNoteRepository(db),
-    flagRepo: new PositionExitFlagRepository(db),
+    flagRepo: exitFlagRepo,
     botRepo,
     tradeRepo,
     audit,
@@ -400,6 +412,13 @@ export function createCore(options: CoreOptions): Core {
     ],
   });
   marketCache.on(MARKET_RULES_CHANGED_EVENT, (payload) => events.emit(MARKET_RULES_CHANGED_EVENT, payload));
+  // ctx.events (spec §5.2): rules changes and halts are pushed to running bots as hints to re-check
+  marketCache.on(MARKET_RULES_CHANGED_EVENT, (e: { marketId: string; question: string; changedAt: string }) =>
+    botManager?.broadcastScriptEvent('rules_changed', { marketId: e.marketId, question: e.question, changedAt: e.changedAt })
+  );
+  halts.on(RISK_HALT_EVENT, (e: { kind: string; scope: string; reason: string }) =>
+    botManager?.broadcastScriptEvent('halt', { kind: e.kind, scope: e.scope, reason: e.reason })
+  );
   const ledger = new LedgerService({
     forecastRepo,
     rightsRepo: new CategoryRightsRepository(db),
@@ -410,6 +429,9 @@ export function createCore(options: CoreOptions): Core {
     getMandate: () => configService.getConfig()?.mandate ?? null,
     getLimits: () => configService.getConfig()?.limits ?? null,
     guardAgentRun,
+    // ctx.events forecast_changed (spec §5.2): new, superseded or withdrawn forecasts
+    onForecastChanged: (f) =>
+      botManager?.broadcastScriptEvent('forecast_changed', { forecastId: f.id, tokenId: f.tokenId, marketId: f.marketId, status: f.status, supersededBy: f.supersededBy }),
   });
 
   // ── Order-book recorder (spec §10): never affects trading ─────────
@@ -449,6 +471,19 @@ export function createCore(options: CoreOptions): Core {
   // Recent bot logs / custom events for the UI (Logs and Events tabs); filled from bot:event after unlock
   const activity = new BotActivityLog();
 
+  // ── Copy-trading leaders (5c): per-leader P&L marks at the market cache's last outcome price ──
+  const copyLeaders = new CopyLeaderService({
+    repo: new CopyLeaderRepository(db),
+    botRepo,
+    audit,
+    mark: (tokenId) => {
+      const m = marketCache.getCachedByToken(tokenId);
+      const i = m ? m.tokens.findIndex((t) => t.tokenId === tokenId) : -1;
+      const p = m && i >= 0 && m.outcomePrices ? parseFloat(m.outcomePrices[i] ?? '') : NaN;
+      return Number.isFinite(p) ? p : null;
+    },
+  });
+
   // ── Services ──────────────────────────────────────────────────────
   const services: CoreServices = {
     bots: new BotService({
@@ -469,6 +504,15 @@ export function createCore(options: CoreOptions): Core {
         const m = marketCache.getCachedByToken(tokenId);
         return m ? { marketId: m.marketId, question: m.question, outcome: m.tokens.find((t) => t.tokenId === tokenId)?.outcome ?? null } : null;
       },
+      lookupTokenMarketInfo: async (tokenId) => strategyMarketInfo(await marketCache.getMarketByToken(tokenId)),
+      cachedTokenMarketInfo: (tokenId) => strategyMarketInfo(marketCache.getCachedByToken(tokenId)),
+      eventMarketIds: { fetch: (eventId) => marketCache.getEventMarketIds(eventId), cached: (eventId) => marketCache.getEventMarketIdsCached(eventId) },
+      getForecast: (id) => {
+        const f = forecastRepo.findById(id);
+        return f ? { tokenId: f.token_id, status: f.status } : null;
+      },
+      getMandate: () => configService.getConfig()?.mandate ?? null,
+      copyLeaders,
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),
     scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null, guardAgentRun }),
@@ -543,6 +587,7 @@ export function createCore(options: CoreOptions): Core {
     }),
     auditLog: new AuditLogService(repos.auditRepo),
     agent: agentService,
+    copy: copyLeaders,
   };
 
   // ── Lifecycle ─────────────────────────────────────────────────────
@@ -696,8 +741,14 @@ export function createCore(options: CoreOptions): Core {
       marketCache,
       ledger,
       clock: clockGuard,
+      exitFlags: exitFlagRepo,
+      copyLeaders,
     });
     botManager = manager;
+    // ctx.requestRetire (5b): a script retires its own bot, audited as the bot
+    manager.on(BOT_RETIRE_REQUEST_EVENT, ({ botId, reason }: { botId: string; reason: string }) => {
+      services.bots.retireByBot(botId, reason).catch((err) => console.error(`[Core] Retire request of bot ${botId} failed:`, err));
+    });
     // No bot may start until startup recovery below has finished (set before initialize so there is no gap)
     manager.setRecoveryInProgress(true);
     await manager.initialize();

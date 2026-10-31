@@ -54,6 +54,28 @@ const EXPIRY_GRACE_MS = 60_000;
 const OPEN_STATUSES: OrderStatus[] = ['submitted', 'open', 'partially_filled'];
 /** Used when the book does not report a tick size; 0.01 multiples are valid on finer ticks too */
 const DEFAULT_TICK = 0.01;
+/**
+ * Rejection cooldown (Mac test F1): a bot whose own orders were refused by the risk checks this many times within
+ * the window has its own new submissions refused (`rejection_cooldown`, not counted as rejections themselves)
+ * until the oldest of them leaves the window. Orders another bot places for it (Position Manager exits) are exempt.
+ */
+export const REJECTION_COOLDOWN_COUNT = 6;
+export const REJECTION_COOLDOWN_WINDOW_MS = 10 * MS_PER_MINUTE;
+/**
+ * Refusals that say nothing about the bot (system-wide states, outages, the cooldown itself): not counted by the
+ * cooldown.
+ */
+export const COOLDOWN_IGNORED_CHECKS: readonly RiskCheckName[] = [
+  'rejection_cooldown',
+  'clock_skew',
+  'clock_unverified',
+  'live_disabled',
+  'market_data_unavailable',
+  'market_data',
+  'state_invalid',
+  'global_halt',
+  'exchange_enabled',
+];
 /** USD-quoted Binance pairs; anything else has no USD notional and is rejected */
 const BINANCE_USD_QUOTES = ['USDT', 'USDC', 'FDUSD'];
 
@@ -86,6 +108,8 @@ export interface OrderIntentOpts {
   forecastId?: string;
   /** Sell flagged as a risk exit (see RiskEngine exemptions) */
   riskExit?: boolean;
+  /** Bot placing the order on this bot's behalf (PortfolioService exits; never from a script's own call) */
+  placedBy?: string;
 }
 
 export interface MarketableOrderInput extends OrderIntentOpts {
@@ -131,6 +155,24 @@ export interface OpenOrderInfo {
   filledSize: number;
   status: OrderStatus;
   expiresAt: string | null;
+  createdAt: string;
+  forecastId: string | null;
+  placedBy: string | null;
+}
+
+export interface OrderHistoryInfo {
+  orderId: string;
+  tokenId: string;
+  marketId: string;
+  side: OrderSide;
+  orderType: 'limit' | 'market';
+  price: number;
+  size: number;
+  filledSize: number;
+  status: OrderStatus;
+  reason: string | null;
+  forecastId: string | null;
+  placedBy: string | null;
   createdAt: string;
 }
 
@@ -417,6 +459,13 @@ export class OrderService {
     }
     const unavailable = this.polymarketUnavailable();
     if (unavailable) return invalid(unavailable);
+    const cooling = this.cooldownGate(input, {
+      exchange: 'polymarket', tokenId: input.tokenId, side: input.side, orderType: 'market',
+      price: input.side === 'buy' ? (input.maxPrice ?? 0) : (input.minPrice ?? 0),
+      size: input.side === 'sell' ? input.amount : 0,
+      notionalUsd: input.side === 'buy' ? input.amount : 0,
+    });
+    if (cooling) return cooling;
 
     await this.syncOpenOrders();
     const ctx = await this.polymarketContext(input.tokenId);
@@ -471,6 +520,11 @@ export class OrderService {
     // The config minimum is GTD_MIN_TTL_MINUTES too; max() guards an older in-memory config
     const ttl = Math.max(Math.min(input.ttlMinutes ?? maxTtl, maxTtl), GTD_MIN_TTL_MINUTES);
     const postOnly = input.postOnly !== false;
+    const cooling = this.cooldownGate(input, {
+      exchange: 'polymarket', tokenId: input.tokenId, side: input.side, orderType: 'limit',
+      price: input.price, size: input.size, notionalUsd: input.price * input.size,
+    });
+    if (cooling) return cooling;
 
     await this.syncOpenOrders();
     const ctx = await this.polymarketContext(input.tokenId);
@@ -478,10 +532,6 @@ export class OrderService {
       return invalid(`price ${input.price} is not a multiple of the tick size ${tickOf(ctx.book)}`);
     }
     const marketable = this.isMarketable({ side: input.side, price: input.price, orderType: 'limit' }, ctx.market);
-
-    if (this.paper && !marketable && ctx.market) {
-      return invalid('paper mode: resting orders not simulated yet');
-    }
 
     const expiresAtMs = this.now() + ttl * MS_PER_MINUTE;
     const preCheck =
@@ -508,6 +558,8 @@ export class OrderService {
       },
       async (row) => {
         if (this.paper) {
+          // Resting paper order (R12 amended, 5a): stays open; later syncs fill it when the book crosses it
+          if (!marketable) return { kind: 'accepted', exchangeOrderId: null, status: 'live', filledSize: 0, filledNotional: 0 };
           // Marketable paper limit order: fills in full at the limit price
           const ps = this.requirePaper();
           const level = [{ price: String(input.price), size: String(input.size) }];
@@ -661,6 +713,72 @@ export class OrderService {
     return after;
   }
 
+  /**
+   * Rejection cooldown gate, at the entry of every place method (before any order sync or book read): null when the
+   * bot may submit. While cooling down, the refusal is stored (one `rejected_risk` row with `rejection_cooldown` and
+   * one audit entry per cooldown episode, not one per attempt) and returned. Orders placed for the bot by another
+   * bot and risk exits never wait.
+   */
+  private cooldownGate(
+    intent: OrderIntentOpts,
+    order: { exchange: Exchange; tokenId: string; side: OrderSide; orderType: 'limit' | 'market'; price: number; size: number; notionalUsd: number }
+  ): OrderResult | null {
+    if (intent.placedBy || intent.riskExit) return null;
+    const now = this.now();
+    const repo = this.deps.orderRepo;
+    const times = repo.ownRejectionTimesSince(
+      this.bot.botId,
+      new Date(now - REJECTION_COOLDOWN_WINDOW_MS).toISOString(),
+      this.paper,
+      COOLDOWN_IGNORED_CHECKS
+    );
+    if (times.length < REJECTION_COOLDOWN_COUNT) return null;
+    // Free again once fewer than COUNT rejections remain in the window
+    const until = Date.parse(times[times.length - REJECTION_COOLDOWN_COUNT]) + REJECTION_COOLDOWN_WINDOW_MS;
+    const seconds = Math.max(Math.ceil((until - now) / 1000), 1);
+    const detail = `${times.length} risk rejections in the last ${REJECTION_COOLDOWN_WINDOW_MS / MS_PER_MINUTE} min: new orders paused for ${seconds} s`;
+    const result: OrderResult = {
+      ok: false,
+      orderId: null,
+      status: 'rejected_risk',
+      filledSize: 0,
+      avgFillPrice: null,
+      filledNotionalUsd: 0,
+      feeUsd: 0,
+      expiresAt: null,
+      failedCheck: 'rejection_cooldown',
+      error: `Risk check failed: ${detail}`,
+    };
+    // This episode began with the latest counted rejection: one stored refusal per episode
+    if (repo.hasRejectionSince(this.bot.botId, times[times.length - 1], this.paper, 'rejection_cooldown')) return result;
+    const decision = preDecision('rejection_cooldown', detail, now);
+    const row = repo.create({
+      botId: this.bot.botId,
+      exchange: order.exchange,
+      marketId: '',
+      tokenId: order.tokenId,
+      side: order.side,
+      orderType: order.orderType,
+      price: dbNum(order.price),
+      size: dbNum(order.size),
+      notionalUsd: dbNum(order.notionalUsd),
+      status: 'rejected_risk',
+      riskDecision: decision,
+      reason: typeof intent.reason === 'string' ? intent.reason.slice(0, 500) : null,
+      forecastId: intent.forecastId ?? null,
+      simulated: this.paper,
+    });
+    logger.warning(`[OrderService] ${this.bot.botName}: own orders paused (rejection_cooldown): ${detail}`);
+    this.deps.audit?.record(
+      `bot:${this.bot.botId}`,
+      'order.rejected',
+      row.id,
+      { exchange: order.exchange, tokenId: order.tokenId, side: order.side, failedCheck: 'rejection_cooldown', reason: detail, simulated: this.paper },
+      'rejected_risk'
+    );
+    return { ...result, orderId: row.id };
+  }
+
   private async lookupForecast(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null> {
     try {
       return await (this.deps.forecasts ?? NoForecastSource).get(forecastId, tokenId);
@@ -712,8 +830,10 @@ export class OrderService {
         reason: typeof intent.reason === 'string' ? intent.reason.slice(0, 500) : null,
         forecastId: intent.forecastId ?? null,
         simulated: this.paper,
+        placedBy: intent.placedBy ?? null,
       });
-      if (!decision.allowed) {
+      // Cooldown refusals are recorded and audited but not notified again (the burst before them already counted)
+      if (!decision.allowed && decision.failedCheck !== 'rejection_cooldown') {
         try {
           this.deps.events?.orderRejected({
             botId: order.botId,
@@ -725,6 +845,8 @@ export class OrderService {
         } catch (err) {
           logger.error(`[OrderService] Rejection notification failed: ${err instanceof Error ? err.message : err}`);
         }
+      }
+      if (!decision.allowed) {
         logger.warning(
           `[OrderService] ${this.bot.botName}: ${order.side} ${order.tokenId} rejected (${decision.failedCheck}): ${decision.reason}`
         );
@@ -742,6 +864,7 @@ export class OrderService {
             failedCheck: decision.failedCheck,
             reason: decision.reason,
             simulated: this.paper,
+            ...(intent.placedBy ? { placedBy: intent.placedBy } : {}),
           },
           'rejected_risk'
         );
@@ -853,6 +976,11 @@ export class OrderService {
     if (input.side !== 'buy' && input.side !== 'sell') return invalid('side must be buy or sell');
     if (!finite(input.amount) || input.amount <= 0) return invalid('amount must be a positive number');
     const symbol = input.symbol.toUpperCase();
+    const cooling = this.cooldownGate(input, {
+      exchange: 'binance', tokenId: symbol, side: input.side, orderType: 'market', price: 0,
+      size: input.side === 'sell' ? input.amount : 0, notionalUsd: input.side === 'buy' ? input.amount : 0,
+    });
+    if (cooling) return cooling;
 
     let book: BinanceOrderBook | null = null;
     try {
@@ -957,12 +1085,18 @@ export class OrderService {
 
   private async syncUnlocked(): Promise<void> {
     const now = this.now();
+    const books = new Map<string, Promise<ClobBook | null>>();
     for (const row of this.deps.orderRepo.findOpen(this.bot.botId, this.paper)) {
       const exp = row.expires_at ? Date.parse(row.expires_at) : null;
 
-      // Paper orders cannot be looked up: they count as open until their expiry, then they are dead
+      // Paper orders: expired at their TTL (checked first: a cross first seen after the expiry never fills it),
+      // otherwise a resting limit order fills against the book read now (simulatePaperRestingFill)
       if (this.paper) {
-        if (exp !== null && now >= exp) this.expire(row.id, 'expired with no fill seen');
+        if (exp !== null && now >= exp) {
+          this.expire(row.id, 'expired with no fill seen');
+          continue;
+        }
+        if (row.exchange === 'polymarket' && row.order_type === 'limit') await this.simulatePaperRestingFill(row, books);
         continue;
       }
       // Live order with no exchange id (outcome unknown): it may have filled. Only the Reconciler may
@@ -988,6 +1122,77 @@ export class OrderService {
     }
   }
 
+  /**
+   * Paper resting-order simulation (R12 amended in 5a). A resting paper limit order fills when a book read
+   * during a sync — necessarily after the order was placed (the placement's own sync runs before the row
+   * exists) — shows the opposite side at or through its price: a buy against asks <= its price, a sell
+   * against bids >= its price. It fills at its own limit price (a maker never gets the better crossing price),
+   * up to the size resting at those levels, as a maker fill (fee 0, R125). Partial fills stay open. A book
+   * that cannot be read leaves the order as is. If the paper state refuses (cash or position gone), the order
+   * is cancelled. Fills happen only when the bot syncs (any order call, getOpenOrders), not continuously.
+   */
+  private async simulatePaperRestingFill(row: OrderRow, books: Map<string, Promise<ClobBook | null>>): Promise<void> {
+    const remaining = row.size - row.filled_size;
+    if (!(remaining > QTY_EPS)) return;
+    let pending = books.get(row.token_id);
+    if (!pending) {
+      // A private copy: fills below consume its levels so two orders cannot fill against the same liquidity
+      pending = this.deps
+        .getBook(row.token_id)
+        .then((b) => (b ? { ...b, bids: (b.bids ?? []).map((l) => ({ ...l })), asks: (b.asks ?? []).map((l) => ({ ...l })) } : null))
+        .catch(() => null);
+      books.set(row.token_id, pending);
+    }
+    const book = await pending;
+    if (!book) return;
+    const buy = row.side === 'buy';
+    let available = 0;
+    for (const l of (buy ? book.asks : book.bids) ?? []) {
+      const p = parseFloat(l.price);
+      const s = parseFloat(l.size);
+      if (!Number.isFinite(p) || !Number.isFinite(s) || s <= 0) continue;
+      if (buy ? p <= row.price + 1e-9 : p >= row.price - 1e-9) available += s;
+    }
+    const qty = Math.min(remaining, available);
+    if (!(qty > QTY_EPS)) return;
+    // Consume the crossing levels, best price first, for the rest of this sync
+    const crossing = ((buy ? book.asks : book.bids) ?? [])
+      .filter((l) => {
+        const p = parseFloat(l.price);
+        return Number.isFinite(p) && (buy ? p <= row.price + 1e-9 : p >= row.price - 1e-9);
+      })
+      .sort((a, b) => (buy ? parseFloat(a.price) - parseFloat(b.price) : parseFloat(b.price) - parseFloat(a.price)));
+    let left = qty;
+    for (const l of crossing) {
+      if (left <= QTY_EPS) break;
+      const s = parseFloat(l.size);
+      if (!(s > 0)) continue;
+      const take = Math.min(s, left);
+      l.size = String(s - take);
+      left -= take;
+    }
+
+    const ps = this.requirePaper();
+    const level = [{ price: String(row.price), size: String(qty) }];
+    const res = buy
+      ? ps.simulateBuy(row.token_id, row.price * qty, { bids: [], asks: level }, { maxPrice: row.price })
+      : ps.simulateSell(row.token_id, qty, { bids: level, asks: [] }, { minPrice: row.price });
+    if (!res.success || !(res.tokenAmount > QTY_EPS)) {
+      const fresh = this.deps.orderRepo.findById(row.id);
+      if (fresh && OPEN_STATUSES.includes(fresh.status)) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
+      logger.warning(`[OrderService] ${this.bot.botName}: paper order ${row.id} cancelled: ${res.error ?? 'paper fill refused'}`);
+      return;
+    }
+    const matched = Math.min(row.filled_size + res.tokenAmount, row.size);
+    this.applyExchangeState(row.id, { status: matched >= row.size - QTY_EPS ? 'matched' : 'live', sizeMatched: matched });
+    try {
+      const info = await this.deps.marketData.getMarketInfo(row.token_id);
+      if (info) ps.updatePositionMeta(row.token_id, info.question, info.outcome);
+    } catch {
+      /* position labels only */
+    }
+  }
+
   /** Mark an order expired if it is still open. */
   private expire(orderId: string, why: string): void {
     const fresh = this.deps.orderRepo.findById(orderId);
@@ -1010,6 +1215,11 @@ export class OrderService {
     this.emitPendingFills();
   }
 
+  /** Placed by another bot on this bot's behalf (a position-manager exit): the owner's own cancels leave it alone. */
+  private placedByOther(row: OrderRow): boolean {
+    return !!row.placed_by && row.placed_by !== this.bot.botId;
+  }
+
   private ownOpenOrder(orderId: string): OrderRow {
     const row = typeof orderId === 'string' ? this.deps.orderRepo.findById(orderId) : undefined;
     // Same message whether it does not exist or belongs to another bot
@@ -1022,10 +1232,16 @@ export class OrderService {
     return row;
   }
 
-  /** Cancel one of this bot's orders. Throws if not found, not this bot's, or not cancellable. */
-  cancel(orderId: string): Promise<void> {
+  /**
+   * Cancel one of this bot's orders. Throws if not found, not this bot's, or not cancellable. An exit another
+   * bot placed for it (position manager) can be cancelled only with `placedBy` equal to that bot.
+   */
+  cancel(orderId: string, opts: { placedBy?: string } = {}): Promise<void> {
     return this.botLock(async () => {
       const row = this.ownOpenOrder(orderId);
+      if (this.placedByOther(row) && opts.placedBy !== row.placed_by) {
+        throw new Error(`Order ${orderId} is an exit placed by the position manager; only it can cancel it`);
+      }
       if (this.paper) {
         this.deps.orderRepo.update(row.id, { status: 'cancelled' });
         return;
@@ -1041,10 +1257,10 @@ export class OrderService {
     });
   }
 
-  /** Cancel all of this bot's open orders (never other bots'). */
+  /** Cancel all of this bot's open orders (never other bots', nor exits the position manager placed for it). */
   cancelAll(): Promise<CancelAllResult> {
     return this.botLock(async () => {
-      const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper);
+      const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper).filter((o) => !this.placedByOther(o));
       if (this.paper) {
         for (const row of open) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
         return { cancelled: open.length, failed: 0, unknownOutcome: 0 };
@@ -1096,6 +1312,29 @@ export class OrderService {
       status: o.status,
       expiresAt: o.expires_at,
       createdAt: o.created_at,
+      forecastId: o.forecast_id,
+      placedBy: o.placed_by ?? null,
+    }));
+  }
+
+  /** This bot's orders (any status) created in the last `days` (max 30), newest first, at most 500. */
+  getOrderHistory(days = 7): OrderHistoryInfo[] {
+    const d = Math.min(Math.max(finite(days) ? days : 7, 0), 30);
+    const since = new Date(this.now() - d * 86_400_000).toISOString();
+    return this.deps.orderRepo.findByBotSince(this.bot.botId, this.paper, since, 500).map((o) => ({
+      orderId: o.id,
+      tokenId: o.token_id,
+      marketId: o.market_id,
+      side: o.side as OrderSide,
+      orderType: o.order_type as 'limit' | 'market',
+      price: o.price,
+      size: o.size,
+      filledSize: o.filled_size,
+      status: o.status,
+      reason: o.reason,
+      forecastId: o.forecast_id,
+      placedBy: o.placed_by ?? null,
+      createdAt: o.created_at,
     }));
   }
 
@@ -1105,15 +1344,32 @@ export class OrderService {
     return info ? this.deps.fees.ratesFor(info.feeSchedule, this.deps.fees.feeCategoryFor(info.labels)) : this.deps.fees.getRates(null);
   }
 
+  /**
+   * ctx.risk.getRecentStops(): latest Position Manager stop per token in this bot's mode over the last 30 days,
+   * on any bot's position (Mac test F4: the stop marker must not live in one executor's own history).
+   */
+  getRecentStops(tokenId?: string): Array<{ tokenId: string; stoppedAt: string }> {
+    const since = new Date(this.now() - 30 * 24 * 3_600_000).toISOString();
+    return this.deps.orderRepo.recentStops(this.paper, since, tokenId).map((r) => ({ tokenId: r.token_id, stoppedAt: r.stopped_at }));
+  }
+
   /** ctx.risk.getBudget(): what this bot can still add before limits bite. */
   async getBudget(): Promise<RiskBudget> {
     const { provider, riskEngine } = this.deps;
     const bot = provider.getBotInfo(this.bot.botId);
     const global = provider.isGloballyHalted();
-    if (!bot) return { remainingAllocation: 0, remainingMarket: {}, halted: true };
+    const limits0 = riskEngine.getConfig().limits;
+    const ordersPerHour = limits0.per_bot_defaults.max_orders_per_hour;
+    const ordersLastHour = this.deps.orderRepo.countByBotSince(this.bot.botId, new Date(this.now() - 3_600_000).toISOString(), this.paper);
+    const orders = {
+      ordersPerHour,
+      ordersRemainingThisHour: Math.max(ordersPerHour - ordersLastHour, 0),
+      maxRestingTtlMinutes: limits0.orders.resting_order_ttl_minutes,
+    };
+    if (!bot) return { remainingAllocation: 0, remainingMarket: {}, halted: true, ...orders };
 
     const exposure = provider.computeExposure(this.bot.botId);
-    const limits = riskEngine.getConfig().limits;
+    const limits = limits0;
     const liveStage = bot.stage === 'probation' || bot.stage === 'full';
     const allocation = liveStage ? riskEngine.effectiveAllocation(bot, 'polymarket') : 0;
     const cash = await provider.getCash('polymarket');
@@ -1131,6 +1387,6 @@ export class OrderService {
     for (const m of markets) {
       remainingMarket[m] = Math.max(0, Math.min(limits.per_market.max_exposure_usd - (exposure.marketUsd.get(m) ?? 0), remainingAllocation));
     }
-    return { remainingAllocation, remainingMarket, halted: global.halted || bot.halted };
+    return { remainingAllocation, remainingMarket, halted: global.halted || bot.halted, ...orders };
   }
 }

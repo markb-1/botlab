@@ -211,7 +211,7 @@ export function ForecastDetail({ id, onClose }: { id: string; onClose: () => voi
                 </span>,
               ],
               ['Ambiguity score', String(f.ambiguityScore)],
-              ['Liquidity at forecast', usd(f.liquidityUsd, 0)],
+              ['Order-book liquidity at forecast', usd(f.liquidityUsd, 0)],
               ['Created', `${dateTime(f.createdAt)} by ${f.createdBy}`],
               ['Resolved', f.resolvedAt ? `${dateTime(f.resolvedAt)} → outcome ${f.outcome}` : '—'],
               ['Brier (forecast / market)', `${num(f.brierAgent)} / ${num(f.brierMarket)}`],
@@ -387,7 +387,7 @@ function ForceState({ bucket, onClose }: { bucket: BucketStats; onClose: () => v
     >
       <p className="text-sm text-gray-400">
         Currently <RightsBadge state={bucket.state} forced={bucket.forced} />. A forced state blocks automatic promotion and deprioritisation; suspension and
-        the mandate rule still apply. <strong>auto</strong> hands the bucket back to the rules. Forcing <strong>trading</strong> is refused unless the category
+        the mandate rule still apply. <strong>auto</strong> hands the bucket back to the rules and runs them at once (a forced <strong>trading</strong> bucket restarts from shadow and trades again only if its record qualifies). Forcing <strong>trading</strong> is refused unless the category
         is in the mandate allow list.
       </p>
       {state === 'trading' && (
@@ -541,7 +541,7 @@ function SubmitForecast() {
     <Card title="Submit a forecast (human)">
       <form onSubmit={submit} className="space-y-3 max-w-2xl">
         <p className="text-sm text-gray-400">
-          The probability that the token resolves YES. The server captures the market price, checks spread, liquidity and UMA status, and files the forecast in
+          The probability that the token resolves YES. The server captures the market price, checks spread, 24 h volume (min_liquidity_usd) and UMA status, and files the forecast in
           its (category, horizon) bucket. A token’s active forecast can be superseded after 6 hours.
         </p>
         <label className="block text-sm text-gray-400">

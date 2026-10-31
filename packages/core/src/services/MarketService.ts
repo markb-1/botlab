@@ -65,6 +65,7 @@ const SEARCH_CACHE_MAX = 200;
 export class MarketService {
   private searchCache = new Map<string, { at: number; hits: GammaSearchHit[] }>();
   private searchBlockedUntil = 0;
+  private searchInflight = new Map<string, Promise<GammaSearchHit[]>>();
 
   constructor(
     private markets: MarketCacheService,
@@ -133,34 +134,60 @@ export class MarketService {
       }));
   }
 
-  /** Live Polymarket search via Gamma (text, open markets only by default, BotLab category filter) */
+  /**
+   * Live Polymarket search via Gamma (text, open markets only by default, BotLab category filter). Cached 60 s per
+   * query; a category-only search (no text: a fan-out over the category's Gamma tags) is fetched once at the maximum
+   * size and sliced per request, so different `limit`s share one fetch; concurrent identical searches share one
+   * in-flight request.
+   */
   async searchLive(input: { q?: unknown; active?: unknown; category?: unknown; limit?: unknown }) {
     const q = typeof input.q === 'string' ? input.q : '';
     const category = typeof input.category === 'string' && input.category.trim() ? input.category.trim() : undefined;
-    const limit = typeof input.limit === 'number' && input.limit > 0 ? input.limit : 50;
-    const opts = { q: q.trim().toLowerCase(), active: input.active !== false, ...(category ? { category } : {}), limit };
+    const limit = typeof input.limit === 'number' && input.limit > 0 ? Math.min(Math.floor(input.limit), 100) : 50;
+    const fanOut = !q.trim() && !!category;
+    const opts = { q: q.trim().toLowerCase(), active: input.active !== false, ...(category ? { category } : {}), limit: fanOut ? 100 : limit };
     const key = JSON.stringify(opts);
     const now = this.now();
     const hit = this.searchCache.get(key);
-    if (hit && now - hit.at < SEARCH_CACHE_MS) return hit.hits;
+    if (hit && now - hit.at < SEARCH_CACHE_MS) return hit.hits.slice(0, limit);
+    const pending = this.searchInflight.get(key);
+    if (pending) return (await pending).slice(0, limit);
     if (now < this.searchBlockedUntil) {
       throw new ServiceError('unavailable', `Polymarket search is rate-limited; try again in ${Math.ceil((this.searchBlockedUntil - now) / 1000)} s`);
     }
-    try {
-      const hits = await this.markets.searchGamma(opts);
-      if (this.searchCache.size >= SEARCH_CACHE_MAX) {
-        for (const [k, v] of this.searchCache) if (now - v.at >= SEARCH_CACHE_MS) this.searchCache.delete(k);
-        if (this.searchCache.size >= SEARCH_CACHE_MAX) this.searchCache.delete(this.searchCache.keys().next().value as string);
+    const run = (async () => {
+      try {
+        const hits = await this.markets.searchGamma(opts);
+        if (this.searchCache.size >= SEARCH_CACHE_MAX) {
+          for (const [k, v] of this.searchCache) if (now - v.at >= SEARCH_CACHE_MS) this.searchCache.delete(k);
+          if (this.searchCache.size >= SEARCH_CACHE_MAX) this.searchCache.delete(this.searchCache.keys().next().value as string);
+        }
+        this.searchCache.set(key, { at: now, hits });
+        return hits;
+      } catch (err) {
+        if (err instanceof GammaHttpError && err.status === 429) {
+          this.searchBlockedUntil = now + Math.min(Math.max(err.retryAfterMs ?? SEARCH_BACKOFF_MS, 5_000), 10 * 60_000);
+          throw new ServiceError('unavailable', 'Polymarket search is rate-limited by Polymarket; try again in a minute');
+        }
+        throw new ServiceError('unavailable', publicLookupError(err, 'Polymarket search'));
+      } finally {
+        this.searchInflight.delete(key);
       }
-      this.searchCache.set(key, { at: now, hits });
-      return hits;
-    } catch (err) {
-      if (err instanceof GammaHttpError && err.status === 429) {
-        this.searchBlockedUntil = now + Math.min(Math.max(err.retryAfterMs ?? SEARCH_BACKOFF_MS, 5_000), 10 * 60_000);
-        throw new ServiceError('unavailable', 'Polymarket search is rate-limited by Polymarket; try again in a minute');
-      }
-      throw new ServiceError('unavailable', publicLookupError(err, 'Polymarket search'));
-    }
+    })();
+    this.searchInflight.set(key, run);
+    return (await run).slice(0, limit);
+  }
+
+  /**
+   * Weight of a live search against the per-principal search rate limit: 1, or for a category-only search (a
+   * fan-out over the category's Gamma tags) one per 4 tags queried, at most 6.
+   */
+  searchCost(input: { q?: unknown; category?: unknown }): number {
+    const q = typeof input.q === 'string' ? input.q.trim() : '';
+    const category = typeof input.category === 'string' ? input.category.trim() : '';
+    if (q || !category) return 1;
+    const tags = this.markets.categorySearchTagCount(category);
+    return Math.min(Math.max(Math.ceil(tags / 4), 1), 6);
   }
 
   /**
@@ -244,9 +271,11 @@ export class MarketService {
       if (market.eventId && market.eventId !== market.marketId) {
         const ev = await fetchGammaEvent(this.extras.gammaUrl ?? GAMMA_API_URL, market.eventId, this.fetchFn);
         if (ev) {
-          related = ev.markets
-            .map((m) => parseGammaMarketFull(m))
-            .filter((m): m is NonNullable<typeof m> => !!m && m.marketId !== market.marketId)
+          const parsed = ev.markets.map((m) => parseGammaMarketFull(m)).filter((m): m is NonNullable<typeof m> => !!m);
+          // Event membership for the consistency checks (exclusive_sum / exhaustive, 5b)
+          if (parsed.length > 0) this.markets.recordEventMarkets(market.eventId, parsed.map((m) => m.marketId));
+          related = parsed
+            .filter((m) => m.marketId !== market.marketId)
             .map((m) => ({ marketId: m.marketId, question: m.question, endDate: m.endDate, closed: m.closed, outcomePrices: m.outcomePrices, cached: !!this.markets.getCached(m.marketId) }));
           relatedSource = 'gamma';
         }

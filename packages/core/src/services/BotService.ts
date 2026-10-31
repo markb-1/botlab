@@ -9,7 +9,8 @@
 import { DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_LINES, type BotActivityLog, type BotCustomEvent, type BotLogLine } from '../bots/BotActivityLog';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { WalletRepository } from '../db/repositories/WalletRepository';
-import type { ScriptRepository } from '../db/repositories/ScriptRepository';
+import { builtinRoleOf, isStandingRole, isStrategyRole, type ScriptRepository, type ScriptRow, type StrategyRole } from '../db/repositories/ScriptRepository';
+import { validateConfigAgainstSchema } from '../utils/configSchema';
 import type { OrderRepository, OrderRow } from '../db/repositories/OrderRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
@@ -24,7 +25,8 @@ import type { BotStage } from '../risk/types';
 import logger from '../utils/logger';
 import { ServiceError, conflict, notFound } from './errors';
 import type { BotCreateInput, BotUpdateInput } from './schemas';
-import type { LimitsConfig } from '../config/schema';
+import type { LimitsConfig, MandateConfig } from '../config/schema';
+import { copyLeadersOf, MAX_COPY_LEADERS, type CopyLeaderService } from './CopyLeaderService';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -186,6 +188,7 @@ function botRowToIpc(
     templateVersion: row.template_version ?? null,
     scriptRevision: script?.revision ?? null,
     scriptTrust: script?.trust ?? null,
+    role: builtinRoleOf(script),
     stageChangedAt: row.stage_changed_at ?? null,
     lastStartedAt: row.last_started_at,
     lastStoppedAt: row.last_stopped_at,
@@ -359,7 +362,43 @@ export interface BotServiceDeps {
   guardAgentRun?: (by: unknown, action: string) => void;
   /** Cached market question / outcome of a token (positions and orders views) */
   describeToken?: (tokenId: string) => { marketId: string; question: string; outcome: string | null } | null;
+  /** A token's market, refreshing the market cache from Gamma when needed (agent strategy-bot creates) */
+  lookupTokenMarketInfo?: (tokenId: string) => Promise<StrategyMarketInfo | null>;
+  /** A token's market from the cache only (agent strategy-bot config updates) */
+  cachedTokenMarketInfo?: (tokenId: string) => StrategyMarketInfo | null;
+  /** Every market of an event: `fetch` may call Gamma (creates), `cached` does not (updates) */
+  eventMarketIds?: { fetch: (eventId: string) => Promise<string[] | null>; cached: (eventId: string) => string[] | null };
+  /** A ledger forecast by id (resolution-rule `forecast_id`) */
+  getForecast?: (id: string) => { tokenId: string; status: string } | null;
+  /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
+  getMandate?: () => MandateConfig | null;
+  /** Copy-trading leader rows (5c): kept in step with a copy bot's config, dropped leaders stay dropped */
+  copyLeaders?: Pick<CopyLeaderService, 'sync' | 'blockedAmong' | 'forgetBot'>;
   now?: () => number;
+}
+
+/** What BotService needs to know about a strategy bot's market (from the market cache) */
+export interface StrategyMarketInfo {
+  marketId: string;
+  eventId: string;
+  negRisk: boolean;
+  endDate: string | null;
+  question: string;
+  tokens: Array<{ tokenId: string; outcome: string }>;
+}
+
+/** Mandate `strategies.allow` key of each builtin strategy role */
+const STRATEGY_KEYS: Record<StrategyRole, string> = { consistency: 'consistency', 'resolution-rule': 'resolution_rule', copy: 'copy' };
+
+/**
+ * The token ids a strategy-role bot's config trades (consistency: `tokens`; resolution-rule: `token_id`; copy: none —
+ * it follows leaders across markets and is not market-scoped).
+ */
+export function strategyConfigTokens(role: StrategyRole, config: Record<string, unknown> | undefined): string[] {
+  if (role === 'copy') return [];
+  const c = config ?? {};
+  const raw = role === 'consistency' ? (Array.isArray(c.tokens) ? c.tokens : []) : [c.token_id];
+  return [...new Set(raw.filter((t): t is string => typeof t === 'string' && t.trim() !== '').map((t) => t.trim()))];
 }
 
 /** A position from the order-linked fills the risk engine uses (spec §7.3 get_positions) */
@@ -428,6 +467,9 @@ export class BotService {
     const script = scriptRepo.findById(data.scriptId);
     if (!script) throw notFound('Script not found');
     if (script.kind !== 'template') deny('the agent can only create bots from templates (list_templates)');
+    // Standing builtin roles (executor, position manager) are set up by a human (R168)
+    const role = builtinRoleOf(script);
+    if (isStandingRole(role)) deny(`the ${role} template is a standing bot only a human can create`);
     const limits = this.deps.getLimits?.() ?? null;
     if (!limits) deny('limits unavailable (config invalid)', 'conflict');
     const { max_bots_created_per_day: perDay, max_active_bots: maxActive } = limits!.agent;
@@ -443,6 +485,106 @@ export class BotService {
     if (row.created_by === 'agent') return;
     this.deps.audit?.record('agent', action, row.id, undefined, 'denied: bot not created by the agent');
     throw new ServiceError('forbidden', `${action}: the agent may only do this for bots it created (pause_bot works on any bot)`);
+  }
+
+  /** The agent may not start, restart or reconfigure a bot on a standing builtin-role template (R168); denial audited */
+  private refuseAgentOnRole(row: { id: string; script_id: string }, action: string): void {
+    const role = builtinRoleOf(this.deps.scriptRepo.findById(row.script_id));
+    if (!isStandingRole(role)) return;
+    this.deps.audit?.record('agent', action, row.id, { role }, `denied: ${role} bot`);
+    throw new ServiceError('forbidden', `${action}: ${role} bots are standing bots managed by a human (the agent may only pause them)`);
+  }
+
+  /**
+   * Agent bots on the builtin strategy templates (consistency, resolution-rule; 5b): the strategy must be allowed by
+   * the mandate (`strategies.allow`), the config must match the template's configSchema, and the bot's market_ids
+   * must cover the market of every token in the config (resolved through the market cache; unknown ⇒ refused).
+   * `resolve` maps a token to its condition id (cached; create pre-fetches unknown tokens). Denials are audited.
+   * Does nothing for any other script.
+   */
+  private checkAgentStrategyBot(
+    script: ScriptRow | undefined,
+    config: Record<string, unknown> | undefined,
+    marketIds: string[] | null | undefined,
+    action: string,
+    target: string | null,
+    resolve: (tokenId: string) => StrategyMarketInfo | null,
+    eventMarkets: (eventId: string) => string[] | null
+  ): void {
+    const role = builtinRoleOf(script);
+    if (!isStrategyRole(role) || !script) return;
+    const deny = (why: string): never => {
+      this.deps.audit?.record('agent', action, target, { role, marketIds: marketIds ?? null }, `denied: ${why}`);
+      throw new ServiceError('forbidden', `${action === 'bot.create' ? 'bots.create' : 'bots.update'}: ${why}`);
+    };
+    const mandate = this.deps.getMandate?.() ?? null;
+    if (this.deps.getMandate && !mandate) deny('mandate unavailable (config invalid)');
+    if (mandate && !mandate.strategies.allow.includes(STRATEGY_KEYS[role])) deny(`strategy ${STRATEGY_KEYS[role]} is not in mandate.strategies.allow`);
+    let schema: unknown = {};
+    try {
+      schema = JSON.parse(script.config_schema || '{}');
+    } catch {
+      schema = {};
+    }
+    const errors = validateConfigAgainstSchema(config, schema);
+    if (errors.length > 0) deny(`config does not match the ${role} template: ${errors.slice(0, 5).join('; ')}`);
+    if (role === 'copy') {
+      // Copy bots (5c, spec §9.5) follow leaders, not tokens: valid leader addresses, a dropped leader is not re-added
+      const { leaders, invalid } = copyLeadersOf(config);
+      if (invalid.length > 0) deny(`leaders must be 0x addresses (not ${invalid.slice(0, 3).join(', ')})`);
+      if (leaders.length === 0) deny('config names no leader (leaders: [0x…]; get_leaderboard proposes some)');
+      if (leaders.length > MAX_COPY_LEADERS) deny(`at most ${MAX_COPY_LEADERS} leaders per bot`);
+      // Dropped anywhere (any bot, also a deleted one) ⇒ blocked for the agent until a human re-activates it
+      const dropped = this.deps.copyLeaders?.blockedAmong(target, leaders) ?? [];
+      if (dropped.length > 0) deny(`leader ${dropped[0]} was dropped for losing copies; only a human can re-activate it`);
+      return;
+    }
+    const tokens = strategyConfigTokens(role, config);
+    if (tokens.length === 0) deny(`config names no token (${role === 'consistency' ? 'tokens' : 'token_id'})`);
+    if (!marketIds || marketIds.length === 0) deny(`${role} bots need marketIds covering every token in the config`);
+    const infos: StrategyMarketInfo[] = [];
+    for (const t of tokens) {
+      const info = resolve(t);
+      if (!info) deny(`token ${t} is unknown to the market cache (open it with get_market first)`);
+      if (!marketIds!.includes(info!.marketId)) deny(`token ${t} belongs to market ${info!.marketId}, which is not in the bot's marketIds`);
+      infos.push(info!);
+    }
+    const c = config ?? {};
+    if (role === 'consistency') {
+      // The same structural rules the template checks at start (5b review): YES tokens of binary markets, ladder
+      // end dates known and ordered, exclusive sums inside one event, exhaustive sets covering the whole event
+      infos.forEach((m, i) => {
+        const own = m.tokens.find((x) => x.tokenId === tokens[i]);
+        if (m.tokens.length !== 2 || !own || !/^yes$/i.test(own.outcome)) deny(`token ${tokens[i]} is not the YES token of a binary market`);
+      });
+      if (new Set(infos.map((m) => m.marketId)).size !== infos.length) deny('every token must be in a different market');
+      if (c.constraint === 'date_ladder') {
+        for (const m of infos) if (!m.endDate || !Number.isFinite(Date.parse(m.endDate))) deny(`date_ladder: "${m.question}" has no known end date`);
+        for (let i = 1; i < infos.length; i++) {
+          if (Date.parse(infos[i - 1].endDate as string) > Date.parse(infos[i].endDate as string)) deny('date_ladder tokens must be ordered by deadline (earliest first)');
+        }
+      }
+      if (c.constraint === 'exclusive_sum') {
+        if (new Set(infos.map((m) => m.eventId)).size !== 1) deny('exclusive_sum: every token must be a market of the same event');
+        if (infos.some((m) => m.negRisk) && !infos.every((m) => m.negRisk)) deny('exclusive_sum: mixed negRisk and plain markets');
+        if (c.exhaustive === true) {
+          if (!infos.every((m) => m.negRisk)) deny('exhaustive: the legs must be the markets of one negRisk event');
+          const all = eventMarkets(infos[0].eventId);
+          if (!all) deny('exhaustive: the event\'s market list is unknown (get_market on a leg loads it)');
+          const legSet = new Set(infos.map((m) => m.marketId));
+          if (all!.length !== infos.length || all!.some((id) => !legSet.has(id))) {
+            deny(`exhaustive: the event has ${all!.length} markets but the config has ${infos.length} legs (every outcome must be a leg)`);
+          }
+        }
+      }
+    }
+    if (role === 'resolution-rule' && typeof c.forecast_id === 'string' && c.forecast_id.trim()) {
+      const f = this.deps.getForecast?.(c.forecast_id.trim()) ?? null;
+      if (!f) deny(`forecast ${c.forecast_id} not found`);
+      if (f!.status !== 'active') deny(`forecast ${c.forecast_id} is ${f!.status}, not active`);
+      const own = infos[0];
+      if (!own.tokens.some((x) => x.tokenId === f!.tokenId)) deny(`forecast ${c.forecast_id} is on token ${f!.tokenId}, not ${tokens[0]} or its complement`);
+    }
   }
 
   list(filter?: { scriptId?: string; status?: string }): IpcBot[] {
@@ -472,6 +614,29 @@ export class BotService {
     if (who.kind === 'agent') {
       this.deps.guardAgentRun?.(who, 'bot.create');
       this.checkAgentCreate(data);
+      const script = scriptRepo.findById(data.scriptId);
+      const role = builtinRoleOf(script);
+      const markets = new Map<string, StrategyMarketInfo | null>();
+      const events = new Map<string, string[] | null>();
+      if (isStrategyRole(role)) {
+        // Resolve the config's tokens (and an exhaustive set's event) first — may refresh from Gamma — then check
+        for (const t of strategyConfigTokens(role, data.config).slice(0, 20)) {
+          try {
+            markets.set(t, this.deps.lookupTokenMarketInfo ? await this.deps.lookupTokenMarketInfo(t) : (this.deps.cachedTokenMarketInfo?.(t) ?? null));
+          } catch {
+            markets.set(t, null);
+          }
+        }
+        const firstEvent = [...markets.values()].find((m) => m)?.eventId;
+        if (firstEvent && data.config?.exhaustive === true && this.deps.eventMarketIds) {
+          try {
+            events.set(firstEvent, await this.deps.eventMarketIds.fetch(firstEvent));
+          } catch {
+            events.set(firstEvent, null);
+          }
+        }
+      }
+      this.checkAgentStrategyBot(script, data.config, data.marketIds, 'bot.create', null, (t) => markets.get(t) ?? null, (e) => events.get(e) ?? null);
     }
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
@@ -507,6 +672,7 @@ export class BotService {
       createdBy: who.kind,
       marketIds: data.marketIds ?? null,
     });
+    if (builtinRoleOf(script) === 'copy') this.deps.copyLeaders?.sync(row.id, data.config, who.kind);
     audit?.record(actor, 'bot.create', row.id, {
       name: data.name,
       scriptId: data.scriptId,
@@ -536,7 +702,22 @@ export class BotService {
     }
     const before = botRepo.findById(id);
     if (!before) throw notFound('Bot not found');
-    if (who.kind === 'agent') this.requireAgentOwned(before, 'bot.update');
+    if (who.kind === 'agent') {
+      this.refuseAgentOnRole(before, 'bot.update');
+      this.requireAgentOwned(before, 'bot.update');
+      // A strategy bot's new config must still match its template and stay within its market_ids (cached markets)
+      if (data.config !== undefined) {
+        this.checkAgentStrategyBot(
+          scriptRepo.findById(before.script_id),
+          data.config,
+          parseMarketIds(before.market_ids),
+          'bot.update',
+          id,
+          (t) => this.deps.cachedTokenMarketInfo?.(t) ?? null,
+          (e) => this.deps.eventMarketIds?.cached(e) ?? null
+        );
+      }
+    }
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {
       const blocked = walletChangeBlocker(id, tradeRepo, orderRepo);
       if (blocked) {
@@ -564,6 +745,16 @@ export class BotService {
       botRepo.setTemplateVersion(id, script?.revision ?? null);
     }
     const fresh = botRepo.findById(id) ?? row;
+    // Copy bots (5c): leader rows follow the config (takes effect at the bot's next start, like any config change)
+    if ((data.config !== undefined || data.scriptId !== undefined) && builtinRoleOf(scriptRepo.findById(fresh.script_id)) === 'copy') {
+      let cfg: Record<string, unknown> = {};
+      try {
+        cfg = JSON.parse(fresh.config || '{}') as Record<string, unknown>;
+      } catch {
+        cfg = {};
+      }
+      this.deps.copyLeaders?.sync(id, cfg, who.kind);
+    }
     return this.toView(fresh);
   }
 
@@ -585,6 +776,7 @@ export class BotService {
     if (!deleted) throw conflict('Bot not found or cannot be deleted (must be stopped)');
     audit?.record(actor, 'bot.delete', id, { name: botRow?.name, scriptId: botRow?.script_id, stage: botRow?.stage });
     this.deps.activity?.forget(id);
+    this.deps.copyLeaders?.forgetBot(id);
 
     // Clean up auto-generated paper wallet
     if (isPaperWallet && paperWalletId) {
@@ -597,6 +789,7 @@ export class BotService {
     if (who.kind === 'agent') {
       const row = this.deps.botRepo.findById(id);
       if (!row) throw notFound('Bot not found');
+      this.refuseAgentOnRole(row, 'bot.start');
       this.requireAgentOwned(row, 'bot.start');
     }
     await this.manager().startBot(id, auditActorOf(who));
@@ -638,12 +831,34 @@ export class BotService {
     return this.get(id);
   }
 
+  /**
+   * A bot retiring itself (ctx.requestRetire, 5b): only ever this bot, only towards `retired` (less risk), so no
+   * transport actor is involved — BotManager forwards the request of the running script, audited as `bot:<id>`.
+   * Not exposed on HTTP / MCP. Returns false when the bot is gone or already retired.
+   */
+  async retireByBot(id: string, reason: string): Promise<boolean> {
+    const { botRepo, audit } = this.deps;
+    const row = botRepo.findById(id);
+    if (!row || row.stage === 'retired') return false;
+    const why = `self: ${String(reason).trim().slice(0, 500) || 'no reason given'}`;
+    try {
+      if (row.status !== 'stopped') await this.manager().stopBot(id, `bot:${id}`);
+    } catch (err) {
+      logger.warning(`[BotService] Stopping bot ${id} for its retire request failed: ${err instanceof Error ? err.message : err}`);
+    }
+    botRepo.retire(id, why);
+    botRepo.setPausedBy(id, null);
+    audit?.record(`bot:${id}`, 'bot.stage', id, { from: row.stage, to: 'retired', reason: why });
+    return true;
+  }
+
   /** Restart (starts a stopped bot too): the agent needs ownership exactly as for start (R134) */
   async restart(id: string, by: Actor): Promise<void> {
     const who = requireActor(by, ['human', 'agent', 'system'], 'bots.restart');
     if (who.kind === 'agent') {
       const row = this.deps.botRepo.findById(id);
       if (!row) throw notFound('Bot not found');
+      this.refuseAgentOnRole(row, 'bot.restart');
       this.requireAgentOwned(row, 'bot.restart');
     }
     await this.manager().restartBot(id, auditActorOf(who));

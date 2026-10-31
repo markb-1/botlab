@@ -376,6 +376,8 @@ export class SnapshotMarket {
   }
 }
 
+import { defaultExitPolicy } from '../runtime/RpcHandler';
+
 const disabled = (what: string) => async () => {
   throw new Error(`${what} is not available in snapshot backtests`);
 };
@@ -443,8 +445,12 @@ function buildCtx(market: SnapshotMarket, mem: InMemoryStorageRepo, input: Snaps
       cancelAll: async () => market.cancelAll(),
       getOpenOrders: async () => market.openOrders(),
       getFee: async (tokenId: string) => input.fees[tokenId] ?? input.defaultFees,
+      getMarket: disabled('getMarket'),
+      getEventMarketIds: disabled('getEventMarketIds'),
     },
-    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false }) },
+    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false, ordersPerHour: null, ordersRemainingThisHour: null, maxRestingTtlMinutes: null }), getExitFlags: async () => [], getExitPolicy: async () => defaultExitPolicy(), getMandateSummary: async () => null, getFlaggedTokens: async () => [], getRecentStops: async () => [] },
+    copy: { getLeaders: disabled('copy.getLeaders'), getHoldings: disabled('copy.getHoldings') },
+    requestRetire: async () => ({ accepted: false }),
     ledger: { getActiveForecasts: async () => [], getForecast: async () => null },
   } as unknown as BotContext;
 }

@@ -13,6 +13,9 @@ import { PaperTradingState } from './PaperTradingState';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { OrderService } from '../orders/OrderService';
+import type { PortfolioAccess } from '../orders/PortfolioService';
+import type { BuiltinRole } from '../db/repositories/ScriptRepository';
+import type { BotPushEventName } from '../sdk/types';
 import logger from '../utils/logger';
 
 /** Builds the bot's OrderService (BotManager supplies it; throws if orders cannot be risk-checked). */
@@ -44,9 +47,34 @@ export interface ScriptBotRunnerDeps {
   fetchAllowlist?: readonly string[] | (() => readonly string[] | undefined);
   /** Forecast ledger, read-only for bots (ctx.ledger) */
   ledger?: LedgerReader;
+  /** Standing builtin role of the script (BotManager, from the script row) */
+  role?: BuiltinRole | null;
+  /**
+   * ctx.portfolio for the builtin position manager: built once the bot's mode is known. Never set for
+   * other scripts.
+   */
+  createPortfolio?: (args: { botId: string; simulated: boolean }) => PortfolioAccess;
+  /** ctx.polymarket.getMarket (market cache) */
+  getMarket?: RpcHandlerDeps['getMarket'];
+  /** The bot's current market_ids (null = unscoped) */
+  marketScope?: RpcHandlerDeps['marketScope'];
+  /** Open exit flags on this bot's positions; the runner passes its mode */
+  exitFlags?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitFlags']>>;
+  /** ctx.requestRetire */
+  requestRetire?: RpcHandlerDeps['requestRetire'];
+  /** The Position Manager's exit thresholds; the runner passes its mode */
+  exitPolicy?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitPolicy']>>;
+  /** ctx.polymarket.getEventMarketIds */
+  eventMarketIds?: RpcHandlerDeps['eventMarketIds'];
+  /** Flagged tokens on any bot's position; the runner passes its mode (ctx.risk.getFlaggedTokens) */
+  flaggedTokens?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['flaggedTokens']>>;
+  /** ctx.risk.getMandateSummary */
+  mandateSummary?: RpcHandlerDeps['mandateSummary'];
+  /** ctx.copy and copy-order attribution: builtin Copy Trading template only */
+  copy?: RpcHandlerDeps['copy'];
 }
 
-const DEFAULT_PAPER_BALANCE = 10_000;
+export const DEFAULT_PAPER_BALANCE = 10_000;
 
 export class ScriptBotRunner extends BaseBotRunner {
   private scriptRunner: ScriptRunner | null = null;
@@ -85,6 +113,19 @@ export class ScriptBotRunner extends BaseBotRunner {
       binanceApiSecret: this.deps.binanceApiSecret,
       fetchAllowlist: this.deps.fetchAllowlist,
       ledger: this.deps.ledger,
+      role: this.deps.role ?? null,
+      ...(this.deps.role === 'position-manager' && this.deps.createPortfolio
+        ? { portfolio: this.deps.createPortfolio({ botId: this.botId, simulated: this.deps.mode === 'paper' }) }
+        : {}),
+      getMarket: this.deps.getMarket,
+      marketScope: this.deps.marketScope,
+      ...(this.deps.exitFlags ? { exitFlags: () => this.deps.exitFlags!(this.deps.mode === 'paper') } : {}),
+      requestRetire: this.deps.requestRetire,
+      ...(this.deps.exitPolicy ? { exitPolicy: () => this.deps.exitPolicy!(this.deps.mode === 'paper') } : {}),
+      eventMarketIds: this.deps.eventMarketIds,
+      mandateSummary: this.deps.mandateSummary,
+      ...(this.deps.flaggedTokens ? { flaggedTokens: () => this.deps.flaggedTokens!(this.deps.mode === 'paper') } : {}),
+      ...(this.deps.role === 'copy' && this.deps.copy ? { copy: this.deps.copy } : {}),
     };
 
     // Create paper trading state if in paper mode
@@ -153,6 +194,11 @@ export class ScriptBotRunner extends BaseBotRunner {
 
     // Start the script
     await this.scriptRunner.start();
+  }
+
+  /** ctx.events push (spec §5.2); dropped while the worker is not running. */
+  pushEvent(name: BotPushEventName, data: Record<string, unknown>): void {
+    this.scriptRunner?.pushEvent(name, data);
   }
 
   protected async doStop(): Promise<void> {

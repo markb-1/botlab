@@ -57,7 +57,7 @@ export function Risk() {
           file="mandate"
           intro={
             <p>
-              What may be traded: budget, allowed / later / denied categories, horizon and liquidity, strategies. Only <code>allow</code> categories can ever
+              What may be traded: budget, allowed / later / denied categories, horizon and minimum 24 h volume (min_liquidity_usd), strategies. Only <code>allow</code> categories can ever
               trade.
             </p>
           }

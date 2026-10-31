@@ -10,7 +10,8 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail, MandateSummary, FlaggedToken, CopyLeaderStatus, CopyOrderTag } from '../sdk/types';
+import type { MarketView } from '../ledger/MarketCacheService';
 import type { ForecastView } from '../ledger/LedgerService';
 import type { PaperTradingState } from './PaperTradingState';
 import {
@@ -27,13 +28,15 @@ import {
 import type { BinanceCredentials } from '../exchange/binance/client';
 import { toTradeResult, type OrderResult, type OrderService } from '../orders/OrderService';
 import { scriptFetch } from './scriptFetch';
+import type { BuiltinRole } from '../db/repositories/ScriptRepository';
+import type { PortfolioAccess } from '../orders/PortfolioService';
 
 /** ctx.fetch requests a bot may have in flight; more are rejected at once (spec §5.1 hardening). */
 export const MAX_CONCURRENT_FETCHES = 6;
 import logger from '../utils/logger';
 
 /** A forecast with its bucket's current rights (live). */
-export type LiveForecast = ForecastView & { bucketState: string | null; tradeableNow: boolean };
+export type LiveForecast = ForecastView & { bucketState: string | null; tradeableNow: boolean; complementTokenId?: string | null; endDate?: string | null; bucketAllocationUsd?: number | null };
 
 /** Read-only ledger access for bots (spec §5.2: bots may read ledger data, never write it). */
 export interface LedgerReader {
@@ -63,6 +66,9 @@ export function toBotForecast(f: LiveForecast): BotForecast {
     rationale: f.rationale,
     sources: f.sources,
     createdAt: f.createdAt,
+    complementTokenId: f.complementTokenId ?? null,
+    endDate: f.endDate ?? null,
+    bucketAllocationUsd: f.bucketAllocationUsd ?? null,
   };
 }
 
@@ -91,6 +97,71 @@ export interface RpcHandlerDeps {
   fetchImpl?: typeof fetch;
   /** Forecast ledger (ctx.ledger); missing ⇒ ledger calls fail */
   ledger?: LedgerReader;
+  /** Standing role of the bot's script (builtin templates only; BotManager reads it from the script row) */
+  role?: BuiltinRole | null;
+  /** ctx.portfolio bound to this bot: given only to the builtin position manager; missing ⇒ portfolio calls fail */
+  portfolio?: PortfolioAccess;
+  /** Market cache lookup by condition id or token id (ctx.polymarket.getMarket); missing ⇒ getMarket fails */
+  getMarket?: (idOrTokenId: string) => Promise<MarketView | null>;
+  /** The bot's market_ids now (null = not market-scoped), for MarketDetail.inScope */
+  marketScope?: () => string[] | null;
+  /** Open exit flags on this bot's positions in its mode (ctx.risk.getExitFlags) */
+  exitFlags?: () => BotExitFlag[];
+  /** The Position Manager's exit thresholds in this bot's mode (ctx.risk.getExitPolicy) */
+  exitPolicy?: () => ExitPolicy;
+  /** Every market of an event (ctx.polymarket.getEventMarketIds) */
+  eventMarketIds?: (eventId: string) => Promise<string[] | null>;
+  /** Retire this bot (ctx.requestRetire): BotManager runs it after the reply, outside the RPC */
+  requestRetire?: (reason: string) => void;
+  /** Tokens with an open exit flag on any bot's position in this bot's mode (ctx.risk.getFlaggedTokens) */
+  flaggedTokens?: () => FlaggedToken[];
+  /** The mandate's market filters (ctx.risk.getMandateSummary); null = config invalid */
+  mandateSummary?: () => MandateSummary | null;
+  /** Copy-trading leaders (5c): given only to the builtin Copy Trading template; missing ⇒ ctx.copy fails, orders are not attributed */
+  copy?: {
+    getLeaders(addresses: unknown): CopyLeaderStatus[];
+    getHoldings(tokenId: string, simulated: boolean): { byLeader: Record<string, number>; attributed: number };
+    recordOrder(orderId: string, info: { leader: string; key?: string | null; side: 'buy' | 'sell'; leaderPrice?: number | null; leaderUsd?: number | null }): void;
+  };
+}
+
+/** Ambiguity at or above which the Position Manager exits (its `ambiguity` trigger); the template reads it from here */
+export const POSITION_MANAGER_AMBIGUITY_EXIT = 2;
+/** Last-resort exit window when neither a Position Manager bot nor its template schema says (its template default) */
+export const POSITION_MANAGER_EXIT_WINDOW_FALLBACK = 180;
+
+export function defaultExitPolicy(): ExitPolicy {
+  return { exitBeforeEndMinutes: POSITION_MANAGER_EXIT_WINDOW_FALLBACK, ambiguityExitScore: POSITION_MANAGER_AMBIGUITY_EXIT, source: 'template-default' };
+}
+
+/** A market cache row as a bot sees it (ctx.polymarket.getMarket). */
+export function toMarketDetail(m: MarketView, askedFor: string, scope: string[] | null): MarketDetail {
+  const tokens = m.tokens.map((t) => ({ tokenId: t.tokenId, outcome: t.outcome }));
+  const asked = tokens.find((t) => t.tokenId === askedFor) ?? null;
+  const other = asked && tokens.length === 2 ? (tokens.find((t) => t.tokenId !== asked.tokenId) ?? null) : null;
+  return {
+    marketId: m.marketId,
+    eventId: m.eventId,
+    question: m.question,
+    category: m.category,
+    endDate: m.endDate,
+    active: m.active,
+    closed: m.closed,
+    negRisk: m.negRisk,
+    tokens,
+    tokenId: asked?.tokenId ?? null,
+    outcome: asked?.outcome ?? null,
+    complementTokenId: other?.tokenId ?? null,
+    ambiguityScore: m.ambiguityScore,
+    rulesHash: m.rulesHash,
+    rulesChangedAt: m.rulesChangedAt,
+    disputed: m.disputed,
+    umaResolutionStatus: m.umaResolutionStatus,
+    inScope: scope === null || scope.includes(m.marketId),
+    liquidityUsd: m.liquidityUsd,
+    volume24hUsd: m.volume24hUsd,
+    updatedAt: m.updatedAt,
+  };
 }
 
 /** Legacy ctx.binance.buy/sell result from an OrderService result. */
@@ -144,6 +215,16 @@ export class RpcHandler {
     return this.deps.ledger;
   }
 
+  private get portfolio(): PortfolioAccess {
+    if (!this.deps.portfolio) throw new Error('ctx.portfolio is only available to bots running the builtin Position Manager template');
+    return this.deps.portfolio;
+  }
+
+  /** The position manager only reduces positions: every buy path is refused for it (server-side, 5a). */
+  private refuseBuy(what: string): void {
+    if (this.deps.role === 'position-manager') throw new Error(`${what}: the position manager cannot buy`);
+  }
+
   private get orders(): OrderService {
     if (!this.deps.orderService) throw new Error('Order service unavailable: orders are disabled');
     return this.deps.orderService;
@@ -165,6 +246,7 @@ export class RpcHandler {
 
       // All order methods go through OrderService (risk checks; paper fills in paper mode)
       case 'polymarket:buy': {
+        this.refuseBuy('buy');
         const opts = orderOpts(args[2]);
         const result = await this.orders.placeMarketable({
           tokenId: args[0] as string,
@@ -178,6 +260,8 @@ export class RpcHandler {
         return toTradeResult(result);
       }
 
+      // A script can never flag its own order as a risk exit (exemptions from hold time, rate, size and stage):
+      // only the position manager's PortfolioService sets riskExit (R169)
       case 'polymarket:sell': {
         const opts = orderOpts(args[2]);
         const result = await this.orders.placeMarketable({
@@ -188,14 +272,14 @@ export class RpcHandler {
           maxSlippage: opts.maxSlippage,
           reason: opts.reason,
           forecastId: opts.forecastId,
-          riskExit: opts.riskExit,
         });
         return toTradeResult(result);
       }
 
       case 'polymarket:placeLimit': {
         const opts = (args[4] && typeof args[4] === 'object' ? args[4] : {}) as LimitOrderOpts;
-        return this.orders.placeLimit({
+        if (args[1] !== 'sell') this.refuseBuy('placeLimit');
+        const result = await this.orders.placeLimit({
           tokenId: args[0] as string,
           side: args[1] as 'buy' | 'sell',
           price: args[2] as number,
@@ -204,8 +288,23 @@ export class RpcHandler {
           ttlMinutes: opts.ttlMinutes,
           reason: opts.reason,
           forecastId: opts.forecastId,
-          riskExit: opts.riskExit,
         });
+        // Copy bots (5c): which leader trade the order copies, for the per-leader P&L (only the copy template's bots)
+        const tag = opts.copy as CopyOrderTag | undefined;
+        if (this.deps.copy && tag && typeof tag === 'object' && typeof tag.leader === 'string' && result.ok && result.orderId) {
+          try {
+            this.deps.copy.recordOrder(result.orderId, {
+              leader: tag.leader,
+              key: typeof tag.key === 'string' ? tag.key : null,
+              side: args[1] === 'sell' ? 'sell' : 'buy',
+              leaderPrice: typeof tag.leaderPrice === 'number' ? tag.leaderPrice : null,
+              leaderUsd: typeof tag.leaderUsd === 'number' ? tag.leaderUsd : null,
+            });
+          } catch (err) {
+            logger.warning(`[RpcHandler] Copy attribution of order ${result.orderId} failed: ${err instanceof Error ? err.message : err}`);
+          }
+        }
+        return result;
       }
 
       case 'polymarket:cancel':
@@ -222,11 +321,65 @@ export class RpcHandler {
       case 'polymarket:getOpenOrders':
         return this.orders.getOpenOrders();
 
+      case 'polymarket:getOrderHistory':
+        return this.orders.getOrderHistory(typeof args[0] === 'number' ? args[0] : undefined);
+
       case 'polymarket:getFee':
         return this.orders.getFee(args[0] as string);
 
       case 'risk:getBudget':
         return this.orders.getBudget();
+
+      case 'risk:getExitFlags':
+        return this.deps.exitFlags ? this.deps.exitFlags() : [];
+
+      case 'risk:getExitPolicy':
+        return this.deps.exitPolicy ? this.deps.exitPolicy() : defaultExitPolicy();
+
+      case 'risk:getMandateSummary':
+        return this.deps.mandateSummary ? this.deps.mandateSummary() : null;
+
+      case 'risk:getFlaggedTokens':
+        return this.deps.flaggedTokens ? this.deps.flaggedTokens() : [];
+
+      case 'risk:getRecentStops': {
+        const tokenId = args[0];
+        if (tokenId !== undefined && tokenId !== null && (typeof tokenId !== 'string' || tokenId.length > 100)) throw new Error('getRecentStops: token id must be a string');
+        return this.orders.getRecentStops(typeof tokenId === 'string' && tokenId.trim() ? tokenId.trim() : undefined);
+      }
+
+      case 'copy:getLeaders':
+        if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');
+        return this.deps.copy.getLeaders(args[0]);
+
+      case 'copy:getHoldings': {
+        if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');
+        const tokenId = args[0];
+        if (typeof tokenId !== 'string' || !tokenId.trim() || tokenId.length > 100) throw new Error('getHoldings: a token id is required');
+        return this.deps.copy.getHoldings(tokenId.trim(), this.isPaper);
+      }
+
+      case 'polymarket:getEventMarketIds': {
+        const eventId = args[0];
+        if (typeof eventId !== 'string' || !eventId.trim() || eventId.length > 100) throw new Error('getEventMarketIds: an event id is required');
+        return this.deps.eventMarketIds ? this.deps.eventMarketIds(eventId.trim()) : null;
+      }
+
+      case 'polymarket:getMarket': {
+        const id = args[0];
+        if (typeof id !== 'string' || !id.trim() || id.length > 100) throw new Error('getMarket: a condition id or token id is required');
+        if (!this.deps.getMarket) throw new Error('getMarket: market data unavailable');
+        const m = await this.deps.getMarket(id.trim());
+        return m ? toMarketDetail(m, id.trim(), this.deps.marketScope ? this.deps.marketScope() : null) : null;
+      }
+
+      case 'bot:requestRetire': {
+        const reason = typeof args[0] === 'string' ? args[0].trim().slice(0, 500) : '';
+        if (!reason) throw new Error('requestRetire: a reason is required');
+        if (!this.deps.requestRetire) return { accepted: false };
+        this.deps.requestRetire(reason);
+        return { accepted: true };
+      }
 
       case 'ledger:getActiveForecasts': {
         const filter = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as { category?: unknown; tradeableOnly?: unknown };
@@ -245,6 +398,27 @@ export class RpcHandler {
         return f ? toBotForecast(f) : null;
       }
 
+      // === Portfolio (builtin position manager only; scoped by the server, not by the script) ===
+
+      case 'portfolio:getAllPositions':
+        return this.portfolio.getAllPositions();
+
+      case 'portfolio:getExitFlags':
+        return this.portfolio.getExitFlags();
+
+      case 'portfolio:getCapitalDemand':
+        return this.portfolio.getCapitalDemand();
+
+      case 'portfolio:ackExitFlag':
+        return this.portfolio.ackExitFlag(args[0], args[1]);
+
+      case 'portfolio:exit':
+        return this.portfolio.exit(args[0]);
+
+      case 'portfolio:cancelExit':
+        await this.portfolio.cancelExit(args[0]);
+        return;
+
       case 'polymarket:getOrderBook':
         return getOrderBook(
           this.deps.clobClient,
@@ -253,7 +427,13 @@ export class RpcHandler {
 
       case 'polymarket:getPositions': {
         if (this.isPaper) {
-          return this.paperState!.getPositions();
+          // Paper state does not know markets: take the condition id from the bot's order-linked paper fills
+          const markets = new Map(
+            this.deps.tradeRepo
+              .getRiskPositions({ simulated: true, botId: this.deps.botId, exchange: 'polymarket' })
+              .map((p) => [p.symbol, p.condition_id] as const)
+          );
+          return this.paperState!.getPositions().map((p) => (p.conditionId || !markets.get(p.tokenId) ? p : { ...p, conditionId: markets.get(p.tokenId) ?? undefined }));
         }
         // Live: this bot's order-linked holdings, i.e. exactly what the risk engine lets it sell (R8).
         // Valued at cost (no mark); currentValue = cost basis.
@@ -371,6 +551,7 @@ export class RpcHandler {
       // === Binance Spot Trading ===
 
       case 'binance:buy': {
+        this.refuseBuy('binance.buy');
         const symbol = args[0] as string;
         const result = await this.orders.placeBinance({ symbol, side: 'buy', amount: args[1] as number });
         return toBinanceTradeResult(symbol, 'BUY', result);

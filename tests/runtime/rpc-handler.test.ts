@@ -116,12 +116,21 @@ describe('RpcHandler', () => {
       expect(resp.result).toMatchObject({ success: true, executedAmount: 50, price: 0.5, tokenAmount: 100, orderId: 'o1' });
     });
 
-    it('sell passes riskExit and minPrice', async () => {
+    it('sell passes minPrice but never a script-supplied riskExit (R169)', async () => {
       const { orderService, handler } = withOrderService();
       await handler.handle(makeReq('polymarket:sell', ['token1', 100, { minPrice: 0.4, riskExit: true }]));
       expect(orderService.placeMarketable).toHaveBeenCalledWith(
-        expect.objectContaining({ tokenId: 'token1', side: 'sell', amount: 100, minPrice: 0.4, riskExit: true })
+        expect.objectContaining({ tokenId: 'token1', side: 'sell', amount: 100, minPrice: 0.4 })
       );
+      expect(orderService.placeMarketable.mock.calls[0][0].riskExit).toBeUndefined();
+    });
+
+    it('placeLimit drops a script-supplied riskExit (R169)', async () => {
+      const { orderService, handler } = withOrderService();
+      (orderService as any).placeLimit = vi.fn().mockResolvedValue({ ok: true, status: 'open' });
+      await handler.handle(makeReq('polymarket:placeLimit', ['token1', 'sell', 0.6, 10, { riskExit: true, reason: 'x' }]));
+      expect((orderService as any).placeLimit).toHaveBeenCalledWith(expect.objectContaining({ tokenId: 'token1', side: 'sell', reason: 'x' }));
+      expect((orderService as any).placeLimit.mock.calls[0][0].riskExit).toBeUndefined();
     });
 
     it('risk rejection is returned as a typed result, not an RPC error', async () => {
@@ -176,10 +185,17 @@ describe('RpcHandler', () => {
 
   describe('getPositions', () => {
     it('should return paper positions in paper mode', async () => {
+      const getRiskPositions = vi.fn().mockReturnValue([
+        { bot_id: 'bot-1', exchange: 'polymarket', symbol: 't1', condition_id: '0xm', net_quantity: 100, cost_basis: 60 },
+      ]);
+      (deps.tradeRepo as any).getRiskPositions = getRiskPositions;
       const resp = await paperHandler.handle(makeReq('polymarket:getPositions'));
       expect(paperState.getPositions).toHaveBeenCalled();
       expect(getPositions).not.toHaveBeenCalled();
       expect(resp.result).toHaveLength(1);
+      // The market of each paper position comes from its order-linked paper fills (executor per-market cap)
+      expect(getRiskPositions).toHaveBeenCalledWith({ simulated: true, botId: 'bot-1', exchange: 'polymarket' });
+      expect(resp.result[0]).toMatchObject({ tokenId: 't1', conditionId: '0xm' });
     });
 
     it("should return the bot's order-linked live positions in live mode", async () => {
@@ -318,6 +334,55 @@ describe('RpcHandler', () => {
     it('should return error', async () => {
       const resp = await liveHandler.handle(makeReq('badMethod'));
       expect(resp.error).toContain('Unknown RPC method: badMethod');
+    });
+  });
+
+  describe('5b: getMarket, getExitFlags, requestRetire', () => {
+    const view = (over: Record<string, unknown> = {}) =>
+      ({
+        marketId: '0xm1',
+        eventId: 'e1',
+        question: 'Q?',
+        category: 'economics',
+        endDate: null,
+        active: true,
+        closed: false,
+        negRisk: false,
+        tokens: [
+          { tokenId: 'yes', outcome: 'Yes' },
+          { tokenId: 'no', outcome: 'No' },
+        ],
+        ambiguityScore: 1,
+        rulesHash: 'h',
+        rulesChangedAt: null,
+        disputed: false,
+        umaResolutionStatus: null,
+        updatedAt: '2026-06-01T00:00:00Z',
+        ...over,
+      }) as any;
+
+    it('getMarket returns the complement token and whether the market is in the bot scope', async () => {
+      const getMarket = vi.fn().mockResolvedValue(view());
+      const h = new RpcHandler({ ...deps, getMarket, marketScope: () => ['0xother'] });
+      const r = (await h.handle(makeReq('polymarket:getMarket', ['yes']))).result;
+      expect(r).toMatchObject({ marketId: '0xm1', tokenId: 'yes', outcome: 'Yes', complementTokenId: 'no', inScope: false, ambiguityScore: 1 });
+      const unscoped = new RpcHandler({ ...deps, getMarket, marketScope: () => null });
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['no']))).result).toMatchObject({ complementTokenId: 'yes', inScope: true });
+      // By condition id: no token asked, no complement
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['0xm1']))).result).toMatchObject({ tokenId: null, complementTokenId: null });
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['']))).error).toMatch(/required/);
+    });
+
+    it('getExitFlags is only what the server passes for this bot; requestRetire needs a reason and never throws inside the RPC', async () => {
+      const requestRetire = vi.fn();
+      const flags = [{ id: 'f1', tokenId: 'yes', marketId: '0xm1', reason: 'r', createdBy: 'agent', createdAt: '' }];
+      const h = new RpcHandler({ ...deps, requestRetire, exitFlags: () => flags });
+      expect((await h.handle(makeReq('risk:getExitFlags'))).result).toEqual(flags);
+      expect((await liveHandler.handle(makeReq('risk:getExitFlags'))).result).toEqual([]);
+      expect((await h.handle(makeReq('bot:requestRetire', ['  ']))).error).toMatch(/reason is required/);
+      expect((await h.handle(makeReq('bot:requestRetire', ['markets resolved']))).result).toEqual({ accepted: true });
+      expect(requestRetire).toHaveBeenCalledWith('markets resolved');
+      expect((await liveHandler.handle(makeReq('bot:requestRetire', ['x']))).result).toEqual({ accepted: false });
     });
   });
 });

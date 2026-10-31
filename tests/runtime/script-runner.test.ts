@@ -373,3 +373,36 @@ describe('ScriptRunner', () => {
     });
   });
 });
+
+describe('ScriptRunner push events (ctx.events, spec §5.2)', () => {
+  it('posts bot-event messages only while the worker runs', async () => {
+    const runner = new ScriptRunner(makeOptions());
+    runner.pushEvent('halt', { kind: 'global', scope: 'global', reason: 'x' }); // not started: dropped
+    const started = runner.start();
+    mockWorkerInstance.simulateMessage({ type: 'started' });
+    await started;
+    runner.pushEvent('forecast_changed', { forecastId: 'f1' });
+    expect(mockWorkerInstance.postMessage).toHaveBeenCalledWith({ type: 'bot-event', name: 'forecast_changed', data: { forecastId: 'f1' } });
+    expect(mockWorkerInstance.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ name: 'halt' }));
+  });
+});
+
+describe('BotContextProxy ctx.events dispatch', () => {
+  it('runs registered handlers for the event, ignores others, survives a failing handler, honours off()', async () => {
+    const { createBotContext, dispatchBotEvent } = await import('../../packages/core/src/runtime/BotContextProxy');
+    const ctx = createBotContext({ botId: 'b', botName: 'b', config: {}, walletAddress: '0x' });
+    const seen: string[] = [];
+    const h = (d: Record<string, unknown>) => void seen.push(`a:${String(d.forecastId)}`);
+    ctx.events.on('forecast_changed', h);
+    ctx.events.on('forecast_changed', () => {
+      throw new Error('boom');
+    });
+    ctx.events.on('halt', () => void seen.push('halt'));
+    await dispatchBotEvent('forecast_changed', { forecastId: 'f1' });
+    expect(seen).toEqual(['a:f1']);
+    ctx.events.off('forecast_changed', h);
+    await dispatchBotEvent('forecast_changed', { forecastId: 'f2' });
+    expect(seen).toEqual(['a:f1']);
+    expect(() => ctx.events.on('nope' as never, h)).toThrow(/Unknown event/);
+  });
+});
