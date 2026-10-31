@@ -94,6 +94,17 @@
         "yaml": "^2.9.1",
         "zod": "^4.6.7"
     },
+    "overrides": {
+        "@polymarket/clob-client": {
+            "axios": "$axios"
+        },
+        "@ethersproject/providers": {
+            "ws": "^8.22.1"
+        },
+        "monaco-editor": {
+            "dompurify": "^3.4.17"
+        }
+    },
     "engines": {
         "node": ">=22.12 <25"
     }
