@@ -102,6 +102,7 @@ type Rule =
   | 'neutral';
 
 const LIMIT_RULES: Record<string, Rule> = {
+  'live_trading.enabled': 'enable',
   'global.max_total_exposure_usd': 'up',
   'global.max_total_exposure_pct': 'up',
   'global.max_long_horizon_pct': 'up',

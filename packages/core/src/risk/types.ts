@@ -164,7 +164,9 @@ export type RiskCheckName =
   // Local clock differs from exchange time by more than 5 s (spec §15; set by the Reconciler)
   | 'clock_skew'
   // No successful exchange clock check for 3 minutes (2b review)
-  | 'clock_unverified';
+  | 'clock_unverified'
+  // limits.yaml live_trading.enabled is false (3b: paper-only until a human enables live trading)
+  | 'live_disabled';
 
 export interface RiskCheckResult {
   /** Spec §4.1 step number (1–7); 0 = snapshot validation */

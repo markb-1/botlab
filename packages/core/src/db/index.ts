@@ -233,8 +233,6 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     'ALTER TABLE wallets ADD COLUMN is_paper INTEGER DEFAULT 0',
     'ALTER TABLE settings ADD COLUMN binance_api_key_encrypted TEXT',
     'ALTER TABLE settings ADD COLUMN binance_api_secret_encrypted TEXT',
-    'ALTER TABLE settings ADD COLUMN claude_api_key_encrypted TEXT',
-    'ALTER TABLE settings ADD COLUMN ai_custom_system_prompt TEXT',
     // Trade recording columns for auto-recorded trades
     'ALTER TABLE bot_trades ADD COLUMN exchange TEXT',
     'ALTER TABLE bot_trades ADD COLUMN symbol TEXT',
@@ -530,6 +528,29 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     `CREATE TABLE IF NOT EXISTS recorder_state (
       key TEXT PRIMARY KEY,
       value TEXT
+    )`,
+    // 3b: the in-app AI assistant is removed (spec §12) with its settings
+    'ALTER TABLE settings DROP COLUMN claude_api_key_encrypted',
+    'ALTER TABLE settings DROP COLUMN ai_custom_system_prompt',
+    // 3b: server auth (spec §8.2) and master-key check (§8.3)
+    'ALTER TABLE settings ADD COLUMN admin_password_hash TEXT',
+    'ALTER TABLE settings ADD COLUMN key_check TEXT',
+    `CREATE TABLE IF NOT EXISTS auth_sessions (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      auth_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      user_agent TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS api_tokens (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK(scope IN ('agent','readonly')),
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      last_used_at TEXT,
+      revoked_at TEXT
     )`,
   ];
   for (const sql of migrations) {

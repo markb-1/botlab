@@ -5,7 +5,6 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-vi.mock('electron', () => ({ ipcMain: { handle: vi.fn() } }));
 vi.mock('../../packages/core/src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));

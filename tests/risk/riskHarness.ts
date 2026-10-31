@@ -75,7 +75,8 @@ export function openRiskHarness(startMs: number): RiskHarness {
   const stopBot = vi.fn().mockImplementation(async (id: string) => {
     running.delete(id);
   });
-  const limits = LimitsSchema.parse({});
+  // Live trading is opt-in (3b); these tests exercise live orders
+  const limits = LimitsSchema.parse({ live_trading: { enabled: true } });
   const marks: Record<string, number | null> = {};
   const clock = { now: startMs };
 

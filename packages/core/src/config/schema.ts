@@ -38,6 +38,16 @@ export const DEFAULT_SCRIPT_FETCH_ALLOWLIST = [
 ] as const;
 
 export const LimitsSchema = z.strictObject({
+  /**
+   * Master switch for real-money orders (spec §15.2 "Local test mode"). Off by default: a fresh install
+   * (or a limits.yaml without this key) runs paper bots only; live bots are refused at start and live
+   * orders are rejected (`live_disabled`) until a human sets it to true.
+   */
+  live_trading: z
+    .strictObject({
+      enabled: z.boolean().default(false),
+    })
+    .prefault({}),
   global: z
     .strictObject({
       max_total_exposure_usd: usd.default(300),

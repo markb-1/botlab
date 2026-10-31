@@ -3,7 +3,6 @@ node_modules/
 
 # Build output
 dist/
-dist-electron/
 
 # Environment variables (contains secrets)
 .env
@@ -39,10 +38,11 @@ coverage/
 *.temp
 
 # Web client build
-web/client/dist/
+apps/web/dist/
 
-# Web server build
-web/server/dist/
+# Runtime data in dev (database, backups, logs, master.key!)
+/data/
+master.key
 
 # Database files
 *.db
@@ -52,17 +52,14 @@ web/server/dist/
 # Design references
 UI/
 
-# Ad-hoc scripts (root-level only)
-/scripts/
-
 # Saved templates (local only)
 _saved-templates/
 
-release/
-dist/
-*.dmg
-*.zip
 
 # Human-owned config (examples are committed)
 config/*.yaml
 !config/*.example.yaml
+
+# Docker secrets (master key) and Tailscale sidecar state
+/secrets/
+/tailscale/

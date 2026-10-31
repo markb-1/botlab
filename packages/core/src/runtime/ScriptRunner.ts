@@ -15,7 +15,7 @@ import { RpcHandler } from './RpcHandler';
 import type { RpcHandlerDeps } from './RpcHandler';
 import type { PaperTradingState } from './PaperTradingState';
 import { SCRIPT_WORKER_RESOURCE_LIMITS } from './sandbox';
-import { resolveWorkerEntry } from './workerPath';
+import { resolveWorkerEntry, startWorker } from './workerPath';
 
 /** A tick (onTick) running longer than this counts one watchdog strike per period (spec §5.1). */
 export const TICK_TIMEOUT_MS = 30_000;
@@ -91,10 +91,10 @@ export class ScriptRunner extends EventEmitter {
     }
 
     return new Promise<void>((resolve, reject) => {
-      // Compiled: dist-electron/packages/core/src/runtime/worker-bootstrap.js (next to this module)
+      // Compiled: dist/packages/core/src/runtime/worker-bootstrap.js (next to this module); tsx: the .ts source
       const bootstrapPath = this.options.bootstrapPath ?? resolveWorkerEntry(__dirname, 'worker-bootstrap');
 
-      this.worker = new Worker(bootstrapPath, {
+      this.worker = startWorker(bootstrapPath, {
         workerData: {
           compiledCode: this.options.compiledCode,
           botId: this.options.botId,

@@ -1,15 +1,16 @@
 /**
  * Composition root (spec §1.1, §1.2). `createCore` builds the database, repositories, config, risk
- * controls, notifications, market cache, ledger, recorder and services; transports (the Electron
- * shell today, the HTTP server + MCP in 3b) only call `core.services.*` and forward `core.events`.
+ * controls, notifications, market cache, ledger, recorder and services; transports (the HTTP server
+ * in apps/server, MCP in Phase 4) only call `core.services.*` and forward `core.events`.
  *
  * Lifecycle:
  * - `createCore(options)` — opens the DB (migrations) and constructs everything; no timers, no network.
  * - `start()` — what needs no wallet keys ("Phase A"): config load + watcher, Telegram, market cache,
- *   ledger scorer, order-book recorder, start-halted-after-crash check, template seeding. Halts and
+ *   ledger scorer, order-book recorder, nightly backup, start-halted-after-crash check, template seeding. Halts and
  *   the kill switch work from here on (R22).
- * - `unlock(encryptionKey)` — what needs the keys ("Phase B"): secret migration, WalletManager,
- *   BotManager, startup order recovery, RiskMonitor, Reconciler.
+ * - `unlock(masterKey)` — what needs the keys ("Phase B"): master-key check, secret migration,
+ *   WalletManager, BotManager, startup order recovery, RiskMonitor, Reconciler. The server calls it at
+ *   boot with the key from `BOTLAB_MASTER_KEY(_FILE)` (spec §8.3).
  * - `shutdown({ timeoutMs })` — graceful stop; writes the clean-shutdown marker unless it timed out.
  * - `close()` — closes the database (after `shutdown`).
  */
@@ -36,6 +37,9 @@ import {
 } from './db/repositories/index';
 import { keyManager } from './security/keyManager';
 import { migrateSecretsToV2 } from './security/migrateSecrets';
+import { verifyMasterKey } from './security/masterKey';
+import { AdminAuthStore } from './security/adminAuth';
+import { BackupJob } from './ops/BackupJob';
 import { WalletManager } from './bots/WalletManager';
 import { BotManager } from './bots/BotManager';
 import { seedTemplates, getBuiltinTemplates } from './db/seed';
@@ -78,6 +82,8 @@ export interface CoreOptions {
   templatesDir?: string;
   /** Database file. Default: `<dataDir>/botlab.db` (tests may pass ':memory:') */
   dbPath?: string;
+  /** Nightly SQLite backups to `<dataDir>/backups` (default true; never for ':memory:') */
+  backups?: boolean;
 }
 
 /**
@@ -128,14 +134,21 @@ export interface Core {
   readonly halts: HaltService;
   readonly killSwitch: KillSwitch;
   readonly notifications: NotificationService;
+  /** Admin password, sessions and API tokens (spec §8.2) */
+  readonly auth: AdminAuthStore;
+  /** Nightly database backup; null when disabled */
+  readonly backups: BackupJob | null;
   /** Null until `unlock()` */
   readonly botManager: BotManager | null;
   readonly walletManager: WalletManager | null;
   readonly reconciler: Reconciler | null;
   isUnlocked(): boolean;
   start(): Promise<void>;
-  /** Returns false if already unlocked (nothing done) */
-  unlock(encryptionKey: string): Promise<boolean>;
+  /**
+   * Returns false if already unlocked (nothing done). Throws `ServiceError('locked')` if the key is not
+   * this database's master key (or the secrets still use the old password-derived key).
+   */
+  unlock(masterKey: string): Promise<boolean>;
   /** Graceful stop. `clean` is false when it timed out (no clean marker written). */
   shutdown(opts?: { timeoutMs?: number }): Promise<{ clean: boolean }>;
   close(): void;
@@ -169,6 +182,18 @@ export function createCore(options: CoreOptions): Core {
   };
   const { botRepo, walletRepo, scriptRepo, settingsRepo, tradeRepo, storageRepo, backtestRepo, orderRepo, riskStateRepo, forecastRepo, snapshotRepo } = repos;
   const audit = new AuditService(repos.auditRepo);
+  const auth = new AdminAuthStore(db);
+  const dbFile = options.dbPath ?? path.join(dataDir, 'botlab.db');
+  const backups =
+    options.backups !== false && dbFile !== ':memory:'
+      ? new BackupJob({
+          db,
+          dir: path.join(dataDir, 'backups'),
+          onResult: (r) => {
+            if (!r.ok) audit.record('system', 'backup.run', null, { error: r.error }, 'error');
+          },
+        })
+      : null;
 
   // Created by unlock()
   let botManager: BotManager | null = null;
@@ -439,6 +464,7 @@ export function createCore(options: CoreOptions): Core {
     marketCache.start();
     ledger.start();
     recorder.start();
+    backups?.start();
 
     // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
     // Once only: a retried start() must not read its own "running" marker as a crash.
@@ -467,6 +493,7 @@ export function createCore(options: CoreOptions): Core {
     startUnsubs = [];
     const quiet = (what: string) => (error: unknown) => console.error(`[Core] Error stopping ${what} after failed start:`, error);
     await recorder.stop().catch(quiet('recorder'));
+    await backups?.stop().catch(quiet('backups'));
     await ledger.stop().catch(quiet('ledger'));
     await marketCache.stop().catch(quiet('market cache'));
     await notifications.stop().catch(quiet('notifications')); // also detaches its config listeners
@@ -498,6 +525,8 @@ export function createCore(options: CoreOptions): Core {
 
   async function unlockOnce(encryptionKey: string): Promise<void> {
     console.log('[Core] Unlocking: initializing protected services...');
+    // Wrong key, or secrets still under the old password-derived key ⇒ ServiceError('locked')
+    verifyMasterKey(db, encryptionKey);
     keyManager.setKey(encryptionKey);
 
     // One-time re-encryption of legacy CryptoJS secrets to AES-256-GCM (idempotent, audited)
@@ -641,6 +670,7 @@ export function createCore(options: CoreOptions): Core {
         await botManager.shutdown();
       }
       await recorder.stop().catch((error) => console.error('[Core] Error stopping recorder:', error));
+      await backups?.stop().catch((error) => console.error('[Core] Error stopping backups:', error));
       await ledger.stop().catch((error) => console.error('[Core] Error stopping ledger scorer:', error));
       await marketCache.stop().catch((error) => console.error('[Core] Error stopping market cache:', error));
       if (timedOut) return;
@@ -686,6 +716,8 @@ export function createCore(options: CoreOptions): Core {
     halts,
     killSwitch,
     notifications,
+    auth,
+    backups,
     get botManager() {
       return botManager;
     },

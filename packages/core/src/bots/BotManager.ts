@@ -519,6 +519,10 @@ export class BotManager extends EventEmitter {
     if (mode === 'paper' && bot.mode !== 'paper') {
       logger.info(`Bot ${bot.name} is at stage paper: running in paper mode`);
     }
+    // Live trading is opt-in (limits.yaml live_trading.enabled; OrderService also rejects live orders)
+    if (mode === 'live' && this.riskEngine && this.riskEngine.getConfig().limits.live_trading?.enabled !== true) {
+      throw new Error('Live trading is disabled: set live_trading.enabled: true in limits.yaml, or run the bot in paper mode');
+    }
 
     // Get wallet credentials and the CLOB client for this wallet
     const walletCredentials = await this.walletManager.getWallet(bot.walletId);

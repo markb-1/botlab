@@ -69,8 +69,7 @@ describe.skipIf(!sqliteAvailable)('migrateSecretsToV2', () => {
       const alreadyV2 = encrypt('cd'.repeat(32), KEY);
       db.prepare(`INSERT INTO wallets (id, name, address, private_key_encrypted) VALUES ('w2', 'w2', '0xdef', ?)`).run(alreadyV2);
       db.prepare(`INSERT OR IGNORE INTO settings (id) VALUES ('global')`).run();
-      db.prepare(`UPDATE settings SET binance_api_key_encrypted = ?, binance_api_secret_encrypted = ?, claude_api_key_encrypted = ? WHERE id = 'global'`)
-        .run(LEGACY.apiKey.payload, LEGACY.unicode.payload, null);
+      db.prepare(`UPDATE settings SET binance_api_key_encrypted = ?, binance_api_secret_encrypted = ? WHERE id = 'global'`).run(LEGACY.apiKey.payload, LEGACY.unicode.payload);
 
       const audit = { record: vi.fn() };
       const first = migrateSecretsToV2(db, KEY, audit as never);
@@ -85,7 +84,7 @@ describe.skipIf(!sqliteAvailable)('migrateSecretsToV2', () => {
       expect(w2.v).toBe(alreadyV2); // untouched
       expect(decrypt(s.binance_api_key_encrypted!, KEY)).toBe(LEGACY.apiKey.plain);
       expect(decrypt(s.binance_api_secret_encrypted!, KEY)).toBe(LEGACY.unicode.plain);
-      expect(s.claude_api_key_encrypted).toBeNull();
+      expect('claude_api_key_encrypted' in s).toBe(false); // column dropped with the AI assistant (3b)
 
       // Second run: nothing to do, nothing changes, no audit row
       audit.record.mockClear();

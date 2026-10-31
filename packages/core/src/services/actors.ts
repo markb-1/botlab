@@ -1,8 +1,7 @@
 /**
  * Who is calling a service (spec §4.6, §8.2). Actors are opaque objects that only the factory
  * functions below create; a transport calls them **after** authenticating the caller and derives the
- * kind from the authenticated principal (Electron: the main window's webContents; HTTP in 3b: the
- * session / token scope), never from request data.
+ * kind from the authenticated principal (HTTP: the session or the API token's scope), never from request data.
  *
  * Human-only domain actions (clearing halts, config writes/restores, position adoption, market
  * assessments, forced category rights) take a `HumanActor` at the type level and re-check at runtime
@@ -11,6 +10,7 @@
  */
 
 import type { AuditActor } from '../db/repositories/AuditRepository';
+import { ServiceError } from './errors';
 
 /** Private brand: not exported, so the type cannot be satisfied outside this module */
 declare const ACTOR_BRAND: unique symbol;
@@ -79,8 +79,8 @@ export function auditActorOf(value: unknown): AuditActor {
 
 /** Throws unless `value` is a minted actor of one of `kinds` */
 export function requireActor<K extends ActorKind>(value: unknown, kinds: readonly K[], what: string): Extract<Actor, { kind: K }> {
-  if (!isActor(value)) throw new Error(`${what}: unauthenticated actor`);
-  if (!(kinds as readonly string[]).includes(value.kind)) throw new Error(`${what}: not allowed for ${value.kind}`);
+  if (!isActor(value)) throw new ServiceError('forbidden', `${what}: unauthenticated actor`);
+  if (!(kinds as readonly string[]).includes(value.kind)) throw new ServiceError('forbidden', `${what}: not allowed for ${value.kind}`);
   return value as Extract<Actor, { kind: K }>;
 }
 

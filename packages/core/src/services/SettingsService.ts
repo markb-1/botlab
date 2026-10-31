@@ -1,8 +1,7 @@
 /**
  * SettingsService — app settings and Binance credentials (moved out of the Electron
  * `settingsHandlers`). Binance credentials are encrypted with the unlocked key and never returned:
- * views only carry `hasBinanceCredentials`. Claude (AI assistant) settings stay in the Electron
- * layer until the assistant is removed (3b); the view still reports them.
+ * views only carry `hasBinanceCredentials`.
  */
 
 import type { SettingsRepository } from '../db/repositories/SettingsRepository';
@@ -21,8 +20,6 @@ export function settingsRowToIpc(row: any): IpcSettings {
     usdcContractAddress: row.usdc_contract_address,
     alchemyApiKey: row.alchemy_api_key,
     hasBinanceCredentials: !!(row.binance_api_key_encrypted && row.binance_api_secret_encrypted),
-    hasClaudeApiKey: !!row.claude_api_key_encrypted,
-    aiCustomSystemPrompt: row.ai_custom_system_prompt || null,
   };
 }
 

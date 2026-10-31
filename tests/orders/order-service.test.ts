@@ -60,7 +60,8 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
   let cash: () => Promise<number>;
   let clock = NOW;
 
-  const engine = new RiskEngine({ limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}) });
+  // Live trading is opt-in (3b); these tests exercise live orders
+  const engine = new RiskEngine({ limits: LimitsSchema.parse({ live_trading: { enabled: true } }), mandate: MandateSchema.parse({}) });
 
   function makeService(botId: string, mode: 'live' | 'paper' = 'live', paperState?: PaperTradingState): OrderService {
     const simulated = mode === 'paper';
@@ -144,6 +145,21 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     const positions = t.tradeRepo.getRiskPositions({ simulated: false });
     expect(positions).toHaveLength(1);
     expect(positions[0]).toMatchObject({ bot_id: 'bot-1', symbol: 't1', condition_id: 'm1', net_quantity: 40, cost_basis: 20 });
+  });
+
+  it('live trading off (the default limits.yaml) ⇒ live orders rejected as live_disabled; paper unaffected', async () => {
+    const live = makeService('bot-1');
+    engine.setConfig({ limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}) });
+    try {
+      const r = await live.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+      expect(r).toMatchObject({ ok: false, status: 'rejected_risk', failedCheck: 'live_disabled' });
+      expect(poly.postMarketOrder).not.toHaveBeenCalled();
+      const paper = makeService('bot-2', 'paper', new PaperTradingState('bot-2', 1000, t.storageRepo));
+      const p = await paper.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+      expect(p.failedCheck).not.toBe('live_disabled');
+    } finally {
+      engine.setConfig({ limits: LimitsSchema.parse({ live_trading: { enabled: true } }), mandate: MandateSchema.parse({}) });
+    }
   });
 
   it('counts earlier fills toward exposure (per-market cap across bots)', async () => {

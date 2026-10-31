@@ -1,9 +1,8 @@
 /**
  * In-memory SQLite for order tests, using the real schema and migrations.
  *
- * better-sqlite3 may be compiled for Electron's ABI after `npm run electron:rebuild`,
- * in which case it cannot load under plain Node: tests that need it are skipped with a
- * warning. CI installs it for Node, so they always run there.
+ * If better-sqlite3's native binary cannot load (e.g. built for another Node ABI), tests that
+ * need it are skipped with a warning. CI installs it for Node, so they always run there.
  */
 
 import { closeDatabase, initializeDatabase, type Database } from '../../packages/core/src/db/index';

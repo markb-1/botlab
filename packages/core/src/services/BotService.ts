@@ -312,9 +312,11 @@ export class BotService {
     const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.create'));
     const { botRepo, scriptRepo, audit } = this.deps;
     let walletId = data.walletId;
+    // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
+    const mode = data.mode ?? 'paper';
 
     // Auto-generate a throwaway wallet for paper bots
-    if (data.mode === 'paper' && !walletId) {
+    if (mode === 'paper' && !walletId) {
       const paperWallet = await this.wallets().createPaperWallet(data.name);
       walletId = paperWallet.id;
     }
@@ -332,7 +334,7 @@ export class BotService {
       walletId,
       config: data.config,
       enabled: data.enabled,
-      mode: data.mode,
+      mode,
       stage,
       templateVersion: script?.revision ?? null,
     });
@@ -341,7 +343,7 @@ export class BotService {
       scriptId: data.scriptId,
       templateVersion: script?.revision ?? null,
       trust: script?.trust ?? null,
-      mode: data.mode ?? 'live',
+      mode,
       stage,
     });
     return this.toView(row);

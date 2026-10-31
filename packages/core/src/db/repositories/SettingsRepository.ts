@@ -7,13 +7,16 @@ export interface SettingsRow {
   clob_ws_url: string;
   usdc_contract_address: string;
   alchemy_api_key: string | null;
+  /** Legacy (Electron) password-derived key: verification hash, salt and "skipped" flag; kept only until `migrate-key` */
   password_hash: string | null;
   password_salt: string | null;
   password_skipped: number;
   binance_api_key_encrypted: string | null;
   binance_api_secret_encrypted: string | null;
-  claude_api_key_encrypted: string | null;
-  ai_custom_system_prompt: string | null;
+  /** Admin UI password (scrypt, `security/adminAuth.ts`); null until first-run setup */
+  admin_password_hash: string | null;
+  /** Master-key check value: a constant encrypted with the master key (`security/masterKey.ts`) */
+  key_check: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -69,19 +72,20 @@ export class SettingsRepository {
     return this.get();
   }
 
-  /**
-   * Update authentication fields (password hash, salt, skipped flag).
-   */
-  updateAuth(data: {
-    passwordHash: string | null;
-    passwordSalt: string;
-    passwordSkipped: boolean;
-  }): SettingsRow {
+  /** Forget the legacy password-derived key fields (after `migrate-key` re-encrypted the secrets). */
+  clearLegacyAuth(): void {
     this.get(); // Ensure the row exists
-    this.db.prepare(
-      `UPDATE settings SET password_hash = ?, password_salt = ?, password_skipped = ?, updated_at = datetime('now') WHERE id = 'global'`
-    ).run(data.passwordHash, data.passwordSalt, data.passwordSkipped ? 1 : 0);
-    return this.get();
+    this.db.prepare(`UPDATE settings SET password_hash = NULL, password_salt = NULL, password_skipped = 0, updated_at = datetime('now') WHERE id = 'global'`).run();
+  }
+
+  setAdminPasswordHash(hash: string | null): void {
+    this.get(); // Ensure the row exists
+    this.db.prepare(`UPDATE settings SET admin_password_hash = ?, updated_at = datetime('now') WHERE id = 'global'`).run(hash);
+  }
+
+  setKeyCheck(value: string | null): void {
+    this.get(); // Ensure the row exists
+    this.db.prepare(`UPDATE settings SET key_check = ?, updated_at = datetime('now') WHERE id = 'global'`).run(value);
   }
 
   /**
@@ -95,32 +99,6 @@ export class SettingsRepository {
     this.db.prepare(
       `UPDATE settings SET binance_api_key_encrypted = ?, binance_api_secret_encrypted = ?, updated_at = datetime('now') WHERE id = 'global'`
     ).run(data.binanceApiKeyEncrypted, data.binanceApiSecretEncrypted);
-    return this.get();
-  }
-
-  /**
-   * Update encrypted Claude API key.
-   */
-  updateClaudeCredentials(data: {
-    claudeApiKeyEncrypted: string | null;
-  }): SettingsRow {
-    this.get(); // Ensure the row exists
-    this.db.prepare(
-      `UPDATE settings SET claude_api_key_encrypted = ?, updated_at = datetime('now') WHERE id = 'global'`
-    ).run(data.claudeApiKeyEncrypted);
-    return this.get();
-  }
-
-  /**
-   * Update AI custom system prompt.
-   */
-  updateAiSystemPrompt(data: {
-    prompt: string | null;
-  }): SettingsRow {
-    this.get(); // Ensure the row exists
-    this.db.prepare(
-      `UPDATE settings SET ai_custom_system_prompt = ?, updated_at = datetime('now') WHERE id = 'global'`
-    ).run(data.prompt);
     return this.get();
   }
 }

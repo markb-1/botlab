@@ -671,6 +671,9 @@ export class OrderService {
   ): Promise<OrderRow> {
     return withPlacementLock(async () => {
       let decision = preCheck;
+      if (!decision && !this.paper && this.deps.riskEngine.getConfig().limits.live_trading?.enabled !== true) {
+        decision = preDecision('live_disabled', 'Live trading is disabled (set live_trading.enabled: true in limits.yaml)', this.now());
+      }
       if (!decision && !this.paper && this.deps.clock) {
         const clock = this.deps.clock.status();
         if (clock.skewed) {

@@ -113,8 +113,6 @@ export interface IpcSettings {
   usdcContractAddress: string;
   alchemyApiKey?: string | null;
   hasBinanceCredentials: boolean;
-  hasClaudeApiKey: boolean;
-  aiCustomSystemPrompt?: string | null;
 }
 
 // Trade types for IPC

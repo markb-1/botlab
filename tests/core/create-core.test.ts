@@ -137,7 +137,9 @@ describe.skipIf(!sqliteAvailable)('createCore — lifecycle failures (3a review)
     const c = boot();
     await c.start();
     const spy = vi.spyOn(BotManager.prototype, 'initialize').mockRejectedValueOnce(new Error('init boom'));
-    await expect(c.unlock(key())).rejects.toThrow(/init boom/);
+    // One master key per database (its key check is written by the first unlock)
+    const masterKey = key();
+    await expect(c.unlock(masterKey)).rejects.toThrow(/init boom/);
     expect(c.isUnlocked()).toBe(false);
     expect(c.botManager).toBeNull();
     expect(c.walletManager).toBeNull();
@@ -146,7 +148,9 @@ describe.skipIf(!sqliteAvailable)('createCore — lifecycle failures (3a review)
     await expect(c.services.bots.start('x', HUMAN)).rejects.toMatchObject({ code: 'locked' });
 
     spy.mockRestore();
-    expect(await c.unlock(key())).toBe(true);
+    await expect(c.unlock(key())).rejects.toMatchObject({ code: 'locked' });
+    expect(c.isUnlocked()).toBe(false);
+    expect(await c.unlock(masterKey)).toBe(true);
     expect(c.isUnlocked()).toBe(true);
     const script = c.services.scripts.list().find((s) => s.isTemplate)!;
     await c.services.bots.create({ name: 'after-retry', scriptId: script.id, mode: 'paper' }, HUMAN);

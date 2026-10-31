@@ -7,7 +7,7 @@ import {
   hasMetaObject,
   isValidKey,
   type ConfigParam,
-} from '../../web/client/src/utils/configSchemaParser';
+} from '../../apps/web/src/utils/configSchemaParser';
 
 // ============================================================================
 // Test Fixtures

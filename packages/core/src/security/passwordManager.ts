@@ -5,8 +5,12 @@ const KEY_LENGTH = 32; // 256-bit key
 const HASH_LENGTH = 32;
 const DIGEST = 'sha512';
 
-/** Used when user skips password setup */
-export const FALLBACK_PASSWORD = 'botlab-default-no-password';
+/**
+ * LEGACY (Electron, before 3b): the encryption key was derived from the unlock password, or from this
+ * constant when the user skipped setting one. The server uses a master key instead (spec §8.3); these
+ * functions remain only so `npm run migrate-key` can re-encrypt old databases.
+ */
+export const LEGACY_SKIPPED_PASSWORD = 'botlab-default-no-password';
 
 /**
  * Generate a random 32-byte salt as hex string.

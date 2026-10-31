@@ -2,6 +2,10 @@
 # Copy to server.yaml (or start the app once and it is created with these defaults).
 timezone: Europe/Dublin              # time zone of the daily digest
 digest_time: "08:00"                 # local time (HH:MM) of the daily digest
+http:                                # web UI / API server (restart to apply; BOTLAB_HOST / BOTLAB_PORT override)
+  host: 127.0.0.1                    # this machine only; use the Tailscale IP on the home server; never public
+  port: 3780
+  allowed_hosts: []                  # extra host names for the UI (IPs, localhost and *.ts.net always work)
 recorder:                            # order-book snapshots for backtests (top 10 levels)
   enabled: true
   interval_seconds: 60

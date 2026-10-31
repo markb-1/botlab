@@ -3,7 +3,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 class Logger {
-    private static logsDir = path.join(process.cwd(), 'logs');
+    /** BOTLAB_LOG_DIR (the server sets <data dir>/logs), else <cwd>/logs */
+    private static get logsDir(): string {
+        return process.env.BOTLAB_LOG_DIR || path.join(process.cwd(), 'logs');
+    }
     private static currentLogFile = '';
 
     private static getLogFileName(): string {

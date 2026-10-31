@@ -1,5 +1,7 @@
 # BotLab hard limits (spec §3.1). Human-owned: the agent can read but never write this file.
 # Copy to limits.yaml (or start the app once and it is created with these defaults).
+live_trading:
+  enabled: false                     # real-money orders; until true, only paper bots run (live bots refused, live orders rejected)
 global:
   max_total_exposure_usd: 300        # open position cost + open buy order notional
   max_total_exposure_pct: 0.60       # of wallet equity; the lower of the two applies

@@ -3,9 +3,11 @@ import pluginJs from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import prettierConfig from 'eslint-config-prettier';
 import prettierPlugin from 'eslint-plugin-prettier';
+import reactHooks from 'eslint-plugin-react-hooks';
+import reactRefresh from 'eslint-plugin-react-refresh';
 
 // ─── Order choke point (spec §4): only these files may reach exchange order endpoints ───
-// Also enforced by tests/orders/choke-point.test.ts (which covers web/client too).
+// Also enforced by tests/orders/choke-point.test.ts (which covers apps/web too).
 const ORDER_METHODS = 'postOrders?|createOrder|createMarketOrder|createAndPostOrder|createAndPostMarketOrder';
 const ORDER_ENDPOINTS = String.raw`\/(api|sapi)\/v\d+\/(order|orderList|sor\/order|margin\/order)`;
 const chokePointSyntax = [
@@ -43,21 +45,23 @@ const orderModuleImports = [
     },
 ];
 const restrictedImports = (opts) => ['error', opts];
-// packages/core is transport-free (spec §1.1): no Electron, no apps/*
+// packages/core is transport-free (spec §1.1): no HTTP framework, no apps/*
 const coreTransportImports = [
-    { name: 'electron', message: 'packages/core must not import electron (transport code lives in electron/ or apps/*).' },
+    { name: 'hono', message: 'packages/core must not import the HTTP framework (transport code lives in apps/server).' },
+    { name: '@hono/node-server', message: 'packages/core must not import the HTTP framework (transport code lives in apps/server).' },
+    { name: 'electron', message: 'packages/core must not import electron.' },
 ];
 const coreTransportPatterns = [
-    { group: ['electron/*', '**/electron/**', '**/apps/**'], message: 'packages/core must not import from electron/ or apps/*.' },
+    { group: ['hono/*', '**/apps/**'], message: 'packages/core must not import from apps/* or the HTTP framework.' },
 ];
 
 /** @type {import('eslint').Linter.Config[]} */
 export default [
     {
-        // Ignore build output and compiled files. web/client has its own eslint config (React rules).
-        ignores: ['dist/**', 'dist-electron/**', 'release/**', 'web/client/**', 'node_modules/**', 'coverage/**', '*.js'],
+        // Ignore build output and compiled files
+        ignores: ['dist/**', 'apps/web/dist/**', 'data/**', 'node_modules/**', 'coverage/**', '*.js'],
     },
-    { files: ['**/*.{js,mjs,cjs,ts}'] },
+    { files: ['**/*.{js,mjs,cjs,ts,tsx}'] },
     { languageOptions: { globals: { ...globals.node, ...globals.jest } } }, // Add jest globals
     pluginJs.configs.recommended,
     ...tseslint.configs.recommended,
@@ -76,9 +80,22 @@ export default [
             'no-control-regex': 'off', // Allow ANSI escape codes in regex for colored terminal output
         },
     },
+    // Web UI (browser globals, React hooks rules)
+    {
+        files: ['apps/web/**/*.{ts,tsx}'],
+        plugins: { 'react-hooks': reactHooks, 'react-refresh': reactRefresh },
+        languageOptions: { globals: { ...globals.browser } },
+        rules: {
+            ...reactHooks.configs.recommended.rules,
+            // React Compiler advisories (eslint-plugin-react-hooks 7); the pre-3b pages predate them
+            'react-hooks/set-state-in-effect': 'warn',
+            'react-hooks/refs': 'warn',
+            'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+        },
+    },
     // Order choke point. Later blocks override earlier ones for the files they list.
     {
-        files: ['electron/**/*.ts', 'templates/**/*.ts', 'scripts/**/*.{js,mjs,cjs,ts}'],
+        files: ['apps/**/*.{ts,tsx}', 'templates/**/*.ts', 'scripts/**/*.{js,mjs,cjs,ts}'],
         rules: {
             '@typescript-eslint/no-restricted-imports': restrictedImports({ paths: clobValueImports, patterns: orderModuleImports }),
             'no-restricted-syntax': chokePointSyntax,

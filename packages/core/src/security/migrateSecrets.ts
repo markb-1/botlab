@@ -1,10 +1,12 @@
 /**
- * One-time migration of secrets at rest from CryptoJS (passphrase mode, MD5 KDF) to AES-256-GCM v2
- * (spec §8.3). Runs after unlock, once the key is available. Idempotent: rows already in v2 are skipped.
+ * Re-encryption of secrets at rest (spec §8.3): wallet private keys (incl. paper wallets) and the
+ * Binance API key/secret.
  *
- * Covers wallet private keys (incl. paper wallets), Binance API key/secret and the Claude API key
- * (until the AI assistant is removed). A row that cannot be decrypted is left untouched (still readable
- * through the legacy path if the key is right) and reported; the rest are migrated in one transaction.
+ * - `migrateSecretsToV2` — one-time migration from CryptoJS (passphrase mode, MD5 KDF) to AES-256-GCM
+ *   v2 with the same key. Runs after unlock; idempotent (rows already in v2 are skipped). A row that
+ *   cannot be decrypted is left untouched and reported; the rest are migrated in one transaction.
+ * - `rekeySecrets` — `migrate-key`: decrypts every secret with the old (password-derived) key, in
+ *   either format, and re-encrypts it as v2 with the new master key. All or nothing.
  */
 
 import type Database from 'better-sqlite3';
@@ -18,7 +20,7 @@ export interface SecretMigrationResult {
   failed: string[];
 }
 
-const SETTINGS_FIELDS = ['binance_api_key_encrypted', 'binance_api_secret_encrypted', 'claude_api_key_encrypted'] as const;
+export const SECRET_SETTINGS_FIELDS = ['binance_api_key_encrypted', 'binance_api_secret_encrypted'] as const;
 
 export function migrateSecretsToV2(db: Database.Database, keyHex: string, audit?: AuditService): SecretMigrationResult {
   const result: SecretMigrationResult = { wallets: 0, settingsFields: [], failed: [] };
@@ -47,7 +49,7 @@ export function migrateSecretsToV2(db: Database.Database, keyHex: string, audit?
 
     const settings = db.prepare("SELECT * FROM settings WHERE id = 'global'").get() as Record<string, string | null> | undefined;
     if (settings) {
-      for (const field of SETTINGS_FIELDS) {
+      for (const field of SECRET_SETTINGS_FIELDS) {
         const value = settings[field];
         if (!value || isV2(value)) continue;
         const v2 = reencrypt(value, `settings.${field}`);
@@ -63,5 +65,49 @@ export function migrateSecretsToV2(db: Database.Database, keyHex: string, audit?
     logger.info(`[Secrets] Migrated to AES-256-GCM: ${result.wallets} wallet key(s), settings: ${result.settingsFields.join(', ') || 'none'}${result.failed.length ? `; failed: ${result.failed.join(', ')}` : ''}`);
     audit?.record('system', 'secrets.migrate_v2', null, result, result.failed.length ? 'partial' : 'ok');
   }
+  return result;
+}
+
+/** Every encrypted secret in the database, labelled (`wallet:<id>`, `settings.<field>`) */
+export function listSecrets(db: Database.Database): Array<{ label: string; payload: string; write: (v: string) => void }> {
+  const out: Array<{ label: string; payload: string; write: (v: string) => void }> = [];
+  const wallets = db.prepare('SELECT id, private_key_encrypted FROM wallets').all() as Array<{ id: string; private_key_encrypted: string | null }>;
+  const updateWallet = db.prepare('UPDATE wallets SET private_key_encrypted = ? WHERE id = ?');
+  for (const w of wallets) {
+    if (w.private_key_encrypted) out.push({ label: `wallet:${w.id}`, payload: w.private_key_encrypted, write: (v) => updateWallet.run(v, w.id) });
+  }
+  const settings = db.prepare("SELECT * FROM settings WHERE id = 'global'").get() as Record<string, string | null> | undefined;
+  for (const field of SECRET_SETTINGS_FIELDS) {
+    const value = settings?.[field];
+    if (value) out.push({ label: `settings.${field}`, payload: value, write: (v) => db.prepare(`UPDATE settings SET ${field} = ? WHERE id = 'global'`).run(v) });
+  }
+  return out;
+}
+
+export interface RekeyResult {
+  reencrypted: string[];
+}
+
+/**
+ * Decrypt every secret with `oldKeyHex` and re-encrypt it with `newKeyHex` (v2). Throws, changing
+ * nothing, if any secret cannot be decrypted with the old key.
+ */
+export function rekeySecrets(db: Database.Database, oldKeyHex: string, newKeyHex: string, audit?: AuditService): RekeyResult {
+  const secrets = listSecrets(db);
+  const failed: string[] = [];
+  const plain = secrets.map((s) => {
+    try {
+      return decrypt(s.payload, oldKeyHex);
+    } catch {
+      failed.push(s.label);
+      return null;
+    }
+  });
+  if (failed.length > 0) throw new Error(`Cannot decrypt with the old key: ${failed.join(', ')} (wrong password?)`);
+  db.transaction(() => {
+    secrets.forEach((s, i) => s.write(encrypt(plain[i] as string, newKeyHex)));
+  })();
+  const result = { reencrypted: secrets.map((s) => s.label) };
+  audit?.record('system', 'secrets.rekey', null, result, 'ok');
   return result;
 }

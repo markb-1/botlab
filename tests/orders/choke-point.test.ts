@@ -9,9 +9,9 @@ import { ESLint } from 'eslint';
  */
 
 const ROOT = path.resolve(__dirname, '..', '..');
-const SCAN_DIRS = ['electron', 'packages', 'templates', 'web/client/src', 'scripts'];
+const SCAN_DIRS = ['apps/server/src', 'apps/web/src', 'packages', 'templates', 'scripts'];
 const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs']);
-const SKIP_DIRS = new Set(['node_modules', 'dist', 'dist-electron', 'release']);
+const SKIP_DIRS = new Set(['node_modules', 'dist']);
 
 /** Modules that talk to exchange order endpoints directly */
 const ORDER_ENDPOINT_MODULES = ['packages/core/src/exchange/polymarket/orders.ts', 'packages/core/src/exchange/binance/client.ts'];
@@ -95,8 +95,8 @@ describe('order choke point', () => {
     expect(findViolations('src/x.ts', "import { postLimitOrder } from '../exchange/polymarket/orders';")).toHaveLength(1);
     expect(findViolations('packages/core/src/runtime/X.ts', 'executeBinanceBuy(creds, s, 1)')).toHaveLength(1);
     expect(findViolations('packages/core/src/runtime/X.ts', 'createPolymarketAdapter(clob)')).toHaveLength(1);
-    expect(findViolations('electron/x.ts', '// clob.postOrder( is documented here')).toHaveLength(0);
-    expect(findViolations('electron/x.ts', 'orderRepo.create({})')).toHaveLength(0);
+    expect(findViolations('apps/server/src/x.ts', '// clob.postOrder( is documented here')).toHaveLength(0);
+    expect(findViolations('apps/server/src/x.ts', 'orderRepo.create({})')).toHaveLength(0);
     expect(findViolations('src/x.ts', "fetch('https://x/sapi/v1/margin/order')")).toHaveLength(1);
     expect(findViolations('src/x.ts', "fetch('https://x/api/v3/orderList/oco')")).toHaveLength(1);
     expect(findViolations('src/x.ts', "fetch('https://x/api/v3/sor/order')")).toHaveLength(1);
@@ -137,7 +137,7 @@ export async function probe(c: ClobClient, s: Side) {
       '9:no-restricted-syntax',
       '10:no-restricted-syntax',
     ]);
-    expect(await chokeErrors('electron/ipc/Probe.ts')).toHaveLength(7);
+    expect(await chokeErrors('apps/server/src/routes/Probe.ts')).toHaveLength(7);
   }, 60_000);
 
   it('allows them in the adapter modules; BotManager may only import clob-client values', async () => {
@@ -150,18 +150,18 @@ export async function probe(c: ClobClient, s: Side) {
 });
 
 describe('packages/core is transport-free (spec §1.1)', () => {
-  it('no core module imports electron, electron/ or apps/*', () => {
+  it('no core module imports the HTTP framework, electron or apps/*', () => {
     const files = listFiles(path.join(ROOT, 'packages', 'core'));
     expect(files.length).toBeGreaterThan(50);
     const bad = files.filter((abs) =>
-      /(from\s+|require\(\s*|import\(\s*)['"](electron|[^'"]*\/electron\/[^'"]*|[^'"]*\/apps\/[^'"]*)['"]/.test(stripComments(fs.readFileSync(abs, 'utf8')))
+      /(from\s+|require\(\s*|import\(\s*)['"](electron|hono|hono\/[^'"]*|@hono\/[^'"]*|[^'"]*\/apps\/[^'"]*)['"]/.test(stripComments(fs.readFileSync(abs, 'utf8')))
     );
     expect(bad.map((f) => path.relative(ROOT, f))).toEqual([]);
   });
 
-  it('ESLint rejects an electron import in core', async () => {
+  it('ESLint rejects an HTTP framework import in core', async () => {
     const eslint = new ESLint({ cwd: ROOT });
-    const [result] = await eslint.lintText("import { app } from 'electron';\nexport const x = app;\n", {
+    const [result] = await eslint.lintText("import { Hono } from 'hono';\nexport const x = Hono;\n", {
       filePath: path.join(ROOT, 'packages/core/src/services/Probe.ts'),
     });
     expect(result.messages.filter((m) => m.severity === 2 && m.ruleId === '@typescript-eslint/no-restricted-imports')).toHaveLength(1);

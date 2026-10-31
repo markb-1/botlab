@@ -14,7 +14,7 @@ import { Worker } from 'worker_threads';
 import { BacktestRepository } from '../db/repositories/BacktestRepository';
 import { fetchKlines } from './klineCache';
 import { SCRIPT_WORKER_RESOURCE_LIMITS } from '../runtime/sandbox';
-import { resolveWorkerEntry } from '../runtime/workerPath';
+import { resolveWorkerEntry, startWorker } from '../runtime/workerPath';
 import type { SimulationInput, SimulationOutput } from './simulate';
 import type { FeeRatesInput, SnapshotSimulationInput, SnapshotSimulationOutput } from './snapshotSimulate';
 import type { BookSnapshot } from '../recorder/snapshotCodec';
@@ -315,7 +315,7 @@ export class BacktestEngine {
 /** Run the simulation in a worker; terminate it after `timeoutMs`. */
 export function runSimulationInWorker(input: SimulationInput | SnapshotSimulationInput, timeoutMs: number, workerPath: string): Promise<SimulationOutput> {
   return new Promise<SimulationOutput>((resolve, reject) => {
-    const worker = new Worker(workerPath, {
+    const worker = startWorker(workerPath, {
       workerData: input,
       env: {},
       resourceLimits: SCRIPT_WORKER_RESOURCE_LIMITS,
