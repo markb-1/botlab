@@ -71,6 +71,8 @@ export function botRoutes(bots: CoreServices['bots']): RouteDef[] {
     { method: 'post', path: '/api/bots/:id/start', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.start(param('id'), actor()) },
     { method: 'post', path: '/api/bots/:id/stop', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.stop(param('id'), actor()) },
     { method: 'post', path: '/api/bots/:id/restart', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.restart(param('id'), actor()) },
+    // Terminal stage (spec §2.1); the agent retires its own bots through MCP retire_bot
+    { method: 'post', path: '/api/bots/:id/retire', domainErrors: 'conflict', handler: ({ param, body, actor }) => bots.retire(param('id'), parseInput(ReasonSchema, body).reason, actor()) },
     { method: 'get', path: '/api/bots/:id/trades', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param, query }) => bots.trades(param('id'), queryNumber(query('hours'))) },
     { method: 'get', path: '/api/bots/:id/positions', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.positions(param('id')) },
     { method: 'get', path: '/api/bots/:id/stats', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.stats(param('id')) },
@@ -417,6 +419,19 @@ export function auditRoutes(auditLog: CoreServices['auditLog']): RouteDef[] {
   ];
 }
 
+// ── Agent (runs, notes, budget, exit flags; the agent itself uses MCP at /mcp) ─
+
+export function agentRoutes(agent: CoreServices['agent']): RouteDef[] {
+  return [
+    { method: 'get', path: '/api/agent/budget', handler: () => agent.budget() },
+    { method: 'get', path: '/api/agent/runs', handler: ({ query }) => agent.listRuns(queryNumber(query('limit')), query('before') || undefined) },
+    { method: 'get', path: '/api/agent/runs/:id', handler: ({ param }) => agent.getRun(param('id')) },
+    { method: 'get', path: '/api/agent/notes', handler: ({ query }) => agent.listNotes({ scope: query('scope'), query: query('q'), limit: queryNumber(query('limit')) }) },
+    { method: 'delete', path: '/api/agent/notes/:id', handler: ({ param, actor }) => agent.deleteNote(param('id'), actor()) },
+    { method: 'get', path: '/api/agent/exit-flags', handler: ({ query }) => agent.listExitFlags(query('status')) },
+  ];
+}
+
 export function apiRoutes(services: CoreServices): RouteDef[] {
   return [
     ...botRoutes(services.bots),
@@ -429,6 +444,7 @@ export function apiRoutes(services: CoreServices): RouteDef[] {
     ...ledgerRoutes(services.ledger, services.markets),
     ...reconcileRoutes(services.reconcile),
     ...auditRoutes(services.auditLog),
+    ...agentRoutes(services.agent),
   ];
 }
 

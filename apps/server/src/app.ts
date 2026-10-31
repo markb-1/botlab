@@ -1,6 +1,6 @@
 /**
  * The Hono application (spec §8): host check → `/healthz` → `/api` (principal, CSRF, auth routes, API
- * routes, SSE) → the built web app with SPA fallback. Transport only: every route calls core services.
+ * routes, SSE) → `/mcp` (agent token, spec §7.3) → the built web app with SPA fallback. Transport only: every route calls core services.
  */
 
 import { Hono } from 'hono';
@@ -14,6 +14,7 @@ import { SseHub } from './http/sse';
 import { serveWeb } from './http/static';
 import { apiRoutes } from './routes/api';
 import { registerAuthRoutes, LoginLimiter } from './routes/auth';
+import { mountMcp } from './mcp/http';
 
 export interface AppOptions {
   core: Core;
@@ -92,6 +93,9 @@ export function createApp(opts: AppOptions): BotLabApp {
   });
 
   app.all('/api/*', (c) => fail(c, new HttpError(404, 'not_found', `No such endpoint: ${c.req.method} ${c.req.path}`)));
+
+  // MCP for the agent (spec §7.3): agent bearer token only
+  mountMcp(app, core, { version: process.env.npm_package_version });
 
   if (opts.webDir) {
     const web = serveWeb(opts.webDir);
