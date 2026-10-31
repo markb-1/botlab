@@ -320,11 +320,11 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       status: 'rejected_risk',
       failedCheck: 'max_order',
     });
-    // Resting paper orders are not simulated
+    // Resting paper orders rest (5a: filled by later syncs when the book crosses them)
     expect(await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })).toMatchObject({
-      ok: false,
-      status: 'invalid',
-      error: 'paper mode: resting orders not simulated yet',
+      ok: true,
+      status: 'open',
+      filledSize: 0,
     });
 
     expect(poly.postMarketOrder).not.toHaveBeenCalled();

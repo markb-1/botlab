@@ -479,10 +479,6 @@ export class OrderService {
     }
     const marketable = this.isMarketable({ side: input.side, price: input.price, orderType: 'limit' }, ctx.market);
 
-    if (this.paper && !marketable && ctx.market) {
-      return invalid('paper mode: resting orders not simulated yet');
-    }
-
     const expiresAtMs = this.now() + ttl * MS_PER_MINUTE;
     const preCheck =
       postOnly && marketable
@@ -508,6 +504,8 @@ export class OrderService {
       },
       async (row) => {
         if (this.paper) {
+          // Resting paper order (R12 amended, 5a): stays open; later syncs fill it when the book crosses it
+          if (!marketable) return { kind: 'accepted', exchangeOrderId: null, status: 'live', filledSize: 0, filledNotional: 0 };
           // Marketable paper limit order: fills in full at the limit price
           const ps = this.requirePaper();
           const level = [{ price: String(input.price), size: String(input.size) }];
@@ -957,12 +955,18 @@ export class OrderService {
 
   private async syncUnlocked(): Promise<void> {
     const now = this.now();
+    const books = new Map<string, Promise<ClobBook | null>>();
     for (const row of this.deps.orderRepo.findOpen(this.bot.botId, this.paper)) {
       const exp = row.expires_at ? Date.parse(row.expires_at) : null;
 
-      // Paper orders cannot be looked up: they count as open until their expiry, then they are dead
+      // Paper orders: expired at their TTL (checked first: a cross first seen after the expiry never fills it),
+      // otherwise a resting limit order fills against the book read now (simulatePaperRestingFill)
       if (this.paper) {
-        if (exp !== null && now >= exp) this.expire(row.id, 'expired with no fill seen');
+        if (exp !== null && now >= exp) {
+          this.expire(row.id, 'expired with no fill seen');
+          continue;
+        }
+        if (row.exchange === 'polymarket' && row.order_type === 'limit') await this.simulatePaperRestingFill(row, books);
         continue;
       }
       // Live order with no exchange id (outcome unknown): it may have filled. Only the Reconciler may
@@ -985,6 +989,57 @@ export class OrderService {
       if (now >= exp + EXPIRY_GRACE_MS || (!ex && now >= exp)) {
         this.expire(row.id, ex ? 'past GTD expiry' : 'not returned by exchange after expiry');
       }
+    }
+  }
+
+  /**
+   * Paper resting-order simulation (R12 amended in 5a). A resting paper limit order fills when a book read
+   * during a sync — necessarily after the order was placed (the placement's own sync runs before the row
+   * exists) — shows the opposite side at or through its price: a buy against asks <= its price, a sell
+   * against bids >= its price. It fills at its own limit price (a maker never gets the better crossing price),
+   * up to the size resting at those levels, as a maker fill (fee 0, R125). Partial fills stay open. A book
+   * that cannot be read leaves the order as is. If the paper state refuses (cash or position gone), the order
+   * is cancelled. Fills happen only when the bot syncs (any order call, getOpenOrders), not continuously.
+   */
+  private async simulatePaperRestingFill(row: OrderRow, books: Map<string, Promise<ClobBook | null>>): Promise<void> {
+    const remaining = row.size - row.filled_size;
+    if (!(remaining > QTY_EPS)) return;
+    let pending = books.get(row.token_id);
+    if (!pending) {
+      pending = this.deps.getBook(row.token_id).catch(() => null);
+      books.set(row.token_id, pending);
+    }
+    const book = await pending;
+    if (!book) return;
+    const buy = row.side === 'buy';
+    let available = 0;
+    for (const l of (buy ? book.asks : book.bids) ?? []) {
+      const p = parseFloat(l.price);
+      const s = parseFloat(l.size);
+      if (!Number.isFinite(p) || !Number.isFinite(s) || s <= 0) continue;
+      if (buy ? p <= row.price + 1e-9 : p >= row.price - 1e-9) available += s;
+    }
+    const qty = Math.min(remaining, available);
+    if (!(qty > QTY_EPS)) return;
+
+    const ps = this.requirePaper();
+    const level = [{ price: String(row.price), size: String(qty) }];
+    const res = buy
+      ? ps.simulateBuy(row.token_id, row.price * qty, { bids: [], asks: level }, { maxPrice: row.price })
+      : ps.simulateSell(row.token_id, qty, { bids: level, asks: [] }, { minPrice: row.price });
+    if (!res.success || !(res.tokenAmount > QTY_EPS)) {
+      const fresh = this.deps.orderRepo.findById(row.id);
+      if (fresh && OPEN_STATUSES.includes(fresh.status)) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
+      logger.warning(`[OrderService] ${this.bot.botName}: paper order ${row.id} cancelled: ${res.error ?? 'paper fill refused'}`);
+      return;
+    }
+    const matched = Math.min(row.filled_size + res.tokenAmount, row.size);
+    this.applyExchangeState(row.id, { status: matched >= row.size - QTY_EPS ? 'matched' : 'live', sizeMatched: matched });
+    try {
+      const info = await this.deps.marketData.getMarketInfo(row.token_id);
+      if (info) ps.updatePositionMeta(row.token_id, info.question, info.outcome);
+    } catch {
+      /* position labels only */
     }
   }
 
