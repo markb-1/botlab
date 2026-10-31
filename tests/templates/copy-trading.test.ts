@@ -267,6 +267,10 @@ describe('copy trading v2: sizing and prices', () => {
     expect(planBuyPrice(0.985, 0.01, 0.99, 0.001)).toEqual({ price: 0.99 });
     expect(planSellPrice(0.5, 0.01, 0.01)).toBe(0.49);
     expect(planSellPrice(0.005, 0.01, 0.01)).toBe(0.01);
+    // The data API reports fills as usdcSize / size, a few 1e-7 off the tick (live values, 2026-10-31)
+    expect(planBuyPrice(0.3699999935, 0.01, null, 0.01)).toEqual({ price: 0.38 });
+    expect(planBuyPrice(0.7699996821, 0.01, null, 0.01)).toEqual({ price: 0.78 });
+    expect(planSellPrice(0.5400002024, 0.01, 0.01)).toBe(0.53);
   });
 
   it('TTL is at least 3 minutes (GTD minimum); legacy keys still read', () => {

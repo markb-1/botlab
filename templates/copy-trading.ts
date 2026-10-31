@@ -388,9 +388,12 @@ export function buyUsd(cfg: CopyConfig, leaderUsd: number, budget: RiskBudget, m
   return { usd: round6(Math.max(usd, 0)), cappedBy };
 }
 
+/** The data API reports fill prices as usdcSize / size, a few 1e-7 off the tick: snap within this before rounding */
+const PRICE_EPS = 1e-6;
+
 /** Buy limit = leader fill + max_chase on the tick grid; skipped when the best ask is already above it. */
 export function planBuyPrice(leaderPrice: number, maxChase: number, bestAsk: number | null, tick: number): { price: number } | { skip: string } {
-  const limit = round6(Math.floor((Math.min(leaderPrice + maxChase, MAX_PRICE) + 1e-9) / tick) * tick);
+  const limit = round6(Math.floor((Math.min(leaderPrice + maxChase, MAX_PRICE) + PRICE_EPS) / tick) * tick);
   if (!(limit >= MIN_PRICE)) return { skip: 'leader price below the minimum' };
   if (bestAsk !== null && bestAsk > limit + 1e-9) return { skip: `book moved: best ask ${bestAsk} > leader ${leaderPrice} + chase ${maxChase}` };
   return { price: limit };
@@ -398,7 +401,7 @@ export function planBuyPrice(leaderPrice: number, maxChase: number, bestAsk: num
 
 /** Sell limit = leader fill − max_chase on the tick grid (rests when the bid is lower: no chase). */
 export function planSellPrice(leaderPrice: number, maxChase: number, tick: number): number {
-  return round6(Math.min(Math.max(Math.ceil((Math.max(leaderPrice - maxChase, MIN_PRICE) - 1e-9) / tick) * tick, MIN_PRICE), MAX_PRICE));
+  return round6(Math.min(Math.max(Math.ceil((Math.max(leaderPrice - maxChase, MIN_PRICE) - PRICE_EPS) / tick) * tick, MIN_PRICE), MAX_PRICE));
 }
 
 /**
