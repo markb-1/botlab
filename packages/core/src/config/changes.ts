@@ -215,6 +215,16 @@ export function classifyKey(file: ConfigFileName, path: string, o: unknown, n: u
       // Notifications are a safety net: turning them off or pointing them elsewhere is a loosening
       if (path === 'notify.telegram.enabled') return o === true && n === false ? 'raises' : 'neutral';
       if (path === 'notify.telegram.chat_id' || path === 'notify.telegram.bot_token') return 'raises';
+      // The scheduled agent spends money and creates paper bots: more of it raises, less of it lowers
+      if (path === 'agent.enabled') return effectOf('enable', o, n);
+      if (path === 'agent.events.enabled') return effectOf('enable', o, n);
+      if (path === 'agent.model') return o === n ? 'neutral' : 'raises'; // pricier / different model: confirm
+      if (path === 'agent.max_turns' || path === 'agent.events.max_per_day') return effectOf('up', o, n);
+      if (path === 'agent.events.debounce_minutes') return effectOf('down', o, n);
+      if (path === 'agent.schedule.cycles') {
+        if (!Array.isArray(o) || !Array.isArray(n)) return 'raises';
+        return n.length > o.length ? 'raises' : n.length < o.length ? 'lowers' : 'neutral';
+      }
       return 'neutral';
     case 'categories':
       // Any remap can move markets into an allowed category; cannot tell cheaply, assume it raises

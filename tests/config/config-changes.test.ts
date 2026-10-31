@@ -15,8 +15,25 @@ function edit(fn: (c: AppConfig) => void): AppConfig {
   return c;
 }
 
+describe('classifyChange agent.enabled', () => {
+  it('true -> false lowers', () => {
+    const on = edit((c) => (c.server.agent.enabled = true));
+    const res = classifyChange(on, base());
+    expect(res).toHaveLength(1);
+    expect(res[0].effect).toBe('lowers');
+  });
+});
+
 describe('classifyChange', () => {
   const table: Array<[string, (c: AppConfig) => void, 'raises' | 'lowers' | 'neutral']> = [
+    ['enabling the agent', (c) => (c.server.agent.enabled = true), 'raises'],
+    ['switching the agent model', (c) => (c.server.agent.model = 'claude-opus-5-5'), 'raises'],
+    ['adding an agent cycle', (c) => (c.server.agent.schedule.cycles = [...c.server.agent.schedule.cycles, '21:30']), 'raises'],
+    ['removing an agent cycle', (c) => (c.server.agent.schedule.cycles = ['11:30']), 'lowers'],
+    ['moving the agent review time', (c) => (c.server.agent.schedule.review = '08:00'), 'neutral'],
+    ['raising the agent monthly budget', (c) => (c.limits.agent.monthly_llm_budget_usd += 5), 'raises'],
+    ['lowering agent max tool calls per run', (c) => (c.limits.agent.max_tool_calls_per_run -= 1), 'lowers'],
+    ['raising agent max active bots', (c) => (c.limits.agent.max_active_bots += 1), 'raises'],
     ['raising total exposure', (c) => (c.limits.global.max_total_exposure_usd = 400), 'raises'],
     ['lowering total exposure', (c) => (c.limits.global.max_total_exposure_usd = 200), 'lowers'],
     ['raising max order', (c) => (c.limits.per_bot_defaults.max_order_usd = 30), 'raises'],

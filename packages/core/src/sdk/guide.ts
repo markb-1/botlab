@@ -142,7 +142,9 @@ Live trading off (\`live_trading.enabled\`), halts (global / bot / kill switch),
 simulated; probation ⇒ small allocation), per-order and per-hour caps, per-market exposure, total and long-horizon
 exposure, minimum liquidity / top of book, maximum spread and slippage, no trading in the last hour before the end,
 unassessed or too ambiguous markets (buys), a rules change in the last 7 days, the mandate's categories, minimum
-hold time before selling (risk exits are exempt), and an edge check net of fees for ledger orders. Polymarket taker
+hold time before selling (risk exits are exempt), and an edge check net of fees for ledger orders. Exposure limits (e.g. \`totalLimitUsd\` in
+\`get_overview\`) apply to live trading and are 0 when there is no live equity; paper bots are limited by their stage
+allocation instead. Polymarket taker
 fee per share = rate × p × (1 − p); makers pay nothing. Paper mode: resting (non-marketable) orders are not
 simulated yet; paper balances do not deduct fees.
 

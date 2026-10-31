@@ -161,7 +161,8 @@ const modeFilter = z.enum(['paper', 'live']).optional().describe('Only paper or 
 export const AgentSearchMarketsSchema = z.object({
   q: z.string().max(200).optional().describe('Search text; empty ⇒ the most traded open markets'),
   category: z.string().max(60).optional().describe('BotLab category (categories.yaml), e.g. weather-climate'),
-  minLiquidityUsd: z.number().nonnegative().optional().describe('Minimum 24h volume (USD)'),
+  minVolume24hUsd: z.number().nonnegative().optional().describe('Minimum 24h volume (USD)'),
+  minLiquidityUsd: z.number().nonnegative().optional().describe('Deprecated alias of minVolume24hUsd (it always filtered on 24h volume)'),
   endWithinDays: z.tuple([z.number().nonnegative(), z.number().nonnegative()]).optional().describe('[min, max] days until the market ends'),
   minPrice: z.number().min(0).max(1).optional().describe('Minimum YES price'),
   maxPrice: z.number().min(0).max(1).optional().describe('Maximum YES price'),

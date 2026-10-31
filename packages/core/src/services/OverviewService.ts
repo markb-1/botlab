@@ -49,6 +49,8 @@ export interface BotAllocationView {
   botId: string;
   name: string;
   stage: string;
+  /** Bot run state: running / stopped / error / ... */
+  status: string;
   /** Paper bots are measured against their own paper orders and fills (stage paper counts as full) */
   simulated: boolean;
   /** Effective Polymarket allocation for the stage; null when the config is invalid */
@@ -321,6 +323,7 @@ export class OverviewService {
         botId: b.id,
         name: b.name,
         stage: b.stage,
+        status: b.status,
         simulated,
         allocationUsd,
         usedUsd,

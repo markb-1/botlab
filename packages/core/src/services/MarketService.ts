@@ -174,7 +174,7 @@ export class MarketService {
     q?: string;
     category?: string;
     active?: boolean;
-    minLiquidityUsd?: number;
+    minVolume24hUsd?: number;
     endWithinDays?: [number, number];
     minPrice?: number;
     maxPrice?: number;
@@ -192,7 +192,7 @@ export class MarketService {
       const end = h.endDate ? Date.parse(h.endDate) : NaN;
       const daysToEnd = Number.isNaN(end) ? null : (end - now) / DAY_MS;
       const yes = h.outcomePrices?.[0] !== undefined ? parseFloat(h.outcomePrices[0]) : NaN;
-      if (input.minLiquidityUsd !== undefined && !((h.volume24hUsd ?? 0) >= input.minLiquidityUsd)) continue;
+      if (input.minVolume24hUsd !== undefined && !((h.volume24hUsd ?? 0) >= input.minVolume24hUsd)) continue;
       if (input.endWithinDays && (daysToEnd === null || daysToEnd < input.endWithinDays[0] || daysToEnd > input.endWithinDays[1])) continue;
       if (input.minPrice !== undefined && !(yes >= input.minPrice)) continue;
       if (input.maxPrice !== undefined && !(yes <= input.maxPrice)) continue;

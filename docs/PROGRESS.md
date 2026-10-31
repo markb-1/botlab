@@ -1041,3 +1041,12 @@ Independent security review of b434e6b..0e1225e. Fixed (R149, R150, R152, R154 a
 5. Nits: quiet hours re-checked at fire time (test: the 23:30 slot at 00:10 is skipped), cost cap ≤ remaining
    month budget (test: $4.60 of $5 used ⇒ cap $0.40), failed event-run starts keep their triggers (audited,
    retried after 5 min).
+
+### 2026-10-31 — Phase 4 test follow-ups (docs/TEST-REPORT-MAC-PHASE4.md observations)
+
+- `get_overview` bot rows now carry `status` (and already `stage`).
+- Config review: `server.yaml agent.enabled` false→true, `agent.model` change, more `agent.schedule.cycles`, higher
+  `agent.max_turns` / `events.max_per_day` are `raises` (reverse `lowers`); limits.yaml agent caps were already covered.
+  Table tests added.
+- Agent guide and system prompt (now v2): exposure limits (`totalLimitUsd`) are live-only, 0 without live equity.
+- `search_markets`: `minLiquidityUsd` renamed `minVolume24hUsd` (it filters 24h volume); old name kept as a deprecated alias for one release.
