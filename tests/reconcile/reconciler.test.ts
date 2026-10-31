@@ -13,7 +13,7 @@ vi.mock('../../packages/core/src/utils/logger', () => ({
 import { sqliteAvailable } from '../orders/db';
 import { openRiskHarness, MARKET, type RiskHarness } from '../risk/riskHarness';
 import { applyPlacementResult } from '../../packages/core/src/orders/orderFills';
-import { walletChangeBlocker } from '../../electron/ipc/handlers/botHandlers';
+import { walletChangeBlocker } from '../../packages/core/src/services/BotService';
 import { WalletRepository } from '../../packages/core/src/db/repositories/WalletRepository';
 import { GLOBAL_SCOPE } from '../../packages/core/src/db/repositories/RiskStateRepository';
 import { Reconciler, RECONCILER_FAILURE_ALERT, type ReconcilerDeps } from '../../packages/core/src/reconcile/Reconciler';

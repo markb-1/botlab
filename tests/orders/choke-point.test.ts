@@ -148,3 +148,22 @@ export async function probe(c: ClobClient, s: Side) {
     expect(botManager).toContain('7:no-restricted-syntax');
   }, 60_000);
 });
+
+describe('packages/core is transport-free (spec §1.1)', () => {
+  it('no core module imports electron, electron/ or apps/*', () => {
+    const files = listFiles(path.join(ROOT, 'packages', 'core'));
+    expect(files.length).toBeGreaterThan(50);
+    const bad = files.filter((abs) =>
+      /(from\s+|require\(\s*|import\(\s*)['"](electron|[^'"]*\/electron\/[^'"]*|[^'"]*\/apps\/[^'"]*)['"]/.test(stripComments(fs.readFileSync(abs, 'utf8')))
+    );
+    expect(bad.map((f) => path.relative(ROOT, f))).toEqual([]);
+  });
+
+  it('ESLint rejects an electron import in core', async () => {
+    const eslint = new ESLint({ cwd: ROOT });
+    const [result] = await eslint.lintText("import { app } from 'electron';\nexport const x = app;\n", {
+      filePath: path.join(ROOT, 'packages/core/src/services/Probe.ts'),
+    });
+    expect(result.messages.filter((m) => m.severity === 2 && m.ruleId === '@typescript-eslint/no-restricted-imports')).toHaveLength(1);
+  }, 60_000);
+});

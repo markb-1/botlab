@@ -11,6 +11,7 @@ vi.mock('electron', () => ({
 }));
 
 import { registerBotHandlers } from '../../electron/ipc/handlers/botHandlers';
+import { BotService } from '../../packages/core/src/services/BotService';
 
 function makeBotRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -101,12 +102,16 @@ describe('botHandlers', () => {
     };
 
     registerBotHandlers(
-      mockBotRepo as any,
-      mockWalletRepo as any,
-      mockScriptRepo as any,
-      mockTradeRepo as any,
-      mockBotManager as any,
-      mockWalletManager as any
+      new BotService({
+        botRepo: mockBotRepo as any,
+        walletRepo: mockWalletRepo as any,
+        scriptRepo: mockScriptRepo as any,
+        tradeRepo: mockTradeRepo as any,
+        storageRepo: {} as any,
+        settingsRepo: {} as any,
+        botManager: () => mockBotManager as any,
+        walletManager: () => mockWalletManager as any,
+      })
     );
   });
 
