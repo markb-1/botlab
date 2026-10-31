@@ -514,6 +514,8 @@ export type MainToWorkerMessage =
   | { type: 'start' }
   | { type: 'stop' }
   | { type: 'heartbeat' }
+  /** Liveness check, answered by the bootstrap without running script code */
+  | { type: 'ping' }
   | { type: 'rpc-response'; response: RpcResponse };
 
 /** Messages from worker to main process */
@@ -525,4 +527,5 @@ export type WorkerToMainMessage =
   | { type: 'rpc-request'; request: RpcRequest }
   /** onTick began / settled (main-side tick watchdog) */
   | { type: 'tick-start'; id: number }
-  | { type: 'tick-end'; id: number };
+  | { type: 'tick-end'; id: number }
+  | { type: 'pong' };

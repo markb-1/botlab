@@ -176,15 +176,16 @@ async function pollTraders(ctx, traders: string[]) {
         totalNewTrades += newTrades.length;
       }
 
-      // Oldest first. For a sell, the leader's position right after it = their current position minus
-      // the net tokens they traded in this asset later in the batch.
+      // Oldest first: the API lists newest first, so reverse, then a stable sort by time keeps same-second rows
+      // in oldest-first order. For a sell, the leader's position right after it = their current position
+      // minus the net tokens they traded in this asset later in the batch (by index).
       const tsOf = (a: any) => (a.timestamp < 1e12 ? a.timestamp * 1000 : a.timestamp);
-      newTrades.sort((a: any, b: any) => tsOf(a) - tsOf(b));
+      newTrades.reverse().sort((a: any, b: any) => tsOf(a) - tsOf(b));
       for (let i = 0; i < newTrades.length; i++) {
         const trade = newTrades[i];
         let laterNetTokens = 0;
         for (const later of newTrades.slice(i + 1)) {
-          if (later.asset !== trade.asset || tsOf(later) <= tsOf(trade)) continue;
+          if (later.asset !== trade.asset) continue;
           const size = parseFloat(later.size || '0') || 0;
           laterNetTokens += later.side === 'BUY' ? size : later.side === 'SELL' ? -size : 0;
         }
@@ -338,7 +339,7 @@ async function processTrade(ctx, trade: any, traderAddress: string, laterNetToke
     }
 
     if (result.success) {
-      dailyVolume += result.executedAmount;
+      if (side === 'BUY') dailyVolume += result.executedAmount; // the cap limits buying only
       ctx.log.info(
         `Copied ${side} from ${traderAddress.slice(0, 8)}... ` +
         `$${result.executedAmount.toFixed(2)} @ ${result.price.toFixed(4)}`

@@ -26,6 +26,9 @@ import {
 import type { BinanceCredentials } from '../sdk/binance';
 import { toTradeResult, type OrderResult, type OrderService } from '../orders/OrderService';
 import { scriptFetch } from './scriptFetch';
+
+/** ctx.fetch requests a bot may have in flight; more are rejected at once (spec §5.1 hardening). */
+export const MAX_CONCURRENT_FETCHES = 6;
 import logger from '../../src/utils/logger';
 
 export interface RpcHandlerDeps {
@@ -76,6 +79,7 @@ function orderOpts(v: unknown): OrderOpts {
 export class RpcHandler {
   private deps: RpcHandlerDeps;
   private paperState: PaperTradingState | null;
+  private fetchesInFlight = 0;
   constructor(deps: RpcHandlerDeps, paperState?: PaperTradingState) {
     this.deps = deps;
     this.paperState = paperState || null;
@@ -247,8 +251,17 @@ export class RpcHandler {
 
       // === HTTP (allowlisted, executed here so the worker has no network access of its own) ===
 
-      case 'fetch':
-        return scriptFetch(args[0], args[1], { allowlist: this.deps.fetchAllowlist, fetchImpl: this.deps.fetchImpl });
+      case 'fetch': {
+        if (this.fetchesInFlight >= MAX_CONCURRENT_FETCHES) {
+          throw new Error(`fetch: too many concurrent requests (max ${MAX_CONCURRENT_FETCHES} in flight per bot)`);
+        }
+        this.fetchesInFlight++;
+        try {
+          return await scriptFetch(args[0], args[1], { allowlist: this.deps.fetchAllowlist, fetchImpl: this.deps.fetchImpl });
+        } finally {
+          this.fetchesInFlight--;
+        }
+      }
 
       // === Storage ===
 

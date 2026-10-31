@@ -5,7 +5,7 @@
  */
 
 import { parentPort as maybeParentPort, workerData } from 'worker_threads';
-import { hardenWorkerGlobals } from '../runtime/sandbox';
+import { hardenWorkerRealm } from '../runtime/sandbox';
 import { runBacktestSimulation, type SimulationInput } from './simulate';
 
 if (!maybeParentPort) {
@@ -13,7 +13,7 @@ if (!maybeParentPort) {
 }
 const parentPort = maybeParentPort;
 
-hardenWorkerGlobals();
+hardenWorkerRealm();
 
 runBacktestSimulation(workerData as SimulationInput)
   .then((output) => parentPort.postMessage({ type: 'result', output }))

@@ -22,6 +22,7 @@ vi.mock('../../electron/backtest/klineCache', () => ({
 import { BacktestEngine } from '../../electron/backtest/BacktestEngine';
 import { compileScript } from '../../electron/runtime/compileScript';
 import { buildWorker, ROOT } from './buildWorker';
+import { escapeProbe } from './escapeProbe';
 
 function fakeRepo() {
   const trades: Array<Record<string, unknown>> = [];
@@ -98,17 +99,18 @@ describe('BacktestEngine worker', () => {
     expect(repo.updateRun).toHaveBeenCalledWith('run-1', expect.objectContaining({ status: 'error' }));
   });
 
-  it('gives the script no require or process', async () => {
-    const code = await compile(`
-      export async function onTick(ctx) {
-        const g = Function('return this')();
-        if (typeof require !== 'undefined' || typeof process !== 'undefined' || typeof g.process !== 'undefined') {
-          throw new Error('escape hatch available');
-        }
-      }
-    `);
+  it('gives the script no require or process and closes the known escapes', async () => {
+    // The probe throws its results from onStart; onStart errors are logged, so report through a trade-free path:
+    // onTick throws if anything escaped, which shows up as a tick error.
+    const code = escapeProbe(
+      "globalThis.__escaped = Object.keys(results).filter((k) => results[k] === 'ESCAPED' || !/^(blocked|nothing)/.test(results[k]));"
+    ).replace(
+      'module.exports.onTick = async function (ctx) {};',
+      "module.exports.onTick = async function (ctx) { if (!globalThis.__escaped) throw new Error('probe did not run'); if (globalThis.__escaped.length) throw new Error('escaped: ' + globalThis.__escaped.join(',')); };"
+    );
     const result = await engine(code, fakeRepo()).run();
     expect(result.status).toBe('completed');
+    expect(result.stats.firstTickError).toBeUndefined();
     expect(result.stats.tickErrors).toBe(0);
   });
 });

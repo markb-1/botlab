@@ -51,6 +51,8 @@ describe('BotManager.startBot halt races', () => {
       }),
       update: vi.fn(),
       recordRunDay: vi.fn(),
+      recordRuntimeError: vi.fn(),
+      appendError: vi.fn(),
     };
     audit = { record: vi.fn() };
     walletManager = { getWallet: vi.fn().mockResolvedValue({ address: '0xabc', privateKey: PRIVATE_KEY }) };
@@ -99,5 +101,15 @@ describe('BotManager.startBot halt races', () => {
     expect(botRepo.update).toHaveBeenCalledWith('b1', expect.objectContaining({ status: 'stopped' }));
     expect(audit.record).toHaveBeenCalledWith('system', 'bot.stop', 'b1', expect.objectContaining({ reason: expect.stringMatching(/halted during start/) }), 'ok');
     expect(audit.record).toHaveBeenCalledWith('human', 'bot.start', 'b1', undefined, expect.stringMatching(/^error: Bot is halted/));
+  });
+
+  it('a fatal worker error (watchdog / unresponsive) marks the bot error and audits it', async () => {
+    await manager.startBot('b1', 'human');
+    const runner = runners[0];
+    runner.emit('bot:event', { type: 'error', botId: 'b1', data: { fatal: true, reason: 'worker_unresponsive', message: 'blocked' } });
+    expect(manager.isRunning('b1')).toBe(false);
+    expect(botRepo.update).toHaveBeenCalledWith('b1', expect.objectContaining({ status: 'error' }));
+    expect(botRepo.appendError).toHaveBeenCalledWith('b1', 'blocked');
+    expect(audit.record).toHaveBeenCalledWith('system', 'bot.error', 'b1', { reason: 'worker_unresponsive', message: 'blocked' }, 'terminated');
   });
 });

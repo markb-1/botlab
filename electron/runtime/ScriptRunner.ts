@@ -21,6 +21,10 @@ import { SCRIPT_WORKER_RESOURCE_LIMITS } from './sandbox';
 export const TICK_TIMEOUT_MS = 30_000;
 /** Consecutive strikes before the worker is terminated and the bot marked `error`. */
 export const MAX_TICK_TIMEOUTS = 3;
+/** The main thread pings the worker this often (answered by the bootstrap, not by script code). */
+export const LIVENESS_PING_MS = 30_000;
+/** No message at all from the worker for this long ⇒ terminated as unresponsive (2 heartbeat periods). */
+export const LIVENESS_TIMEOUT_MS = 120_000;
 /** Module load + onStart must finish within this, or the worker is terminated. */
 export const START_TIMEOUT_MS = 60_000;
 
@@ -38,6 +42,8 @@ export interface ScriptRunnerOptions {
   tickTimeoutMs?: number;
   maxTickTimeouts?: number;
   startTimeoutMs?: number;
+  livenessPingMs?: number;
+  livenessTimeoutMs?: number;
 }
 
 /**
@@ -49,7 +55,7 @@ export interface ScriptRunnerOptions {
  * - 'event': { type: string, data?: Record<string, unknown> } - custom bot event
  * - 'log': { level: string, args: unknown[] } - log from script
  * - 'tick-timeout': { strikes: number, elapsedMs: number } - an onTick exceeded the tick timeout
- * - 'fatal': { message: string, reason: 'tick_watchdog' | 'worker_exit' } - the worker died or was
+ * - 'fatal': { message: string, reason: 'tick_watchdog' | 'worker_unresponsive' | 'worker_exit' } - the worker died or was
  *   terminated while running (not via stop()); the bot must be marked `error`
  */
 export class ScriptRunner extends EventEmitter {
@@ -65,7 +71,10 @@ export class ScriptRunner extends EventEmitter {
   private tickStartedAt = 0;
   private tickStruck = false;
   private tickStrikes = 0;
-  private fatalReason: 'tick_watchdog' | null = null;
+  private fatalReason: 'tick_watchdog' | 'worker_unresponsive' | null = null;
+  // Liveness: any message from the worker counts; a worker blocked in a synchronous loop sends none
+  private lastSeenAt = 0;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: ScriptRunnerOptions) {
     super();
@@ -112,6 +121,7 @@ export class ScriptRunner extends EventEmitter {
       startTimer.unref?.();
 
       this.worker.on('message', async (msg: WorkerToMainMessage) => {
+        this.lastSeenAt = Date.now();
         switch (msg.type) {
           case 'started':
             if (startResolved) break; // start already timed out
@@ -119,6 +129,7 @@ export class ScriptRunner extends EventEmitter {
             this.running = true;
             this.startedOk = true;
             startResolved = true;
+            this.startLiveness();
             this.emit('started');
             resolve();
             break;
@@ -145,6 +156,9 @@ export class ScriptRunner extends EventEmitter {
             this.onTickEnd();
             break;
 
+          case 'pong':
+            break;
+
           case 'heartbeat-result':
             this.emit('heartbeat', { metrics: msg.metrics });
             break;
@@ -169,6 +183,7 @@ export class ScriptRunner extends EventEmitter {
         this.running = false;
         if (this.worker === worker) this.worker = null;
         this.clearTickWatchdog();
+        this.stopLiveness();
         clearTimeout(startTimer);
         if (!startResolved) {
           startResolved = true;
@@ -182,7 +197,9 @@ export class ScriptRunner extends EventEmitter {
           const reason = this.fatalReason ?? 'worker_exit';
           const message = reason === 'tick_watchdog'
             ? `onTick did not finish within ${Math.round(this.tickTimeoutMs / 1000)} s ${this.maxTickTimeouts} times in a row; worker terminated`
-            : `Worker exited unexpectedly (code ${code})`;
+            : reason === 'worker_unresponsive'
+              ? `Worker sent nothing for ${Math.round(this.livenessTimeoutMs / 1000)} s (blocked event loop); worker terminated`
+              : `Worker exited unexpectedly (code ${code})`;
           this.emit('fatal', { message, reason });
         }
         this.emit('stopped');
@@ -200,6 +217,7 @@ export class ScriptRunner extends EventEmitter {
     if (!this.worker) return;
     this.stopRequested = true;
     this.clearTickWatchdog();
+    this.stopLiveness();
 
     return new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -272,11 +290,46 @@ export class ScriptRunner extends EventEmitter {
     this.tickStrikes++;
     const elapsedMs = Date.now() - this.tickStartedAt;
     this.emit('tick-timeout', { strikes: this.tickStrikes, elapsedMs });
-    if (this.tickStrikes >= this.maxTickTimeouts && this.worker && !this.stopRequested) {
+    if (this.tickStrikes >= this.maxTickTimeouts && this.worker && !this.stopRequested && !this.fatalReason) {
       this.clearTickWatchdog();
+      this.stopLiveness();
       this.fatalReason = 'tick_watchdog';
       void this.worker.terminate();
     }
+  }
+
+  /**
+   * Liveness (catches a synchronous loop anywhere, e.g. in a ctx.setInterval callback, which the tick
+   * watchdog does not see): ping every `livenessPingMs`; nothing received for `livenessTimeoutMs` ⇒
+   * terminate with fatal reason `worker_unresponsive`.
+   */
+  private startLiveness(): void {
+    this.stopLiveness();
+    this.lastSeenAt = Date.now();
+    const timeoutMs = this.livenessTimeoutMs;
+    this.livenessTimer = setInterval(() => {
+      if (!this.worker || this.stopRequested || this.fatalReason) return;
+      if (Date.now() - this.lastSeenAt > timeoutMs) {
+        this.stopLiveness();
+        this.clearTickWatchdog();
+        this.fatalReason = 'worker_unresponsive';
+        void this.worker.terminate();
+        return;
+      }
+      this.sendToWorker({ type: 'ping' });
+    }, this.options.livenessPingMs ?? LIVENESS_PING_MS);
+    this.livenessTimer.unref?.();
+  }
+
+  private stopLiveness(): void {
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer);
+      this.livenessTimer = null;
+    }
+  }
+
+  private get livenessTimeoutMs(): number {
+    return this.options.livenessTimeoutMs ?? LIVENESS_TIMEOUT_MS;
   }
 
   private clearTickWatchdog(): void {

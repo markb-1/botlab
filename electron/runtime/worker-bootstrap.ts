@@ -3,13 +3,14 @@
  * Receives compiled script code via workerData, creates BotContext,
  * and manages the script lifecycle (start/stop/heartbeat).
  *
- * Sandbox (spec §5.1, limits in sandbox.ts): escape-hatch globals (process, fetch, ...) are deleted
- * before the script is evaluated; the script gets only module/exports/ctx.
+ * Sandbox (spec §5.1, limits in sandbox.ts): the worker realm is hardened (no Function/eval/process/
+ * fetch..., no function-prototype constructors), then the script is evaluated in a vm context without
+ * code generation from strings; it gets only module/exports/ctx.
  */
 
 import { parentPort as maybeParentPort, workerData } from 'worker_threads';
 import { createBotContext, handleRpcResponse } from './BotContextProxy';
-import { evaluateScript, hardenWorkerGlobals } from './sandbox';
+import { evaluateScript, hardenWorkerRealm } from './sandbox';
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
@@ -53,7 +54,7 @@ const ctx = createBotContext({
 // Load the compiled script module
 let scriptModule: ScriptModule;
 
-hardenWorkerGlobals();
+hardenWorkerRealm();
 
 try {
   // The compiled code should export { onStart?, onTick?, onStop?, onHeartbeat?, meta? }
@@ -143,6 +144,10 @@ parentPort.on('message', async (msg: MainToWorkerMessage) => {
       } catch {
         send({ type: 'heartbeat-result', metrics: {} });
       }
+      break;
+
+    case 'ping':
+      send({ type: 'pong' });
       break;
 
     case 'rpc-response':
