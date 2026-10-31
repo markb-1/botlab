@@ -183,6 +183,14 @@ describe.skipIf(!sqliteAvailable)('PortfolioService', () => {
     await expect(access.ackExitFlag(f.id, 'again')).rejects.toThrow(/not open/);
   });
 
+  it('capital demand: the executor\'s report is validated (bot-written data)', async () => {
+    const make = (raw: unknown) =>
+      new PortfolioService({ botRepo: t.botRepo, tradeRepo: t.tradeRepo, orderRepo: t.orderRepo, flagRepo: flags, getExitService: async () => service('owner'), capitalDemand: () => raw }).forBot('pm', true);
+    expect(await make(null).getCapitalDemand()).toEqual({ bestUnmetEdgePerDay: null, at: null });
+    expect(await make({ bestUnmetEdgePerDay: 'lots', at: 'x' }).getCapitalDemand()).toEqual({ bestUnmetEdgePerDay: null, at: null });
+    expect(await make({ bestUnmetEdgePerDay: 0.004, at: '2026-06-01T00:00:00.000Z' }).getCapitalDemand()).toEqual({ bestUnmetEdgePerDay: 0.004, at: '2026-06-01T00:00:00.000Z' });
+  });
+
   describe('RPC scoping', () => {
     function handler(extra: Partial<RpcHandlerDeps>): RpcHandler {
       return new RpcHandler({

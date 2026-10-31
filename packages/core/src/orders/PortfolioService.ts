@@ -20,7 +20,7 @@ import { OPEN_ORDER_STATUSES } from '../db/repositories/OrderRepository';
 import type { PositionExitFlagRepository, PositionExitFlagRow } from '../db/repositories/AgentRepository';
 import type { MarketView } from '../ledger/MarketCacheService';
 import type { BotForecastRow } from '../ledger/LedgerService';
-import type { ExitRequest, PortfolioExitFlag, PortfolioPosition } from '../sdk/types';
+import type { CapitalDemand, ExitRequest, PortfolioExitFlag, PortfolioPosition } from '../sdk/types';
 import type { OrderResult, OrderService } from './OrderService';
 import { parseDbTime } from './DbRiskStateProvider';
 import { GTD_MIN_TTL_MINUTES } from '../exchange/polymarket/gtd';
@@ -33,6 +33,7 @@ const MAX_REASON = 500;
 export interface PortfolioAccess {
   getAllPositions(): Promise<PortfolioPosition[]>;
   getExitFlags(): Promise<PortfolioExitFlag[]>;
+  getCapitalDemand(): Promise<CapitalDemand>;
   ackExitFlag(flagId: unknown, note: unknown): Promise<boolean>;
   exit(req: unknown): Promise<OrderResult>;
   cancelExit(orderId: unknown): Promise<void>;
@@ -54,6 +55,8 @@ export interface PortfolioServiceDeps {
   markets?: { getMarketByToken(tokenId: string): Promise<MarketView | null>; getCachedByToken(tokenId: string): MarketView | null };
   /** The owning bot's OrderService in this mode (its running one, else a transient one); throws if unavailable */
   getExitService(botId: string, simulated: boolean): Promise<ExitOrderService>;
+  /** What the running forecast executor in this mode stored as its unfunded demand (bot storage); null if none */
+  capitalDemand?: (simulated: boolean) => unknown;
   audit?: AuditService;
   now?: () => number;
 }
@@ -64,9 +67,29 @@ export class PortfolioService {
   private deps: PortfolioServiceDeps;
   private now: () => number;
 
+  /** Per owning bot: a transient OrderService and its PaperTradingState load-modify-save never overlap */
+  private ownerTail = new Map<string, Promise<void>>();
+
   constructor(deps: PortfolioServiceDeps) {
     this.deps = deps;
     this.now = deps.now ?? Date.now;
+  }
+
+  /** Run fn with the owning bot's exit service, serialised per owner and mode. */
+  private async withOwner<T>(botId: string, simulated: boolean, fn: (svc: ExitOrderService) => Promise<T>): Promise<T> {
+    const key = `${simulated ? 'paper' : 'live'}:${botId}`;
+    const prev = this.ownerTail.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => mine);
+    this.ownerTail.set(key, tail);
+    try {
+      await prev;
+      return await fn(await this.deps.getExitService(botId, simulated));
+    } finally {
+      release();
+      if (this.ownerTail.get(key) === tail) this.ownerTail.delete(key);
+    }
   }
 
   /** Access object for one position-manager bot (BotManager calls this only for that template). */
@@ -74,10 +97,25 @@ export class PortfolioService {
     return {
       getAllPositions: () => this.getAllPositions(callerBotId, simulated),
       getExitFlags: async () => this.openFlags(simulated).map(toFlag),
+      getCapitalDemand: async () => this.capitalDemand(simulated),
       ackExitFlag: async (flagId, note) => this.ackExitFlag(callerBotId, simulated, flagId, note),
       exit: (req) => this.exit(callerBotId, simulated, req),
       cancelExit: (orderId) => this.cancelExit(callerBotId, simulated, orderId),
     };
+  }
+
+  /** The executor's last reported unfunded demand, validated (it is bot-written data). */
+  capitalDemand(simulated: boolean): CapitalDemand {
+    let raw: unknown = null;
+    try {
+      raw = this.deps.capitalDemand?.(simulated) ?? null;
+    } catch {
+      raw = null;
+    }
+    const d = (raw && typeof raw === 'object' ? raw : {}) as { bestUnmetEdgePerDay?: unknown; at?: unknown };
+    const v = typeof d.bestUnmetEdgePerDay === 'number' && Number.isFinite(d.bestUnmetEdgePerDay) && d.bestUnmetEdgePerDay > 0 ? d.bestUnmetEdgePerDay : null;
+    const at = typeof d.at === 'string' && Number.isFinite(Date.parse(d.at)) ? d.at : null;
+    return { bestUnmetEdgePerDay: v === null || at === null ? null : v, at };
   }
 
   private openFlags(simulated: boolean): PositionExitFlagRow[] {
@@ -100,7 +138,7 @@ export class PortfolioService {
     const owners = new Set(this.deps.orderRepo.findOpenPlacedBy(callerBotId, simulated).map((o) => o.bot_id));
     for (const botId of owners) {
       try {
-        await (await this.deps.getExitService(botId, simulated)).syncOpenOrders();
+        await this.withOwner(botId, simulated, (svc) => svc.syncOpenOrders());
       } catch (err) {
         logger.warning(`[Portfolio] sync of ${botId}'s orders failed: ${err instanceof Error ? err.message : err}`);
       }
@@ -212,21 +250,22 @@ export class PortfolioService {
       }
 
       const reason = `position manager: ${why}`.slice(0, MAX_REASON);
-      const service = await this.deps.getExitService(botId, simulated);
-      const result =
+      const size = req.size;
+      const result = await this.withOwner(botId, simulated, (service) =>
         req.marketable === true
-          ? await service.placeMarketable({ tokenId, side: 'sell', amount: req.size, minPrice: req.price, riskExit: true, reason, placedBy: callerBotId })
-          : await service.placeLimit({
+          ? service.placeMarketable({ tokenId, side: 'sell', amount: size, minPrice: req.price, riskExit: true, reason, placedBy: callerBotId })
+          : service.placeLimit({
               tokenId,
               side: 'sell',
               price: req.price as number,
-              size: req.size,
+              size,
               postOnly: true,
               ttlMinutes: req.ttlMinutes,
               riskExit: true,
               reason,
               placedBy: callerBotId,
-            });
+            })
+      );
       this.audit(
         callerBotId,
         'position.exit',
@@ -249,7 +288,7 @@ export class PortfolioService {
       throw new Error(`Exit order not found or not open: ${String(orderId)}`);
     }
     try {
-      await (await this.deps.getExitService(row.bot_id, simulated)).cancel(row.id);
+      await this.withOwner(row.bot_id, simulated, (svc) => svc.cancel(row.id, { placedBy: callerBotId }));
       this.audit(callerBotId, 'position.exit_cancel', row.bot_id, { orderId: row.id, tokenId: row.token_id, simulated }, 'ok');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

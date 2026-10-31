@@ -472,6 +472,11 @@ superseded, withdrawn, no longer tradeable or the edge is gone. It never sells.
 | `requote_minutes` | 10 | |
 | `max_per_market_usd` | 25 | this bot's cost + open bids per market |
 | `max_markets` | 10 | |
+| `min_edge_per_day` | 0.001 | quotes below this edge / day are skipped; **keep equal to the Position Manager's `min_hold_edge_per_day`** |
+
+It leaves its own resting bids out of the book (it never outbids itself) and keeps a bid while it is still at or
+above the best competing bid. After the Position Manager stops a position out, the token is skipped until its
+forecast is renewed. Each cycle it records the best edge per day it could not fund (read by the Position Manager).
 
 **Position Manager** (`templates/position-manager.ts`, spec §9.2) — the only bot that can see other bots'
 positions (`ctx.portfolio`, granted by the server to this builtin template only; forks do not get it). It exits a
@@ -483,7 +488,7 @@ it can never buy, never sell more than the bot holds net of its open sells, and 
 |---|---|
 | take-profit (default) | best bid ≥ fair − `take_profit_margin` (0.02); the fair value is per token, so NO positions mirror |
 | forecast withdrawn / flipped | no active forecast prices the token, or it values it below the entry price |
-| low edge per day | (fair − bid) / days to end < `min_hold_edge_per_day` (0.001; 0 = off) |
+| low edge per day | (fair − bid) / days to end < `min_hold_edge_per_day` (0.001; 0 = off) **and** the running executor reported, within the last hour, unfunded demand with a higher edge per day |
 | rules changed | the market's rules changed after the position was opened |
 | ambiguity | score ≥ 2 (after the server raise) or a UMA dispute |
 | exit flag | an open `flag_position_exit` (agent or human); marked handled when the position is closed |
@@ -491,7 +496,9 @@ it can never buy, never sell more than the bot holds net of its open sells, and 
 | market end | ambiguity ≥ 1 and less than `exit_before_end_minutes` (180) to the end |
 
 Positions bought without a forecast (copy trading, your own scripts) only get the risk triggers (rules,
-ambiguity, flag, end); `ignore_bot_ids` leaves bots alone. Exits rest post-only first and become marketable
+ambiguity, flag, end); `ignore_bot_ids` leaves bots alone. Only a human creates, starts or reconfigures these two
+bots (the agent may pause them). Scripts cannot flag their own orders as risk exits; the owning bot's own
+`cancel` / `cancelAll` leave the manager's exits alone. Exits rest post-only first and become marketable
 (best bid − `escalate_slippage`) after `escalate_after_minutes` (30). Risk exits are exempt from hold time, order
 size, rate and spread limits and pass from any bot stage (a retired bot's positions can still be exited), but not
 from halts: during a halt or kill switch nothing is sold (spec §4.3).

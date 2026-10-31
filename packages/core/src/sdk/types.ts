@@ -115,8 +115,6 @@ export interface OrderOpts {
   reason?: string;
   /** Ledger forecast this order trades on */
   forecastId?: string;
-  /** Sell is a risk exit (exempt from hold time and rate limits) */
-  riskExit?: boolean;
 }
 
 export interface TradeResult {
@@ -150,7 +148,6 @@ export interface LimitOrderOpts {
   ttlMinutes?: number;
   reason?: string;
   forecastId?: string;
-  riskExit?: boolean;
 }
 
 /** Result of placing an order. Rejections are returned (ok: false), not thrown. */
@@ -187,6 +184,25 @@ export interface OpenOrder {
   placedBy: string | null;
 }
 
+/** An order of this bot, any status (ctx.polymarket.getOrderHistory). */
+export interface OrderHistoryEntry {
+  orderId: string;
+  tokenId: string;
+  marketId: string;
+  side: 'buy' | 'sell';
+  orderType: 'limit' | 'market';
+  price: number;
+  size: number;
+  filledSize: number;
+  status: string;
+  /** Free text stored with the order; position-manager exits start with "position manager: <trigger>" */
+  reason: string | null;
+  forecastId: string | null;
+  /** Bot that placed it on this bot's behalf (the position manager); null = this bot */
+  placedBy: string | null;
+  createdAt: string;
+}
+
 export interface FeeRates {
   /** Polymarket fee rate for takers. Taker fee (USDC, on top) = shares × takerRate × p × (1 − p) when formula is 'price' */
   takerRate: number;
@@ -210,8 +226,10 @@ export interface PolymarketContext {
    * `unknownOutcome` and expire on their own.
    */
   cancelAll(): Promise<{ cancelled: number; failed: number; unknownOutcome: number }>;
-  /** This bot's open orders */
+  /** This bot's open orders (including exits the position manager placed for it, `placedBy` set: it cannot cancel those) */
   getOpenOrders(): Promise<OpenOrder[]>;
+  /** This bot's orders of any status from the last `days` (default 7, max 30), newest first, at most 500 */
+  getOrderHistory(days?: number): Promise<OrderHistoryEntry[]>;
   getFee(tokenId: string): Promise<FeeRates>;
 }
 
@@ -363,6 +381,11 @@ export interface PortfolioExitFlag {
   createdAt: string;
 }
 
+export interface CapitalDemand {
+  bestUnmetEdgePerDay: number | null;
+  at: string | null;
+}
+
 export interface ExitRequest {
   /** The bot that holds the position; the sell is placed as that bot (its order, its fills) */
   botId: string;
@@ -389,6 +412,11 @@ export interface PortfolioContext {
   getAllPositions(): Promise<PortfolioPosition[]>;
   /** Open exit flags (agent / human flag_position_exit) in this mode */
   getExitFlags(): Promise<PortfolioExitFlag[]>;
+  /**
+   * Unfunded demand reported by the running Forecast Executor in this mode: the best edge per day it had to leave
+   * unfunded for lack of budget at its last cycle (`at`). null fields when there is none / no executor runs.
+   */
+  getCapitalDemand(): Promise<CapitalDemand>;
   /** Close an open flag as handled (done) with a note */
   ackExitFlag(flagId: string, note: string): Promise<boolean>;
   exit(req: ExitRequest): Promise<OrderResult>;
@@ -677,11 +705,13 @@ export type RpcMethod =
   | 'polymarket:cancelAll'
   | 'polymarket:getOpenOrders'
   | 'polymarket:getFee'
+  | 'polymarket:getOrderHistory'
   | 'risk:getBudget'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'
   | 'portfolio:getAllPositions'
   | 'portfolio:getExitFlags'
+  | 'portfolio:getCapitalDemand'
   | 'portfolio:ackExitFlag'
   | 'portfolio:exit'
   | 'portfolio:cancelExit'

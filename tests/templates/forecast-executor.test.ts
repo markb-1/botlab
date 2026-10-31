@@ -8,6 +8,8 @@ import fs from 'fs';
 import path from 'path';
 import {
   allocate,
+  allocatePlan,
+  DEFAULT_MIN_EDGE_PER_DAY,
   executorConfig,
   kellyFraction,
   quoteFor,
@@ -15,6 +17,7 @@ import {
   type Quote,
 } from '../../templates/forecast-executor';
 import { typecheckScript } from '../../packages/core/src/runtime/typecheckScript';
+import { managerConfig, runManagerCycle } from '../../templates/position-manager';
 
 const NOW = Date.parse('2026-06-01T00:00:00Z');
 const DAY = 86_400_000;
@@ -58,6 +61,7 @@ function fakeCtx(opts: {
   positions?: Array<Record<string, unknown>>;
   config?: Record<string, unknown>;
   fee?: Record<string, unknown>;
+  history?: Array<Record<string, unknown>>;
 }) {
   const placeLimit = vi.fn().mockResolvedValue({ ok: true, status: 'open', orderId: 'new' });
   const cancel = vi.fn().mockResolvedValue(undefined);
@@ -65,18 +69,20 @@ function fakeCtx(opts: {
     config: opts.config ?? {},
     now: NOW,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    storage: { get: vi.fn().mockResolvedValue(null), set: vi.fn().mockResolvedValue(undefined), delete: vi.fn() },
     getPositions: vi.fn().mockResolvedValue(opts.positions ?? []),
     getOrderBook: vi.fn(async (t: string) => opts.books[t] ?? book(0.01, 0.99)),
     ledger: { getActiveForecasts: vi.fn().mockResolvedValue(opts.forecasts) },
     risk: { getBudget: vi.fn().mockResolvedValue(opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }) },
     polymarket: {
       getOpenOrders: vi.fn().mockResolvedValue(opts.open ?? []),
+      getOrderHistory: vi.fn().mockResolvedValue(opts.history ?? []),
       getFee: vi.fn().mockResolvedValue(opts.fee ?? NO_FEE),
       placeLimit,
       cancel,
     },
   };
-  return { ctx: ctx as never, placeLimit, cancel };
+  return { ctx: ctx as never, placeLimit, cancel, storage: ctx.storage };
 }
 
 describe('forecast executor: pure rules', () => {
@@ -195,6 +201,112 @@ describe('forecast executor: cycle', () => {
     const live = { orderId: 'o1', exchange: 'polymarket', marketId: 'm1', tokenId: 'yes1', side: 'buy', orderType: 'limit', price: 0.5, size: 20, filledSize: 0, status: 'open', expiresAt: null, createdAt: '', forecastId: 'f1', placedBy: null };
     const f = fakeCtx({ forecasts: [forecast()], books: { yes1: book(0.49, 0.52) }, open: [live], budget: { remainingAllocation: 100, remainingMarket: {}, halted: true } });
     expect(await runExecutorCycle(f.ctx)).toMatchObject({ cancelled: 1, placed: 0 });
+  });
+
+  const liveBid = (over: Record<string, unknown> = {}) => ({
+    orderId: 'o1', exchange: 'polymarket', marketId: 'm1', tokenId: 'yes1', side: 'buy', orderType: 'limit', price: 0.5, size: 20, filledSize: 0,
+    status: 'open', expiresAt: new Date(NOW + 60 * 60_000).toISOString(), createdAt: '', forecastId: 'f1', placedBy: null, ...over,
+  });
+
+  it('does not step over its own bid: its resting order is left out of the book and kept while still best', async () => {
+    // The book shows our own 0.50 bid (20 shares) on top of a competitor at 0.49
+    const withOwn = { bids: [{ price: '0.5', size: '20' }, { price: '0.49', size: '100' }], asks: [{ price: '0.52', size: '100' }], tick_size: '0.01' };
+    const noNo = book(0.45, 0.47);
+    for (let i = 0; i < 3; i++) {
+      const f = fakeCtx({ forecasts: [forecast()], books: { yes1: withOwn, no1: noNo }, open: [liveBid()] });
+      expect(await runExecutorCycle(f.ctx)).toMatchObject({ kept: 1, placed: 0, cancelled: 0 });
+    }
+    // Others joined our level: still kept (at the best competing bid)
+    const joined = { ...withOwn, bids: [{ price: '0.5', size: '70' }] };
+    let f = fakeCtx({ forecasts: [forecast()], books: { yes1: joined, no1: noNo }, open: [liveBid()] });
+    expect(await runExecutorCycle(f.ctx)).toMatchObject({ kept: 1, placed: 0 });
+    // A competitor above us: replaced one tick above the competitor
+    const outbid = { ...withOwn, bids: [{ price: '0.51', size: '50' }, { price: '0.5', size: '20' }], asks: [{ price: '0.53', size: '100' }] };
+    f = fakeCtx({ forecasts: [forecast()], books: { yes1: outbid, no1: noNo }, open: [liveBid()] });
+    expect(await runExecutorCycle(f.ctx)).toMatchObject({ kept: 0, cancelled: 1, placed: 1 });
+    expect(f.placeLimit.mock.calls[0][2]).toBe(0.52);
+  });
+
+  it("counts existing paper holdings against max_per_market_usd even without a conditionId (forecast token map)", async () => {
+    const f = fakeCtx({
+      forecasts: [forecast()],
+      books: { yes1: book(0.49, 0.52), no1: book(0.45, 0.47) },
+      positions: [{ tokenId: 'yes1', size: 40, avgPrice: 0.5, currentValue: 20 }],
+      config: { max_per_market_usd: 25 },
+    });
+    const r = await runExecutorCycle(f.ctx);
+    // $25 cap − $20 held ⇒ $5 ⇒ 10 shares at 0.50
+    expect(r.planned).toEqual([expect.objectContaining({ tokenId: 'yes1', size: 10 })]);
+  });
+
+  it('after a position-manager stop skips the token until the forecast is renewed', async () => {
+    const stop = { orderId: 'x', tokenId: 'yes1', marketId: 'm1', side: 'sell', orderType: 'limit', price: 0.3, size: 20, filledSize: 20, status: 'filled', reason: 'position manager: stop: bid 0.3 <= entry', forecastId: null, placedBy: 'pm', createdAt: new Date(NOW - 3600_000).toISOString() };
+    const books = { yes1: book(0.49, 0.52), no1: book(0.45, 0.47) };
+    let f = fakeCtx({ forecasts: [forecast()], books, history: [stop] }); // forecast created a day ago, before the stop
+    expect((await runExecutorCycle(f.ctx)).planned).toEqual([]);
+    // Other exits (take-profit) do not block
+    f = fakeCtx({ forecasts: [forecast()], books, history: [{ ...stop, reason: 'position manager: take_profit: converged' }] });
+    expect((await runExecutorCycle(f.ctx)).planned).toHaveLength(1);
+    // A forecast renewed after the stop
+    f = fakeCtx({ forecasts: [forecast({ id: 'f2', createdAt: new Date(NOW - 60_000).toISOString() })], books, history: [stop] });
+    expect((await runExecutorCycle(f.ctx)).planned).toHaveLength(1);
+  });
+
+  it('skips quotes below min_edge_per_day (shared default with the position manager) and records unfunded demand', async () => {
+    expect(DEFAULT_MIN_EDGE_PER_DAY).toBe(managerConfig({}).minHoldEdgePerDay);
+    // 80 days out, edge 0.07 ⇒ 0.000875/day < 0.001: not bought (the reviewer's churn case)
+    const far = forecast({ probability: 0.6, endDate: new Date(NOW + 80 * DAY).toISOString() });
+    let f = fakeCtx({ forecasts: [far], books: { yes1: book(0.52, 0.53), no1: book(0.45, 0.47) } });
+    expect((await runExecutorCycle(f.ctx)).planned).toEqual([]);
+    // Budget for one of two: the unfunded one's edge per day is reported
+    const plan = allocatePlan(
+      [
+        { forecastId: 'a', marketId: 'ma', tokenId: 'A', fair: 0.6, price: 0.5, edge: 0.1, edgePerDay: 0.05, days: 2, kelly: 0.2, bucketAllocationUsd: 200 },
+        { forecastId: 'b', marketId: 'mb', tokenId: 'B', fair: 0.6, price: 0.5, edge: 0.1, edgePerDay: 0.02, days: 5, kelly: 0.2, bucketAllocationUsd: 200 },
+      ],
+      executorConfig({ max_per_market_usd: 1000 }),
+      { remainingAllocation: 10, remainingMarket: {} },
+      {}
+    );
+    expect(plan.orders.map((o) => o.tokenId)).toEqual(['A']);
+    expect(plan.unmetEdgePerDay).toBe(0.02);
+    f = fakeCtx({ forecasts: [forecast()], books: { yes1: book(0.49, 0.52), no1: book(0.45, 0.47) } });
+    await runExecutorCycle(f.ctx);
+    expect(f.storage.set).toHaveBeenCalledWith('executor:demand', { bestUnmetEdgePerDay: null, at: new Date(NOW).toISOString() });
+  });
+
+  it('executor + position manager on a market more than 30 days out: what the executor buys is not churned', async () => {
+    // 40 days, p = 0.62, ask 0.52 ⇒ bid 0.50, edge 0.12 ⇒ 0.003/day (above the shared 0.001)
+    const end = new Date(NOW + 40 * DAY).toISOString();
+    const f = fakeCtx({ forecasts: [forecast({ probability: 0.62, endDate: end })], books: { yes1: book(0.49, 0.52), no1: book(0.3, 0.33) } });
+    const r = await runExecutorCycle(f.ctx);
+    const buy = r.planned.find((p) => p.tokenId === 'yes1')!;
+    expect(buy).toBeDefined();
+    // The bid fills; one minute later the manager looks at the position (bid 0.50, still 0.12 from fair)
+    const position = {
+      botId: 'exec', botName: 'exec', tokenId: 'yes1', marketId: 'm1', size: buy.size, openSellSize: 0, available: buy.size, avgPrice: buy.price,
+      costBasis: buy.usd, openedAt: new Date(NOW).toISOString(), entryForecastId: 'f1', entryForecastStatus: 'active',
+      forecast: { id: 'f1', probability: 0.62, onComplement: false, tradeable: true, createdAt: new Date(NOW - DAY).toISOString() },
+      market: { question: 'Q', outcome: 'Yes', category: 'economics', endDate: end, ambiguityScore: 0, rulesChangedAt: null, disputed: false, closed: false },
+      exitOrders: [], exitFlag: null,
+    };
+    const exit = vi.fn();
+    const pm = {
+      config: {}, now: NOW + 60_000,
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      getOrderBook: vi.fn(async () => book(0.5, 0.52)),
+      storage: { get: vi.fn().mockResolvedValue(null), set: vi.fn(), delete: vi.fn() },
+      portfolio: {
+        getAllPositions: vi.fn().mockResolvedValue([position]),
+        getExitFlags: vi.fn().mockResolvedValue([]),
+        getCapitalDemand: vi.fn().mockResolvedValue({ bestUnmetEdgePerDay: null, at: null }),
+        ackExitFlag: vi.fn(),
+        exit,
+        cancelExit: vi.fn(),
+      },
+    };
+    expect((await runManagerCycle(pm as never)).exits).toEqual([]);
+    expect(exit).not.toHaveBeenCalled();
   });
 
   it('typechecks against botlab-sdk.d.ts (the agent can fork it)', () => {

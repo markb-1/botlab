@@ -116,6 +116,17 @@ describe.skipIf(!sqliteAvailable)('paper resting orders', () => {
     expect(t.orderRepo.findById(r.orderId!)).toMatchObject({ filled_size: 10 });
   });
 
+  it('two resting orders cannot fill against the same liquidity within one sync', async () => {
+    const a = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10 });
+    const b = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10 });
+    clock += MIN;
+    current = { bids: [{ price: '0.4', size: '100' }], asks: [{ price: '0.44', size: '25' }, { price: '0.6', size: '100' }], tick_size: '0.01' };
+    await svc.getOpenOrders();
+    const filled = t.orderRepo.findById(a.orderId!)!.filled_size + t.orderRepo.findById(b.orderId!)!.filled_size;
+    expect(filled).toBeCloseTo(25); // 25 shown, not 40
+    expect(current.asks[0].size).toBe('25'); // the fetched book itself is not modified
+  });
+
   it('expires at its TTL; a cross first seen after the expiry never fills it (no look-ahead)', async () => {
     const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 5 });
     clock += 5 * MIN;

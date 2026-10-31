@@ -321,6 +321,15 @@ export class BotManager extends EventEmitter {
         markets: this.orderDeps.marketCache,
         audit: this.orderDeps.audit,
         getExitService: (botId, simulated) => this.getExitOrderService(botId, simulated),
+        // The running forecast executor's last unfunded demand (spec §9.2 "a better use of capital is queued")
+        capitalDemand: (simulated) => {
+          for (const [id, r] of this.roles) {
+            if (r.role === 'forecast-executor' && r.mode === (simulated ? 'paper' : 'live') && this.instances.has(id)) {
+              return this.storageRepo.get(id, 'executor:demand');
+            }
+          }
+          return null;
+        },
       });
     }
     return this.portfolio;

@@ -116,12 +116,21 @@ describe('RpcHandler', () => {
       expect(resp.result).toMatchObject({ success: true, executedAmount: 50, price: 0.5, tokenAmount: 100, orderId: 'o1' });
     });
 
-    it('sell passes riskExit and minPrice', async () => {
+    it('sell passes minPrice but never a script-supplied riskExit (R169)', async () => {
       const { orderService, handler } = withOrderService();
       await handler.handle(makeReq('polymarket:sell', ['token1', 100, { minPrice: 0.4, riskExit: true }]));
       expect(orderService.placeMarketable).toHaveBeenCalledWith(
-        expect.objectContaining({ tokenId: 'token1', side: 'sell', amount: 100, minPrice: 0.4, riskExit: true })
+        expect.objectContaining({ tokenId: 'token1', side: 'sell', amount: 100, minPrice: 0.4 })
       );
+      expect(orderService.placeMarketable.mock.calls[0][0].riskExit).toBeUndefined();
+    });
+
+    it('placeLimit drops a script-supplied riskExit (R169)', async () => {
+      const { orderService, handler } = withOrderService();
+      (orderService as any).placeLimit = vi.fn().mockResolvedValue({ ok: true, status: 'open' });
+      await handler.handle(makeReq('polymarket:placeLimit', ['token1', 'sell', 0.6, 10, { riskExit: true, reason: 'x' }]));
+      expect((orderService as any).placeLimit).toHaveBeenCalledWith(expect.objectContaining({ tokenId: 'token1', side: 'sell', reason: 'x' }));
+      expect((orderService as any).placeLimit.mock.calls[0][0].riskExit).toBeUndefined();
     });
 
     it('risk rejection is returned as a typed result, not an RPC error', async () => {
@@ -176,10 +185,17 @@ describe('RpcHandler', () => {
 
   describe('getPositions', () => {
     it('should return paper positions in paper mode', async () => {
+      const getRiskPositions = vi.fn().mockReturnValue([
+        { bot_id: 'bot-1', exchange: 'polymarket', symbol: 't1', condition_id: '0xm', net_quantity: 100, cost_basis: 60 },
+      ]);
+      (deps.tradeRepo as any).getRiskPositions = getRiskPositions;
       const resp = await paperHandler.handle(makeReq('polymarket:getPositions'));
       expect(paperState.getPositions).toHaveBeenCalled();
       expect(getPositions).not.toHaveBeenCalled();
       expect(resp.result).toHaveLength(1);
+      // The market of each paper position comes from its order-linked paper fills (executor per-market cap)
+      expect(getRiskPositions).toHaveBeenCalledWith({ simulated: true, botId: 'bot-1', exchange: 'polymarket' });
+      expect(resp.result[0]).toMatchObject({ tokenId: 't1', conditionId: '0xm' });
     });
 
     it("should return the bot's order-linked live positions in live mode", async () => {

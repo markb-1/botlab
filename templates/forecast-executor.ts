@@ -8,13 +8,18 @@
  * Each cycle (every `requote_minutes`, or at once after a forecast_changed / rules_changed / halt event):
  *   1. Candidates where p − best_ask ≥ min_edge + taker fee: bid = min(best_bid + tick, p − min_edge) on the
  *      tick grid, never at or through the best ask (post-only); edge = p − bid − maker fee ≥ min_edge.
+ *      This bot's own resting bids are left out of the book first (it never outbids itself). Quotes below
+ *      `min_edge_per_day` (keep equal to the Position Manager's `min_hold_edge_per_day`) are skipped, and so is
+ *      a token the Position Manager stopped out of until its forecast is renewed.
  *   2. Ranked by edge per day = edge / max(days to settlement, 1) (spec §3.4); at most `max_markets` markets.
  *   3. Size = kelly_fraction × Kelly × bucket allocation, Kelly = (p − c) / (1 − c) at cost c = bid + fee;
  *      capped by max_per_market_usd (minus what this bot already holds or bids in the market), the risk
  *      budget (remaining allocation and per-market room) and what is left after better-ranked candidates.
- *   4. Orders that still match (same token, forecast and price, similar size, not about to expire) are kept;
+ *   4. Orders that still match (same token and forecast, at or above the best competing bid and within
+ *      fair − min_edge, similar size, not about to expire) are kept;
  *      every other buy of this bot is cancelled (forecast superseded / withdrawn / no longer tradeable, edge
  *      gone, budget gone); missing ones are placed, tagged with the forecastId and a reason.
+ * The best edge per day it could not fund is stored (`executor:demand`) for the Position Manager's low-edge exit.
  * The server re-checks every order (RiskEngine: edge ≥ 0.03 floor, category rights, exposure caps). The
  * executor never sells: exits belong to the Position Manager. It only cancels its own BUY orders.
  */
@@ -61,6 +66,13 @@ export const meta = {
         default: 25,
         minimum: 1,
       },
+      min_edge_per_day: {
+        type: 'number',
+        title: 'Minimum edge per day',
+        description: 'Skip quotes whose edge / days to settlement is below this. Keep it equal to the Position Manager’s min_hold_edge_per_day (both default 0.001), or it would exit what this bot buys',
+        default: 0.001,
+        minimum: 0,
+      },
       max_markets: {
         type: 'number',
         title: 'Max markets',
@@ -93,7 +105,16 @@ export interface ExecutorConfig {
   requoteMinutes: number;
   maxPerMarketUsd: number;
   maxMarkets: number;
+  minEdgePerDay: number;
 }
+
+/**
+ * Shared with the Position Manager's `min_hold_edge_per_day` default: the executor never buys below the edge per
+ * day the manager holds for (R165 amended). If you change one, change the other.
+ */
+export const DEFAULT_MIN_EDGE_PER_DAY = 0.001;
+/** Bot storage key where each cycle records the best edge per day it could not fund (read by the Position Manager) */
+export const DEMAND_KEY = 'executor:demand';
 
 /** Config with defaults and floors (min_edge never below 0.03). */
 export function executorConfig(raw: Record<string, any>): ExecutorConfig {
@@ -104,6 +125,7 @@ export function executorConfig(raw: Record<string, any>): ExecutorConfig {
     requoteMinutes: Math.max(num(raw.requote_minutes, 10), 1),
     maxPerMarketUsd: Math.max(num(raw.max_per_market_usd, 25), 0),
     maxMarkets: Math.max(Math.floor(num(raw.max_markets, 10)), 1),
+    minEdgePerDay: Math.max(num(raw.min_edge_per_day, DEFAULT_MIN_EDGE_PER_DAY), 0),
   };
 }
 
@@ -171,6 +193,10 @@ export interface Quote {
   /** Full Kelly at cost price + fee */
   kelly: number;
   bucketAllocationUsd: number;
+  /** Best bid of everyone else; null if none */
+  competingBid?: number | null;
+  /** Highest price still leaving min_edge after the maker fee */
+  maxPrice?: number;
 }
 
 /**
@@ -199,6 +225,13 @@ export function quoteFor(
   return { price, edge, feePerShare };
 }
 
+/** Highest price on the tick grid that still leaves min_edge after the maker fee. */
+export function maxKeepPrice(fair: number, fee: FeeRates, minEdge: number, tick: number): number {
+  let p = floorTick(fair - minEdge, tick);
+  while (p >= MIN_PRICE && fair - p - makerFeePerShare(fee, p) + 1e-9 < minEdge) p = round6(p - tick);
+  return p;
+}
+
 /** Days to settlement now, at least 1 (spec §3.4); from the end date, else the days at forecast minus elapsed time. */
 export function daysToSettlement(f: BotForecast, now: number): number {
   const end = f.endDate ? Date.parse(f.endDate) : NaN;
@@ -217,6 +250,10 @@ export interface PlannedOrder {
   usd: number;
   edge: number;
   edgePerDay: number;
+  /** Best bid of everyone else (this bot's own bids removed); null if none */
+  competingBid: number | null;
+  /** Highest price that still leaves min_edge after the maker fee */
+  maxPrice: number;
 }
 
 /**
@@ -231,6 +268,21 @@ export function allocate(
   budget: { remainingAllocation: number; remainingMarket: Record<string, number> },
   marketUsed: Record<string, number>
 ): PlannedOrder[] {
+  return allocatePlan(quotes, cfg, budget, marketUsed).orders;
+}
+
+/**
+ * allocate() plus the best edge per day among quotes the remaining allocation could not fund (at least 5 shares
+ * short because the budget ran out, not because of per-market caps): the "better use of capital" the Position
+ * Manager may free capital for (spec §9.2). null when every quote was funded.
+ */
+export function allocatePlan(
+  quotes: Quote[],
+  cfg: ExecutorConfig,
+  budget: { remainingAllocation: number; remainingMarket: Record<string, number> },
+  marketUsed: Record<string, number>
+): { orders: PlannedOrder[]; unmetEdgePerDay: number | null } {
+  let unmet: number | null = null;
   const ranked = [...quotes].sort((a, b) => b.edgePerDay - a.edgePerDay || b.edge - a.edge);
   const markets = new Set<string>();
   const allocated: Record<string, number> = {};
@@ -243,35 +295,90 @@ export function allocate(
     const capRoom = cfg.maxPerMarketUsd - (marketUsed[q.marketId] ?? 0) - already;
     const budgetRoom = q.marketId in budget.remainingMarket ? budget.remainingMarket[q.marketId] - already : Infinity;
     const usd = Math.min(want, capRoom, budgetRoom, remaining);
+    const unfunded = Math.min(want, capRoom, budgetRoom) - Math.max(remaining, 0);
+    if (unfunded >= q.price * MIN_SHARES && (unmet === null || q.edgePerDay > unmet)) unmet = q.edgePerDay;
     const size = Math.floor((usd / q.price) * 100) / 100;
     if (!(size >= MIN_SHARES)) continue;
     const spend = round6(size * q.price);
     markets.add(q.marketId);
     allocated[q.marketId] = already + spend;
     remaining -= spend;
-    out.push({ forecastId: q.forecastId, marketId: q.marketId, tokenId: q.tokenId, price: q.price, size, usd: spend, edge: q.edge, edgePerDay: q.edgePerDay });
+    out.push({
+      forecastId: q.forecastId,
+      marketId: q.marketId,
+      tokenId: q.tokenId,
+      price: q.price,
+      size,
+      usd: spend,
+      edge: q.edge,
+      edgePerDay: q.edgePerDay,
+      competingBid: q.competingBid ?? null,
+      maxPrice: q.maxPrice ?? q.price,
+    });
   }
-  return out;
+  return { orders: out, unmetEdgePerDay: unmet };
 }
 
-/** An open buy is kept when it is the same quote (token, forecast, price) with a similar size and enough life left. */
+/**
+ * An open buy is kept (no re-quote, so the bot never steps over its own bid) while it is on the same token and
+ * forecast, still at or above the best competing bid and at most the highest price leaving min_edge, with a
+ * similar USD size (± 15 %, at least $1) and enough life left.
+ */
 export function keeps(order: OpenOrder, plan: PlannedOrder, now: number, requoteMinutes: number): boolean {
   const remaining = order.size - order.filledSize;
   const expiresAt = order.expiresAt ? Date.parse(order.expiresAt) : Infinity;
   return (
     order.tokenId === plan.tokenId &&
     order.forecastId === plan.forecastId &&
-    Math.abs(order.price - plan.price) < 1e-9 &&
-    Math.abs(remaining - plan.size) <= Math.max(plan.size * 0.1, 1) &&
+    (plan.competingBid === null || order.price >= plan.competingBid - 1e-9) &&
+    order.price <= plan.maxPrice + 1e-9 &&
+    Math.abs(remaining * order.price - plan.usd) <= Math.max(plan.usd * 0.15, 1) &&
     expiresAt - now > (requoteMinutes + 1) * 60_000
   );
 }
 
+/** The book without this bot's own resting bids (its remaining size subtracted from its price level). */
+export function withoutOwnBids(book: OrderBook, own: OpenOrder[]): OrderBook {
+  const mine = new Map<string, number>();
+  for (const o of own) {
+    const key = o.price.toFixed(6);
+    mine.set(key, (mine.get(key) ?? 0) + Math.max(o.size - o.filledSize, 0));
+  }
+  const bids = (book.bids ?? [])
+    .map((l) => {
+      const key = parseFloat(l.price).toFixed(6);
+      const take = Math.min(mine.get(key) ?? 0, parseFloat(l.size));
+      if (take > 0) mine.set(key, (mine.get(key) ?? 0) - take);
+      return { price: l.price, size: String(parseFloat(l.size) - take) };
+    })
+    .filter((l) => parseFloat(l.size) > 1e-9);
+  return { ...book, bids };
+}
+
+/** Tokens the Position Manager stopped out of (its exits with reason "position manager: stop…"), latest time each. */
+export function stoppedTokens(history: OrderHistoryEntry[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const h of history) {
+    if (!h.placedBy || h.side !== 'sell' || !/^position manager: stop\b/.test(h.reason ?? '')) continue;
+    const at = Date.parse(h.createdAt);
+    if (Number.isFinite(at) && at > (out.get(h.tokenId) ?? -Infinity)) out.set(h.tokenId, at);
+  }
+  return out;
+}
+
 /** One full re-quote. Exported for tests; the lifecycle below calls it. */
-export async function runExecutorCycle(ctx: BotContext): Promise<{ placed: number; kept: number; cancelled: number; planned: PlannedOrder[] }> {
+export interface CycleResult {
+  placed: number;
+  kept: number;
+  cancelled: number;
+  planned: PlannedOrder[];
+  unmetEdgePerDay: number | null;
+}
+
+export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   const cfg = executorConfig(ctx.config);
   const now = ctx.now;
-  const result = { placed: 0, kept: 0, cancelled: 0, planned: [] as PlannedOrder[] };
+  const result: CycleResult = { placed: 0, kept: 0, cancelled: 0, planned: [], unmetEdgePerDay: null };
 
   const open = (await ctx.polymarket.getOpenOrders()).filter((o) => o.side === 'buy' && o.exchange === 'polymarket' && !o.placedBy);
   const budget = await ctx.risk.getBudget();
@@ -294,23 +401,41 @@ export async function runExecutorCycle(ctx: BotContext): Promise<{ placed: numbe
   for (const o of open) if (o.marketId in remainingMarket) remainingMarket[o.marketId] += openUsd(o);
   const available = { remainingAllocation: budget.remainingAllocation + open.reduce((n, o) => n + openUsd(o), 0), remainingMarket };
 
+  const forecasts = await ctx.ledger.getActiveForecasts({ tradeableOnly: true });
+  // Token → market from the forecasts, for positions whose market is unknown
+  const tokenMarket = new Map<string, string>();
+  for (const f of forecasts) {
+    tokenMarket.set(f.tokenId, f.marketId);
+    if (f.complementTokenId) tokenMarket.set(f.complementTokenId, f.marketId);
+  }
+
   // What this bot already holds per market counts against max_per_market_usd
   const marketUsed: Record<string, number> = {};
   for (const p of await ctx.getPositions()) {
-    if (p.conditionId) marketUsed[p.conditionId] = (marketUsed[p.conditionId] ?? 0) + p.size * p.avgPrice;
+    const m = p.conditionId || tokenMarket.get(p.tokenId);
+    if (m) marketUsed[m] = (marketUsed[m] ?? 0) + p.size * p.avgPrice;
   }
 
-  const forecasts = await ctx.ledger.getActiveForecasts({ tradeableOnly: true });
+  // After a stop by the Position Manager a token is skipped until its forecast is renewed (R166 amended)
+  const stops = stoppedTokens(await ctx.polymarket.getOrderHistory(30));
+
   const quotes: Quote[] = [];
   for (const f of forecasts) {
     const sides: Array<{ tokenId: string; fair: number }> = [{ tokenId: f.tokenId, fair: f.probability }];
     if (f.complementTokenId) sides.push({ tokenId: f.complementTokenId, fair: 1 - f.probability });
     const days = daysToSettlement(f, now);
     for (const side of sides) {
+      const stoppedAt = stops.get(side.tokenId);
+      if (stoppedAt !== undefined && !(Date.parse(f.createdAt) > stoppedAt)) continue;
       try {
         const [book, fee] = await Promise.all([ctx.getOrderBook(side.tokenId), ctx.polymarket.getFee(side.tokenId)]);
-        const q = quoteFor(side.fair, bookTop(book), fee, cfg.minEdge);
+        // Our own resting bids are not competition: leave them out before looking at the best bid
+        const top = bookTop(withoutOwnBids(book, open.filter((o) => o.tokenId === side.tokenId)));
+        const q = quoteFor(side.fair, top, fee, cfg.minEdge);
         if (!q) continue;
+        const edgePerDay = q.edge / days;
+        // Below the edge per day the Position Manager holds for: it would only churn (R165 amended)
+        if (edgePerDay < cfg.minEdgePerDay) continue;
         quotes.push({
           forecastId: f.id,
           marketId: f.marketId,
@@ -318,10 +443,12 @@ export async function runExecutorCycle(ctx: BotContext): Promise<{ placed: numbe
           fair: side.fair,
           price: q.price,
           edge: q.edge,
-          edgePerDay: q.edge / days,
+          edgePerDay,
           days,
           kelly: kellyFraction(side.fair, q.price + q.feePerShare),
           bucketAllocationUsd: f.bucketAllocationUsd ?? 0,
+          competingBid: top.bestBid,
+          maxPrice: Math.min(maxKeepPrice(side.fair, fee, cfg.minEdge, top.tick), top.bestAsk !== null ? top.bestAsk - top.tick : MAX_PRICE),
         });
       } catch (err) {
         ctx.log.warn(`executor: no quote for ${side.tokenId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -329,8 +456,12 @@ export async function runExecutorCycle(ctx: BotContext): Promise<{ placed: numbe
     }
   }
 
-  const planned = allocate(quotes, cfg, available, marketUsed);
+  const plan = allocatePlan(quotes, cfg, available, marketUsed);
+  const planned = plan.orders;
   result.planned = planned;
+  result.unmetEdgePerDay = plan.unmetEdgePerDay;
+  // Unfunded demand for the Position Manager's "better use of capital" check (spec §9.2)
+  await ctx.storage.set(DEMAND_KEY, { bestUnmetEdgePerDay: plan.unmetEdgePerDay, at: new Date(now).toISOString() });
 
   // Keep matching orders, cancel the rest, place what is missing
   const kept = new Set<string>();

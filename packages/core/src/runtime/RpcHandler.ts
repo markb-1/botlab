@@ -198,6 +198,8 @@ export class RpcHandler {
         return toTradeResult(result);
       }
 
+      // A script can never flag its own order as a risk exit (exemptions from hold time, rate, size and stage):
+      // only the position manager's PortfolioService sets riskExit (R169)
       case 'polymarket:sell': {
         const opts = orderOpts(args[2]);
         const result = await this.orders.placeMarketable({
@@ -208,7 +210,6 @@ export class RpcHandler {
           maxSlippage: opts.maxSlippage,
           reason: opts.reason,
           forecastId: opts.forecastId,
-          riskExit: opts.riskExit,
         });
         return toTradeResult(result);
       }
@@ -225,7 +226,6 @@ export class RpcHandler {
           ttlMinutes: opts.ttlMinutes,
           reason: opts.reason,
           forecastId: opts.forecastId,
-          riskExit: opts.riskExit,
         });
       }
 
@@ -242,6 +242,9 @@ export class RpcHandler {
 
       case 'polymarket:getOpenOrders':
         return this.orders.getOpenOrders();
+
+      case 'polymarket:getOrderHistory':
+        return this.orders.getOrderHistory(typeof args[0] === 'number' ? args[0] : undefined);
 
       case 'polymarket:getFee':
         return this.orders.getFee(args[0] as string);
@@ -274,6 +277,9 @@ export class RpcHandler {
       case 'portfolio:getExitFlags':
         return this.portfolio.getExitFlags();
 
+      case 'portfolio:getCapitalDemand':
+        return this.portfolio.getCapitalDemand();
+
       case 'portfolio:ackExitFlag':
         return this.portfolio.ackExitFlag(args[0], args[1]);
 
@@ -292,7 +298,13 @@ export class RpcHandler {
 
       case 'polymarket:getPositions': {
         if (this.isPaper) {
-          return this.paperState!.getPositions();
+          // Paper state does not know markets: take the condition id from the bot's order-linked paper fills
+          const markets = new Map(
+            this.deps.tradeRepo
+              .getRiskPositions({ simulated: true, botId: this.deps.botId, exchange: 'polymarket' })
+              .map((p) => [p.symbol, p.condition_id] as const)
+          );
+          return this.paperState!.getPositions().map((p) => (p.conditionId || !markets.get(p.tokenId) ? p : { ...p, conditionId: markets.get(p.tokenId) ?? undefined }));
         }
         // Live: this bot's order-linked holdings, i.e. exactly what the risk engine lets it sell (R8).
         // Valued at cost (no mark); currentValue = cost basis.

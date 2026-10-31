@@ -68,7 +68,8 @@ caps, category rights and the monthly budget; every tool call is in the audit lo
 
 ### The standing strategy templates (spec §9.1, §9.2)
 
-Two builtin templates run as **one bot each per mode** (a second running copy in the same mode is refused). They
+Two builtin templates run as **one bot each per mode** (a second running copy in the same mode is refused). Only a
+human creates, starts or reconfigures them; you cannot (you may pause them). They
 are seeded with trust \`new\`, so their bots start in paper and go through the ramp like any new template.
 
 - **Forecast Executor** turns your tradeable forecasts into orders. You do not size or place anything: write good
@@ -77,13 +78,15 @@ are seeded with trust \`new\`, so their bots start in paper and go through the r
   min(best bid + tick, fair − min_edge); size = \`kelly_fraction\` × Kelly × the bucket's allocation, capped by
   \`max_per_market_usd\` and the risk budget; ranked by edge per day (a short market beats a long one with the same
   edge); at most \`max_markets\`. It re-quotes every \`requote_minutes\` and at once when a forecast changes, and
-  cancels its bids when the forecast is superseded, withdrawn or no longer tradeable, or the edge is gone. So:
+  cancels its bids when the forecast is superseded, withdrawn or no longer tradeable, or the edge is gone. Quotes
+  below \`min_edge_per_day\` (0.001, equal to the manager's \`min_hold_edge_per_day\`) are skipped; after a stop it
+  skips the token until the forecast is renewed. So:
   **withdraw a forecast you no longer believe** — that is how you pull the executor's bids. Config: \`min_edge\`,
   \`kelly_fraction\` (0.25), \`requote_minutes\`, \`max_per_market_usd\`, \`max_markets\`.
 - **Position Manager** watches every bot's positions in its mode and exits them as the owning bot (risk-exit sells
   through the risk engine; it can never buy or sell more than a bot holds). Triggers: convergence take-profit (bid ≥
   fair − \`take_profit_margin\`, the default way edge is realised), forecast withdrawn or flipped below the entry
-  price, remaining edge per day below \`min_hold_edge_per_day\`, rules changed after entry, ambiguity ≥ 2 or a
+  price, remaining edge per day below \`min_hold_edge_per_day\` while the executor has better unfunded demand, rules changed after entry, ambiguity ≥ 2 or a
   dispute, an exit flag, a stop (\`stop_loss_move\` against with no renewed forecast) and \`exit_before_end_minutes\`
   for ambiguous markets. Exits rest post-only first and go marketable after \`escalate_after_minutes\`. Positions
   bought without a forecast (e.g. copy trading) only get the risk triggers; \`ignore_bot_ids\` leaves bots alone.
@@ -140,7 +143,7 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
 ### The ctx API (summary; see types.d.ts)
 
 - Polymarket orders — every order goes through the risk engine and is recorded, including rejections:
-  - \`ctx.polymarket.placeLimit(tokenId, side, price, size, { postOnly?, ttlMinutes?, reason?, forecastId?, riskExit? })\`
+  - \`ctx.polymarket.placeLimit(tokenId, side, price, size, { postOnly?, ttlMinutes?, reason?, forecastId? })\`
     → \`OrderResult\` (\`ok\`, \`orderId\`, \`status\`, \`failedCheck\`, \`error\`). Resting orders are **GTD**: \`ttlMinutes\`
     ≥ 3 (Polymarket's minimum), capped by \`limits.orders.resting_order_ttl_minutes\` (default 240). Post-only by
     default (a crossing post-only order is refused). Prices must be on the market's tick size.
@@ -170,7 +173,8 @@ Live trading off (\`live_trading.enabled\`), halts (global / bot / kill switch),
 simulated; probation ⇒ small allocation), per-order and per-hour caps, per-market exposure, total and long-horizon
 exposure, minimum liquidity / top of book, maximum spread and slippage, no trading in the last hour before the end,
 unassessed or too ambiguous markets (buys), a rules change in the last 7 days, the mandate's categories, minimum
-hold time before selling (risk exits are exempt), and an edge check net of fees for ledger orders. Exposure limits (e.g. \`totalLimitUsd\` in
+hold time before selling (only the Position Manager's risk exits are exempt; a script cannot flag its own orders
+as risk exits), and an edge check net of fees for ledger orders. Exposure limits (e.g. \`totalLimitUsd\` in
 \`get_overview\`) apply to live trading and are 0 when there is no live equity; paper bots are limited by their stage
 allocation instead. Polymarket taker
 fee per share = rate × p × (1 − p); makers pay nothing. Paper mode: a resting (non-marketable) order fills at its own

@@ -167,7 +167,7 @@ describe.skipIf(!sqliteAvailable)('HTTP auth', () => {
     const kill = await req('POST', '/api/risk/kill-switch', { bearer: token, body: { reason: 'agent pressed it', actor: 'human' }, csrf: false });
     expect(kill.json.success).toBe(true);
     expect(audit('risk.kill_switch').at(-1)?.actor).toBe('agent');
-    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    const script = core.services.scripts.list().find((s) => s.isTemplate && s.trust === 'proven')!; // not a standing-role template (R168)
     const bot = await req('POST', '/api/bots', { bearer: token, body: { name: 'agent-bot', scriptId: script.id, actor: 'human' }, csrf: false });
     expect(bot.json.data).toMatchObject({ mode: 'paper' });
     expect(audit('bot.create').at(-1)).toMatchObject({ actor: 'agent', target: bot.json.data.id });
@@ -193,7 +193,7 @@ describe.skipIf(!sqliteAvailable)('HTTP auth', () => {
   it('readonly token: no wallets, settings, config, tokens or script export', async () => {
     const cookie = await setup();
     const { token } = core.auth.createToken('dashboard', 'readonly');
-    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    const script = core.services.scripts.list().find((s) => s.isTemplate && s.trust === 'proven')!; // not a standing-role template (R168)
     for (const p of [
       '/api/wallets',
       '/api/wallets/w1',
@@ -233,7 +233,7 @@ describe.skipIf(!sqliteAvailable)('HTTP auth', () => {
   it('agent: bots are paper with no wallet choice; updates are config only (enforced in BotService too)', async () => {
     await setup();
     const { token } = core.auth.createToken('mcp', 'agent');
-    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    const script = core.services.scripts.list().find((s) => s.isTemplate && s.trust === 'proven')!; // not a standing-role template (R168)
     const asAgentReq = (method: string, p: string, body: unknown) => req(method, p, { bearer: token, body, csrf: false });
     expect((await asAgentReq('POST', '/api/bots', { name: 'a', scriptId: script.id, walletId: 'w1', mode: 'paper' })).json).toMatchObject({ code: 'forbidden' });
     expect((await asAgentReq('POST', '/api/bots', { name: 'a', scriptId: script.id, mode: 'live' })).json).toMatchObject({ code: 'forbidden' });

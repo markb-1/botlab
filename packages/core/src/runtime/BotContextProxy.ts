@@ -45,6 +45,8 @@ import type {
   PortfolioPosition,
   PortfolioExitFlag,
   ExitRequest,
+  OrderHistoryEntry,
+  CapitalDemand,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../utils/kellyCalculator';
 
@@ -275,6 +277,7 @@ export function createBotContext(params: {
       cancel: (orderId: string) => rpcCall('polymarket:cancel', orderId) as Promise<void>,
       cancelAll: () => rpcCall('polymarket:cancelAll') as ReturnType<PolymarketContext['cancelAll']>,
       getOpenOrders: () => rpcCall('polymarket:getOpenOrders') as Promise<OpenOrder[]>,
+      getOrderHistory: (days?: number) => rpcCall('polymarket:getOrderHistory', days) as Promise<OrderHistoryEntry[]>,
       getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
     } as PolymarketContext,
 
@@ -295,6 +298,7 @@ export function createBotContext(params: {
     portfolio: {
       getAllPositions: () => rpcCall('portfolio:getAllPositions') as Promise<PortfolioPosition[]>,
       getExitFlags: () => rpcCall('portfolio:getExitFlags') as Promise<PortfolioExitFlag[]>,
+      getCapitalDemand: () => rpcCall('portfolio:getCapitalDemand') as Promise<CapitalDemand>,
       ackExitFlag: (flagId: string, note: string) => rpcCall('portfolio:ackExitFlag', flagId, note) as Promise<boolean>,
       exit: (req: ExitRequest) => rpcCall('portfolio:exit', req) as Promise<OrderResult>,
       cancelExit: (orderId: string) => rpcCall('portfolio:cancelExit', orderId) as Promise<void>,

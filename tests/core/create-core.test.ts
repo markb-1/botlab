@@ -247,4 +247,23 @@ describe.skipIf(!sqliteAvailable)('createCore — actors (3a review)', () => {
     expect(lastAudit(c, 'risk.kill_switch')).toMatchObject({ actor: 'agent' });
     expect(c.services.risk.getState().global?.halted).toBe(true);
   }, 60_000);
+
+  it('the agent can neither create nor start nor reconfigure bots on the standing builtin-role templates (R168)', async () => {
+    const c = await started();
+    const agent = asAgent('agent-token');
+    const pm = c.services.scripts.list().find((s) => s.name === 'Position Manager')!;
+    const ex = c.services.scripts.list().find((s) => s.name === 'Forecast Executor')!;
+    for (const script of [pm, ex]) {
+      await expect(c.services.bots.create({ name: 'x', scriptId: script.id }, agent)).rejects.toThrow(/standing bot only a human can create/);
+    }
+    // A position-manager bot, even one recorded as the agent's, can only be paused by the agent
+    const wallet = c.repos.walletRepo.create({ name: 'w', address: '0xabc', privateKeyEncrypted: 'x' });
+    const bot = c.repos.botRepo.create({ name: 'pm', scriptId: pm.id, walletId: wallet.id, mode: 'paper', createdBy: 'agent' });
+    await expect(c.services.bots.start(bot.id, agent)).rejects.toThrow(/position-manager bots are standing bots/);
+    await expect(c.services.bots.restart(bot.id, agent)).rejects.toThrow(/position-manager bots are standing bots/);
+    expect(() => c.services.bots.update(bot.id, { config: { take_profit_margin: 0.5 } }, agent)).toThrow(/position-manager bots are standing bots/);
+    expect(lastAudit(c, 'bot.update')).toMatchObject({ actor: 'agent', result: 'denied: position-manager bot' });
+    // A human may
+    expect(c.services.bots.update(bot.id, { config: { take_profit_margin: 0.03 } }, HUMAN).config).toMatchObject({ take_profit_margin: 0.03 });
+  }, 60_000);
 });

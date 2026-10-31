@@ -429,6 +429,9 @@ export class BotService {
     const script = scriptRepo.findById(data.scriptId);
     if (!script) throw notFound('Script not found');
     if (script.kind !== 'template') deny('the agent can only create bots from templates (list_templates)');
+    // Standing builtin roles (executor, position manager) are set up by a human (R168)
+    const role = builtinRoleOf(script);
+    if (role) deny(`the ${role} template is a standing bot only a human can create`);
     const limits = this.deps.getLimits?.() ?? null;
     if (!limits) deny('limits unavailable (config invalid)', 'conflict');
     const { max_bots_created_per_day: perDay, max_active_bots: maxActive } = limits!.agent;
@@ -444,6 +447,14 @@ export class BotService {
     if (row.created_by === 'agent') return;
     this.deps.audit?.record('agent', action, row.id, undefined, 'denied: bot not created by the agent');
     throw new ServiceError('forbidden', `${action}: the agent may only do this for bots it created (pause_bot works on any bot)`);
+  }
+
+  /** The agent may not start, restart or reconfigure a bot on a standing builtin-role template (R168); denial audited */
+  private refuseAgentOnRole(row: { id: string; script_id: string }, action: string): void {
+    const role = builtinRoleOf(this.deps.scriptRepo.findById(row.script_id));
+    if (!role) return;
+    this.deps.audit?.record('agent', action, row.id, { role }, `denied: ${role} bot`);
+    throw new ServiceError('forbidden', `${action}: ${role} bots are standing bots managed by a human (the agent may only pause them)`);
   }
 
   list(filter?: { scriptId?: string; status?: string }): IpcBot[] {
@@ -537,7 +548,10 @@ export class BotService {
     }
     const before = botRepo.findById(id);
     if (!before) throw notFound('Bot not found');
-    if (who.kind === 'agent') this.requireAgentOwned(before, 'bot.update');
+    if (who.kind === 'agent') {
+      this.refuseAgentOnRole(before, 'bot.update');
+      this.requireAgentOwned(before, 'bot.update');
+    }
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {
       const blocked = walletChangeBlocker(id, tradeRepo, orderRepo);
       if (blocked) {
@@ -598,6 +612,7 @@ export class BotService {
     if (who.kind === 'agent') {
       const row = this.deps.botRepo.findById(id);
       if (!row) throw notFound('Bot not found');
+      this.refuseAgentOnRole(row, 'bot.start');
       this.requireAgentOwned(row, 'bot.start');
     }
     await this.manager().startBot(id, auditActorOf(who));
@@ -645,6 +660,7 @@ export class BotService {
     if (who.kind === 'agent') {
       const row = this.deps.botRepo.findById(id);
       if (!row) throw notFound('Bot not found');
+      this.refuseAgentOnRole(row, 'bot.restart');
       this.requireAgentOwned(row, 'bot.restart');
     }
     await this.manager().restartBot(id, auditActorOf(who));

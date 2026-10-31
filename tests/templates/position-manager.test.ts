@@ -88,10 +88,14 @@ describe('position manager: exit triggers', () => {
     expect(decide(position({ market: { ...m, ambiguityScore: 0, endDate: new Date(NOW + 100 * MIN).toISOString() } }), 0.55, 0.57)).not.toMatchObject({ kind: 'end' });
   });
 
-  it('low remaining edge per day', () => {
+  it('low remaining edge per day only when the executor has better unfunded demand', () => {
     const m = position().market;
-    // (0.65 − 0.6) / 60 days < 0.001
-    expect(decide(position({ market: { ...m, endDate: new Date(NOW + 60 * DAY).toISOString() } }), 0.6, 0.62)).toMatchObject({ kind: 'low_edge' });
+    const p = position({ market: { ...m, endDate: new Date(NOW + 60 * DAY).toISOString() } });
+    const top = topOf(book(0.6, 0.62) as never);
+    // (0.65 − 0.6) / 60 days < 0.001, but nothing better is waiting: hold
+    expect(exitDecision(p as never, top, cfg, NOW)).toBeNull();
+    expect(exitDecision(p as never, top, cfg, NOW, 0.0005)).toBeNull(); // demand worse than this position
+    expect(exitDecision(p as never, top, cfg, NOW, 0.01)).toMatchObject({ kind: 'low_edge' });
   });
 
   it('stop: price moved against by stop_loss_move with no new forecast; a renewed forecast holds', () => {
@@ -101,7 +105,7 @@ describe('position manager: exit triggers', () => {
   });
 });
 
-function fakeCtx(positions: any[], opts: { flags?: any[]; storage?: Record<string, unknown>; now?: number; books?: Record<string, any> } = {}) {
+function fakeCtx(positions: any[], opts: { flags?: any[]; storage?: Record<string, unknown>; now?: number; books?: Record<string, any>; demand?: any } = {}) {
   const store = new Map(Object.entries(opts.storage ?? {}));
   const exit = vi.fn().mockResolvedValue({ ok: true, status: 'open', orderId: 'e1' });
   const cancelExit = vi.fn().mockResolvedValue(undefined);
@@ -119,6 +123,7 @@ function fakeCtx(positions: any[], opts: { flags?: any[]; storage?: Record<strin
     portfolio: {
       getAllPositions: vi.fn().mockResolvedValue(positions),
       getExitFlags: vi.fn().mockResolvedValue(opts.flags ?? []),
+      getCapitalDemand: vi.fn().mockResolvedValue(opts.demand ?? { bestUnmetEdgePerDay: null, at: null }),
       ackExitFlag,
       exit,
       cancelExit,
@@ -178,6 +183,16 @@ describe('position manager: cycle', () => {
     expect(f.ackExitFlag).toHaveBeenCalledWith('fl1', 'position closed');
     expect(r.exits).toEqual([expect.objectContaining({ kind: 'flag', size: 20 })]);
     expect(f.exit.mock.calls[0][0]).toMatchObject({ price: 0.51 }); // one tick inside the ask
+  });
+
+  it('low_edge uses a fresh executor demand report only', async () => {
+    const m = position().market;
+    const p = position({ market: { ...m, endDate: new Date(NOW + 60 * DAY).toISOString() } });
+    const books = { yes1: book(0.6, 0.62) };
+    let f = fakeCtx([p], { books, demand: { bestUnmetEdgePerDay: 0.01, at: new Date(NOW - 2 * 3600_000).toISOString() } }); // stale
+    expect((await runManagerCycle(f.ctx)).exits).toEqual([]);
+    f = fakeCtx([p], { books, demand: { bestUnmetEdgePerDay: 0.01, at: new Date(NOW - 60_000).toISOString() } });
+    expect((await runManagerCycle(f.ctx)).exits).toEqual([expect.objectContaining({ kind: 'low_edge' })]);
   });
 
   it('skips closed markets and ignored bots', async () => {

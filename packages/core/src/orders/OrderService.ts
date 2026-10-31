@@ -138,6 +138,22 @@ export interface OpenOrderInfo {
   placedBy: string | null;
 }
 
+export interface OrderHistoryInfo {
+  orderId: string;
+  tokenId: string;
+  marketId: string;
+  side: OrderSide;
+  orderType: 'limit' | 'market';
+  price: number;
+  size: number;
+  filledSize: number;
+  status: OrderStatus;
+  reason: string | null;
+  forecastId: string | null;
+  placedBy: string | null;
+  createdAt: string;
+}
+
 export interface CancelAllResult {
   cancelled: number;
   /** Orders the exchange did not confirm cancelled */
@@ -1012,7 +1028,11 @@ export class OrderService {
     if (!(remaining > QTY_EPS)) return;
     let pending = books.get(row.token_id);
     if (!pending) {
-      pending = this.deps.getBook(row.token_id).catch(() => null);
+      // A private copy: fills below consume its levels so two orders cannot fill against the same liquidity
+      pending = this.deps
+        .getBook(row.token_id)
+        .then((b) => (b ? { ...b, bids: (b.bids ?? []).map((l) => ({ ...l })), asks: (b.asks ?? []).map((l) => ({ ...l })) } : null))
+        .catch(() => null);
       books.set(row.token_id, pending);
     }
     const book = await pending;
@@ -1027,6 +1047,22 @@ export class OrderService {
     }
     const qty = Math.min(remaining, available);
     if (!(qty > QTY_EPS)) return;
+    // Consume the crossing levels, best price first, for the rest of this sync
+    const crossing = ((buy ? book.asks : book.bids) ?? [])
+      .filter((l) => {
+        const p = parseFloat(l.price);
+        return Number.isFinite(p) && (buy ? p <= row.price + 1e-9 : p >= row.price - 1e-9);
+      })
+      .sort((a, b) => (buy ? parseFloat(a.price) - parseFloat(b.price) : parseFloat(b.price) - parseFloat(a.price)));
+    let left = qty;
+    for (const l of crossing) {
+      if (left <= QTY_EPS) break;
+      const s = parseFloat(l.size);
+      if (!(s > 0)) continue;
+      const take = Math.min(s, left);
+      l.size = String(s - take);
+      left -= take;
+    }
 
     const ps = this.requirePaper();
     const level = [{ price: String(row.price), size: String(qty) }];
@@ -1071,6 +1107,11 @@ export class OrderService {
     this.emitPendingFills();
   }
 
+  /** Placed by another bot on this bot's behalf (a position-manager exit): the owner's own cancels leave it alone. */
+  private placedByOther(row: OrderRow): boolean {
+    return !!row.placed_by && row.placed_by !== this.bot.botId;
+  }
+
   private ownOpenOrder(orderId: string): OrderRow {
     const row = typeof orderId === 'string' ? this.deps.orderRepo.findById(orderId) : undefined;
     // Same message whether it does not exist or belongs to another bot
@@ -1083,10 +1124,16 @@ export class OrderService {
     return row;
   }
 
-  /** Cancel one of this bot's orders. Throws if not found, not this bot's, or not cancellable. */
-  cancel(orderId: string): Promise<void> {
+  /**
+   * Cancel one of this bot's orders. Throws if not found, not this bot's, or not cancellable. An exit another
+   * bot placed for it (position manager) can be cancelled only with `placedBy` equal to that bot.
+   */
+  cancel(orderId: string, opts: { placedBy?: string } = {}): Promise<void> {
     return this.botLock(async () => {
       const row = this.ownOpenOrder(orderId);
+      if (this.placedByOther(row) && opts.placedBy !== row.placed_by) {
+        throw new Error(`Order ${orderId} is an exit placed by the position manager; only it can cancel it`);
+      }
       if (this.paper) {
         this.deps.orderRepo.update(row.id, { status: 'cancelled' });
         return;
@@ -1102,10 +1149,10 @@ export class OrderService {
     });
   }
 
-  /** Cancel all of this bot's open orders (never other bots'). */
+  /** Cancel all of this bot's open orders (never other bots', nor exits the position manager placed for it). */
   cancelAll(): Promise<CancelAllResult> {
     return this.botLock(async () => {
-      const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper);
+      const open = this.deps.orderRepo.findOpen(this.bot.botId, this.paper).filter((o) => !this.placedByOther(o));
       if (this.paper) {
         for (const row of open) this.deps.orderRepo.update(row.id, { status: 'cancelled' });
         return { cancelled: open.length, failed: 0, unknownOutcome: 0 };
@@ -1159,6 +1206,27 @@ export class OrderService {
       createdAt: o.created_at,
       forecastId: o.forecast_id,
       placedBy: o.placed_by ?? null,
+    }));
+  }
+
+  /** This bot's orders (any status) created in the last `days` (max 30), newest first, at most 500. */
+  getOrderHistory(days = 7): OrderHistoryInfo[] {
+    const d = Math.min(Math.max(finite(days) ? days : 7, 0), 30);
+    const since = new Date(this.now() - d * 86_400_000).toISOString();
+    return this.deps.orderRepo.findByBotSince(this.bot.botId, this.paper, since, 500).map((o) => ({
+      orderId: o.id,
+      tokenId: o.token_id,
+      marketId: o.market_id,
+      side: o.side as OrderSide,
+      orderType: o.order_type as 'limit' | 'market',
+      price: o.price,
+      size: o.size,
+      filledSize: o.filled_size,
+      status: o.status,
+      reason: o.reason,
+      forecastId: o.forecast_id,
+      placedBy: o.placed_by ?? null,
+      createdAt: o.created_at,
     }));
   }
 

@@ -77,6 +77,13 @@ export class OrderRepository {
       .all(botId, limit) as OrderRow[];
   }
 
+  /** A bot's orders (paper or live) created since `sinceIso`, newest first. */
+  findByBotSince(botId: string, simulated: boolean, sinceIso: string, limit = 500): OrderRow[] {
+    return this.db
+      .prepare('SELECT * FROM orders WHERE bot_id = ? AND simulated = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?')
+      .all(botId, simulated ? 1 : 0, sinceIso, limit) as OrderRow[];
+  }
+
   /** Forecast of the bot's most recent ledger-driven buy in a token that filled something (position manager). */
   lastBuyForecastId(botId: string, tokenId: string, simulated: boolean): string | null {
     const row = this.db

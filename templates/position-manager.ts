@@ -17,7 +17,9 @@
  *   - flipped:      the current forecast values the token below the average entry price
  *   - take-profit:  best bid ≥ fair − `take_profit_margin` (convergence, default exit; mirror for NO tokens
  *                   since the fair value is per token)
- *   - low edge/day: (fair − best bid) / days to end < `min_hold_edge_per_day` (simplified "better use")
+ *   - low edge/day: (fair − best bid) / days to end < `min_hold_edge_per_day` AND the Forecast Executor reports
+ *                   unfunded demand with a higher edge per day (a better use of capital is queued, spec §9.2);
+ *                   keep `min_hold_edge_per_day` equal to the executor's `min_edge_per_day` (both 0.001)
  *   - stop:         best bid ≤ entry − `stop_loss_move` and the forecast was not renewed since entry
  * Exits rest post-only first (take-profit at max(best bid + tick, fair − margin), others one tick inside the
  * ask); after `escalate_after_minutes` without a full exit (or with the end closer than the escalation
@@ -47,7 +49,7 @@ export const meta = {
       min_hold_edge_per_day: {
         type: 'number',
         title: 'Min edge per day to hold',
-        description: 'Exit when (fair − best bid) / days to end falls below this (0 = off)',
+        description: 'Exit when (fair − best bid) / days to end falls below this AND the executor has unfunded demand with a higher edge per day (0 = off). Keep equal to the executor’s min_edge_per_day',
         default: 0.001,
         minimum: 0,
       },
@@ -106,6 +108,8 @@ export const meta = {
 };
 
 const DAY_MS = 86_400_000;
+/** The executor's demand report counts for this long */
+const DEMAND_MAX_AGE_MS = 3_600_000;
 const MIN_MS = 60_000;
 const MIN_PRICE = 0.01;
 const MAX_PRICE = 0.99;
@@ -173,7 +177,14 @@ export interface ExitDecision {
  * Pure exit rule for one position, or null to hold. Risk triggers come first (flag, rules, ambiguity, end),
  * then the ledger triggers (withdrawn, flipped, take-profit, low edge per day, stop).
  */
-export function exitDecision(p: PortfolioPosition, top: Top, cfg: ManagerConfig, now: number): ExitDecision | null {
+export function exitDecision(
+  p: PortfolioPosition,
+  top: Top,
+  cfg: ManagerConfig,
+  now: number,
+  /** Best edge per day the executor could not fund (fresh), or null: low_edge needs a better use queued */
+  demandEdgePerDay: number | null = null
+): ExitDecision | null {
   const m = p.market;
   const openedAt = p.openedAt ? Date.parse(p.openedAt) : NaN;
   const endMs = m?.endDate ? Date.parse(m.endDate) : NaN;
@@ -211,8 +222,8 @@ export function exitDecision(p: PortfolioPosition, top: Top, cfg: ManagerConfig,
   if (cfg.minHoldEdgePerDay > 0 && bestBid !== null && minutesToEnd !== null) {
     const days = Math.max(minutesToEnd / (DAY_MS / MIN_MS), 1);
     const perDay = (fair - bestBid) / days;
-    if (perDay < cfg.minHoldEdgePerDay) {
-      return risk('low_edge', `edge/day ${perDay.toFixed(5)} < ${cfg.minHoldEdgePerDay}`);
+    if (perDay < cfg.minHoldEdgePerDay && demandEdgePerDay !== null && demandEdgePerDay > perDay) {
+      return risk('low_edge', `edge/day ${perDay.toFixed(5)} < ${cfg.minHoldEdgePerDay}; unfunded demand at ${demandEdgePerDay.toFixed(5)}/day`);
     }
   }
   const renewed = f.id !== p.entryForecastId;
@@ -243,6 +254,10 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
   const now = ctx.now;
   const out: CycleResult = { exits: [], cancelled: 0, acked: 0 };
   const positions = await ctx.portfolio.getAllPositions();
+  // The executor's unfunded demand, if reported within the last hour
+  const demand = await ctx.portfolio.getCapitalDemand();
+  const demandEdgePerDay =
+    demand.bestUnmetEdgePerDay !== null && demand.at !== null && now - Date.parse(demand.at) <= DEMAND_MAX_AGE_MS ? demand.bestUnmetEdgePerDay : null;
 
   // Flags on positions that no longer exist were handled (position closed): acknowledge them
   const held = new Set(positions.filter((p) => p.size > 1e-9).map((p) => `${p.botId}|${p.tokenId}`));
@@ -266,7 +281,7 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
       ctx.log.warn(`position manager: no book for ${p.tokenId}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    const decision = exitDecision(p, top, cfg, now);
+    const decision = exitDecision(p, top, cfg, now, demandEdgePerDay);
     const key = stateKey(p);
 
     if (!decision) {
