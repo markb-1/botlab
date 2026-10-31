@@ -678,7 +678,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
       .sort((a, b) => BUCKET_ORDER.indexOf(a.horizon_bucket) - BUCKET_ORDER.indexOf(b.horizon_bucket));
 
     for (const row of rows) {
-      if (only && (row.category !== only.category || row.horizon_bucket !== only.bucket)) continue;
+      // A short bucket's state drives the medium relaxation: re-evaluate that category's medium bucket with it
+      if (only && (row.category !== only.category || (row.horizon_bucket !== only.bucket && !(only.bucket === 'short' && row.horizon_bucket === 'medium')))) continue;
       const votes = bucketVotes(groups.get(`${row.category}|${row.horizon_bucket}`) ?? []);
       const shortTrading = this.deps.rightsRepo.get(row.category, 'short')?.state === 'trading';
       const decision = decideRights({

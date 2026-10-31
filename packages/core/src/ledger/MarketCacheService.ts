@@ -47,7 +47,9 @@ const BATCH_SIZE = 20;
 /** Category search (no text): Gamma tags queried per search, events per page, pages per tag, parallel requests */
 export const CATEGORY_SEARCH_MAX_TAGS = 24;
 export const CATEGORY_SEARCH_PAGE_SIZE = 50;
-export const CATEGORY_SEARCH_MAX_PAGES = 3;
+export const CATEGORY_SEARCH_MAX_PAGES = 2;
+/** Total time for a category fan-out; tags finished by then are returned (partial result) */
+export const CATEGORY_SEARCH_DEADLINE_MS = 15_000;
 const CATEGORY_SEARCH_CONCURRENCY = 4;
 
 export interface RulesChangedEvent {
@@ -109,6 +111,25 @@ export class GammaHttpError extends Error {
     super(message);
     this.name = 'GammaHttpError';
   }
+}
+
+/** `p`, or a rejection as soon as `signal` aborts (a fetch implementation that ignores its signal cannot hold the deadline). */
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      }
+    );
+  });
 }
 
 /** Gamma events (with their `markets`) → the markets, each carrying its event (title, tags) for categorizing. */
@@ -529,10 +550,20 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
    * VERIFY: `tag_slug` and `order=volume24hr` on `/events` are from knowledge of the Gamma API, not checked against
    * live data. A failing tag is skipped unless every tag failed; a 429 is thrown at once (the caller backs off).
    */
+  /** Tags a category-only search would query (MarketService weighs the search rate limit by it). */
+  categorySearchTagCount(category: string): number {
+    return Math.min(categorySearchTags(category, this.deps.getCategories()).length, CATEGORY_SEARCH_MAX_TAGS);
+  }
+
+  /** Total deadline of a category fan-out (ms); a field so tests can shorten it */
+  categorySearchDeadlineMs = CATEGORY_SEARCH_DEADLINE_MS;
+
   private async gammaEventsByTags(tags: string[], active: boolean): Promise<unknown[]> {
+    const deadline = AbortSignal.timeout(this.categorySearchDeadlineMs);
     const fetchTag = async (tag: string): Promise<unknown[]> => {
       const raws: unknown[] = [];
       for (let page = 0; page < CATEGORY_SEARCH_MAX_PAGES; page++) {
+        if (deadline.aborted) break;
         const params = new URLSearchParams({
           tag_slug: tag,
           order: 'volume24hr',
@@ -544,7 +575,17 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
           params.set('active', 'true');
           params.set('closed', 'false');
         }
-        const resp = await this.fetchFn(`${this.baseUrl}/events?${params.toString()}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+        let resp: Response;
+        try {
+          resp = await abortable(
+            this.fetchFn(`${this.baseUrl}/events?${params.toString()}`, { signal: AbortSignal.any([AbortSignal.timeout(FETCH_TIMEOUT_MS), deadline]) }),
+            deadline
+          );
+        } catch (err) {
+          // Out of time: keep the pages this tag already returned
+          if (deadline.aborted && raws.length > 0) break;
+          throw err;
+        }
         if (!resp.ok) throw gammaHttpError(`Gamma events (tag ${tag})`, resp);
         const body = (await resp.json()) as unknown;
         const events = Array.isArray(body) ? body : [];
@@ -555,6 +596,7 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
     };
     const results: Array<{ ok: true; raws: unknown[] } | { ok: false; err: unknown }> = [];
     for (let i = 0; i < tags.length; i += CATEGORY_SEARCH_CONCURRENCY) {
+      if (deadline.aborted) break; // partial result: the tags finished so far
       const batch = await Promise.all(
         tags.slice(i, i + CATEGORY_SEARCH_CONCURRENCY).map((t) =>
           fetchTag(t).then(
@@ -570,6 +612,7 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
     }
     const ok = results.filter((r): r is { ok: true; raws: unknown[] } => r.ok);
     if (ok.length === 0) {
+      if (deadline.aborted) throw new Error(`Gamma category search timed out after ${Math.round(this.categorySearchDeadlineMs / 1000)} s`);
       const first = results.find((r): r is { ok: false; err: unknown } => !r.ok);
       throw first ? first.err : new Error('Gamma: no tags to search');
     }

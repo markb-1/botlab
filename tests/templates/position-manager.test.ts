@@ -208,6 +208,23 @@ describe('position manager: cycle', () => {
     expect(f.exit.mock.calls[0][0]).toMatchObject({ marketable: true });
   });
 
+  it('review: no non-crossing price (bid 0.99) ⇒ marketable at once; when refused, no resting cross and no retry every cycle', async () => {
+    const flag = { id: 'fl', botId: 'b1', tokenId: 'yes1', marketId: 'm1', reason: 'x', createdBy: 'agent', createdAt: '' };
+    const p = position({ exitFlag: flag });
+    const top = { yes1: { bids: [{ price: '0.99', size: '10' }], asks: [], tick_size: '0.01' } };
+    let f = fakeCtx([p], { books: top });
+    f.exit.mockResolvedValue({ ok: false, status: 'rejected_risk', failedCheck: 'top_of_book', error: 'thin', orderId: 'r1' });
+    await runManagerCycle(f.ctx);
+    expect(f.exit).toHaveBeenCalledTimes(1);
+    expect(f.exit.mock.calls[0][0]).toMatchObject({ marketable: true });
+    const saved = f.store.get('exit:b1:yes1') as { marketableRefusedAt: number };
+    expect(saved.marketableRefusedAt).toBe(NOW);
+    // Next cycles inside the retry window: nothing is attempted
+    f = fakeCtx([p], { books: top, storage: { 'exit:b1:yes1': saved }, now: NOW + 2 * MIN });
+    await runManagerCycle(f.ctx);
+    expect(f.exit).not.toHaveBeenCalled();
+  });
+
   it('cancels its exits when the trigger is gone', async () => {
     const mine = { orderId: 'e0', orderType: 'limit', price: 0.64, size: 20, filledSize: 0, status: 'open', placedByMe: true, createdAt: '', expiresAt: null };
     const f = fakeCtx([position({ openSellSize: 20, available: 0, exitOrders: [mine] })], { books: { yes1: book(0.55, 0.57) } });

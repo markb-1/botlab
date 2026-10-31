@@ -152,6 +152,12 @@ export function refreshWindowMs(cfg: Pick<ExecutorConfig, 'bidTtlMinutes'>): num
   return Math.min(5, cfg.bidTtlMinutes / 2) * 60_000;
 }
 
+/** Bid lifetime actually used: bid_ttl_minutes capped by the server's resting-order TTL (when known), at least 3. */
+export function effectiveBidTtl(cfg: Pick<ExecutorConfig, 'bidTtlMinutes'>, maxRestingTtlMinutes: number | null | undefined): number {
+  const cap = typeof maxRestingTtlMinutes === 'number' && Number.isFinite(maxRestingTtlMinutes) ? maxRestingTtlMinutes : Infinity;
+  return Math.max(Math.min(cfg.bidTtlMinutes, cap), 3);
+}
+
 /**
  * Markets the per-bot order rate can keep quoted: each costs about one re-placement per (TTL − refresh window)
  * plus one re-price an hour. Infinity when the rate is unknown.
@@ -420,10 +426,14 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   const cfg = executorConfig(ctx.config);
   const now = ctx.now;
   const result: CycleResult = { placed: 0, kept: 0, cancelled: 0, planned: [], unmetEdgePerDay: null, deferred: 0, refreshAt: null };
-  const refreshMs = refreshWindowMs(cfg);
+  // Effective bid lifetime set below, once the server's resting-order cap is known
+  let refreshMs = refreshWindowMs(cfg);
 
   const open = (await ctx.polymarket.getOpenOrders()).filter((o) => o.side === 'buy' && o.exchange === 'polymarket' && !o.placedBy);
   const budget = await ctx.risk.getBudget();
+  // The server caps GTD lifetimes at limits.yaml orders.resting_order_ttl_minutes: plan with the effective TTL
+  const ttlCfg = { ...cfg, bidTtlMinutes: effectiveBidTtl(cfg, budget.maxRestingTtlMinutes) };
+  refreshMs = refreshWindowMs(ttlCfg);
   if (budget.halted) {
     // Halted: the server refuses orders and cancels resting ones; drop ours too
     for (const o of open) {
@@ -518,7 +528,7 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   }
 
   // No more markets than the hourly order rate can keep quoted (F1)
-  const sustainable = sustainableMarkets(cfg, budget.ordersPerHour);
+  const sustainable = sustainableMarkets(ttlCfg, budget.ordersPerHour);
   const plan = allocatePlan(quotes, { ...cfg, maxMarkets: Math.min(cfg.maxMarkets, sustainable) }, available, marketUsed);
   const planned = plan.orders;
   result.planned = planned;
@@ -549,7 +559,7 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   }
   result.kept = kept.size;
 
-  const ttlMinutes = Math.max(3, Math.round(cfg.bidTtlMinutes));
+  const ttlMinutes = Math.max(3, Math.round(ttlCfg.bidTtlMinutes));
   // Hourly order budget (own submissions; rejections and Position Manager exits do not count)
   let ordersLeft = typeof budget.ordersRemainingThisHour === 'number' ? budget.ordersRemainingThisHour : Infinity;
   for (let i = 0; i < planned.length; i++) {
@@ -568,7 +578,9 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
     });
     if (r.ok) {
       result.placed++;
-      result.refreshAt = Math.min(result.refreshAt ?? Infinity, now + ttlMinutes * 60_000 - refreshMs);
+      // The server's expiry (it may have capped the TTL), else what was asked for
+      const exp = r.expiresAt ? Date.parse(r.expiresAt) : NaN;
+      result.refreshAt = Math.min(result.refreshAt ?? Infinity, (Number.isFinite(exp) ? exp : now + ttlMinutes * 60_000) - refreshMs);
     } else ctx.log.info(`executor: bid ${p.size} @ ${p.price} on ${p.tokenId} not placed: ${r.error ?? r.status}`);
   }
   return result;

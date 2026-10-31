@@ -337,6 +337,11 @@ export interface RiskBudget {
    * (risk rejections and Position Manager exits placed for it do not count). null when unknown.
    */
   ordersRemainingThisHour: number | null;
+  /**
+   * Longest resting-order lifetime the server allows (limits.yaml orders.resting_order_ttl_minutes): a longer
+   * `ttlMinutes` is capped to it. null when unknown.
+   */
+  maxRestingTtlMinutes: number | null;
 }
 
 export interface RiskContext {

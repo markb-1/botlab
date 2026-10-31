@@ -62,6 +62,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
   let cash: () => Promise<number>;
   let clock = NOW;
   let market: MarketInfo = MARKET;
+  let bookCalls = 0;
 
   // Live trading is opt-in (3b); these tests exercise live orders
   const engine = new RiskEngine({ limits: LimitsSchema.parse({ live_trading: { enabled: true } }), mandate: MandateSchema.parse({}) });
@@ -97,7 +98,10 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
         fees: new FeeService(),
         marketData: { getMarketInfo: async (tokenId: string) => (market.tokenIds.includes(tokenId) ? market : null) },
         quality: ASSESSED,
-        getBook: async () => BOOK,
+        getBook: async () => {
+          bookCalls++;
+          return BOOK;
+        },
         getBinanceBook: async () => ({ bids: [{ price: '49990', quantity: '1' }], asks: [{ price: '50000', quantity: '1' }] }),
         now: () => clock,
       },
@@ -509,6 +513,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       const budget = await svc.getBudget();
       expect(budget.ordersPerHour).toBe(20);
       expect(budget.ordersRemainingThisHour).toBe(19);
+      expect(budget.maxRestingTtlMinutes).toBe(240);
     });
 
     it('a burst of own rejections pauses own submissions briefly; exits placed by another bot are exempt', async () => {
@@ -520,7 +525,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       expect(paused).toMatchObject({ ok: false, status: 'rejected_risk', failedCheck: 'rejection_cooldown' });
       expect(poly.postLimitOrder).not.toHaveBeenCalled();
       // The cooldown's own refusals do not extend it
-      expect(t.orderRepo.ownRejectionTimesSince('bot-1', new Date(0).toISOString(), false, 'rejection_cooldown')).toHaveLength(6);
+      expect(t.orderRepo.ownRejectionTimesSince('bot-1', new Date(0).toISOString(), false, ['rejection_cooldown'])).toHaveLength(6);
       // A risk exit placed by the Position Manager still reaches the risk engine (refused there for other reasons)
       const exit = await svc.placeLimit({ tokenId: 't1', side: 'sell', price: 0.6, size: 5, riskExit: true, placedBy: 'pm' });
       expect(exit.failedCheck).not.toBe('rejection_cooldown');
@@ -529,6 +534,40 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       // Ten minutes later the window has drained
       clock += 11 * 60_000;
       expect((await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })).ok).toBe(true);
+    });
+
+    it('while cooling down a tight loop makes no sync or book calls and stores one refusal per cooldown', async () => {
+      clock = Date.now();
+      market = { ...MARKET, endDate: new Date(clock + 10 * DAY).toISOString() };
+      const svc = makeService('bot-1');
+      for (let i = 0; i < 6; i++) await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 100 });
+      const sync = vi.spyOn(svc, 'syncOpenOrders');
+      bookCalls = 0;
+      const rowsBefore = t.db.prepare("SELECT COUNT(*) AS n FROM orders WHERE bot_id = 'bot-1'").get() as { n: number };
+      for (let i = 0; i < 50; i++) {
+        const r = i % 3 === 0
+          ? await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })
+          : i % 3 === 1
+            ? await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 5 })
+            : await svc.placeBinance({ symbol: 'BTCUSDT', side: 'buy', amount: 10 });
+        expect(r.failedCheck).toBe('rejection_cooldown');
+      }
+      expect(sync).not.toHaveBeenCalled();
+      expect(bookCalls).toBe(0);
+      expect(binance.marketBuy).not.toHaveBeenCalled();
+      const after = t.db.prepare("SELECT COUNT(*) AS n FROM orders WHERE bot_id = 'bot-1'").get() as { n: number };
+      expect(after.n - rowsBefore.n).toBe(1);
+    });
+
+    it('system-wide refusals (live trading off, clock) do not start a cooldown', async () => {
+      t.orderRepo.create({ botId: 'bot-1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'buy', orderType: 'limit', price: 0.4, size: 5, notionalUsd: 2, status: 'rejected_risk', riskDecision: { allowed: false, failedCheck: 'live_disabled', checks: [], evaluatedAt: '' } });
+      for (let i = 0; i < 7; i++) {
+        t.orderRepo.create({ botId: 'bot-1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'buy', orderType: 'limit', price: 0.4, size: 5, notionalUsd: 2, status: 'rejected_risk', riskDecision: { allowed: false, failedCheck: i % 2 ? 'clock_skew' : 'global_halt', checks: [], evaluatedAt: '' } });
+      }
+      clock = Date.now();
+      market = { ...MARKET, endDate: new Date(clock + 10 * DAY).toISOString() };
+      const r = await makeService('bot-1').placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+      expect(r.ok).toBe(true);
     });
   });
 

@@ -106,6 +106,23 @@ export interface BotManagerOrderDeps {
  * BotManager orchestrates all bot instances.
  * Handles starting, stopping, and monitoring bots.
  */
+
+/**
+ * ctx.risk.getFlaggedTokens: open exit flags on any bot's position in ONE mode (filtered in SQL), latest per token,
+ * without reasons or owners (they are another bot's business).
+ */
+export function flaggedTokensInMode(
+  flags: Pick<PositionExitFlagRepository, 'listOpen'>,
+  simulated: boolean
+): Array<{ tokenId: string; marketId: string | null; flaggedAt: string }> {
+  const byToken = new Map<string, { tokenId: string; marketId: string | null; flaggedAt: string }>();
+  for (const f of flags.listOpen(simulated)) {
+    const prev = byToken.get(f.token_id);
+    if (!prev || f.created_at > prev.flaggedAt) byToken.set(f.token_id, { tokenId: f.token_id, marketId: f.market_id ?? prev?.marketId ?? null, flaggedAt: f.created_at });
+  }
+  return [...byToken.values()];
+}
+
 export class BotManager extends EventEmitter {
   private walletManager: WalletManager;
   private botRepo: BotRepository;
@@ -767,16 +784,7 @@ export class BotManager extends EventEmitter {
         : {}),
       ...(this.orderDeps?.exitFlags
         ? {
-            flaggedTokens: (simulated: boolean) => {
-              // Mode-scoped, any bot: latest flag per token, no reasons (they are another bot's business)
-              const byToken = new Map<string, { tokenId: string; marketId: string | null; flaggedAt: string }>();
-              for (const f of this.orderDeps!.exitFlags!.list({ status: 'open', limit: 1000 })) {
-                if ((f.simulated === 1) !== simulated) continue;
-                const prev = byToken.get(f.token_id);
-                if (!prev || f.created_at > prev.flaggedAt) byToken.set(f.token_id, { tokenId: f.token_id, marketId: f.market_id ?? prev?.marketId ?? null, flaggedAt: f.created_at });
-              }
-              return [...byToken.values()];
-            },
+            flaggedTokens: (simulated: boolean) => flaggedTokensInMode(this.orderDeps!.exitFlags!, simulated),
           }
         : {}),
       exitPolicy: (simulated: boolean) => this.getExitPolicy(simulated),

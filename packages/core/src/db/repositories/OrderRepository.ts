@@ -242,17 +242,29 @@ export class OrderRepository {
 
   /**
    * The bot's own risk rejections since `sinceIso` (not orders placed for it by another bot), oldest first, without
-   * the cooldown's own refusals (`failedCheck` = `excludeCheck`): the rejection cooldown's input.
+   * those whose `failedCheck` is in `excludeChecks` (the cooldown's own refusals, system-wide states): the rejection
+   * cooldown's input.
    */
-  ownRejectionTimesSince(botId: string, sinceIso: string, simulated: boolean, excludeCheck: string): string[] {
+  ownRejectionTimesSince(botId: string, sinceIso: string, simulated: boolean, excludeChecks: readonly string[]): string[] {
+    const placeholders = excludeChecks.map(() => '?').join(',') || "''";
     const rows = this.db
       .prepare(
-        `SELECT created_at FROM orders WHERE bot_id = ? AND created_at >= ? AND simulated = ? AND status = 'rejected_risk'
-           AND placed_by IS NULL AND COALESCE(json_extract(risk_decision, '$.failedCheck'), '') != ?
+        `SELECT created_at FROM orders WHERE bot_id = ? AND status = 'rejected_risk' AND created_at >= ? AND simulated = ?
+           AND placed_by IS NULL AND COALESCE(json_extract(risk_decision, '$.failedCheck'), '') NOT IN (${placeholders})
          ORDER BY created_at`
       )
-      .all(botId, sinceIso, simulated ? 1 : 0, excludeCheck) as Array<{ created_at: string }>;
+      .all(botId, sinceIso, simulated ? 1 : 0, ...excludeChecks) as Array<{ created_at: string }>;
     return rows.map((r) => r.created_at);
+  }
+
+  /** Whether the bot has a rejection with this failed check since `sinceIso` (one cooldown row per window). */
+  hasRejectionSince(botId: string, sinceIso: string, simulated: boolean, failedCheck: string): boolean {
+    return !!this.db
+      .prepare(
+        `SELECT 1 FROM orders WHERE bot_id = ? AND status = 'rejected_risk' AND created_at >= ? AND simulated = ?
+           AND json_extract(risk_decision, '$.failedCheck') = ? LIMIT 1`
+      )
+      .get(botId, sinceIso, simulated ? 1 : 0, failedCheck);
   }
 
   /**

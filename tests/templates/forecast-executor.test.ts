@@ -15,6 +15,7 @@ import {
   quoteFor,
   runExecutorCycle,
   sustainableMarkets,
+  effectiveBidTtl,
   type Quote,
 } from '../../templates/forecast-executor';
 import { typecheckScript } from '../../packages/core/src/runtime/typecheckScript';
@@ -354,6 +355,24 @@ describe('forecast executor: cycle', () => {
       r = await runExecutorCycle(f.ctx);
       expect(r).toMatchObject({ placed: 2, deferred: 1 });
       expect(f.placeLimit.mock.calls.map((c) => c[0])).toEqual(['ya', 'yb']);
+    });
+
+    it('review: the server TTL cap (resting_order_ttl_minutes 30) sets the bid lifetime, refresh time and market count', async () => {
+      expect(effectiveBidTtl({ bidTtlMinutes: 60 }, 30)).toBe(30);
+      expect(effectiveBidTtl({ bidTtlMinutes: 60 }, null)).toBe(60);
+      const budget = { remainingAllocation: 1000, remainingMarket: {}, halted: false, ordersPerHour: 20, ordersRemainingThisHour: 20, maxRestingTtlMinutes: 30 };
+      const fs7 = Array.from({ length: 7 }, (_, i) =>
+        forecast({ id: `f${i}`, marketId: `m${i}`, tokenId: `y${i}`, complementTokenId: `n${i}`, endDate: new Date(NOW + (2 + i) * DAY).toISOString() })
+      );
+      const bk = Object.fromEntries(fs7.map((f) => [f.tokenId, book(0.49, 0.52)]));
+      const f = fakeCtx({ forecasts: fs7, books: bk, budget, config: { bid_ttl_minutes: 60 } });
+      // The server answers with its own (capped) expiry
+      f.placeLimit.mockResolvedValue({ ok: true, status: 'open', orderId: 'new', expiresAt: new Date(NOW + 30 * 60_000).toISOString() });
+      const r = await runExecutorCycle(f.ctx);
+      // 20 / (60 / 25 + 1) = 5.9 ⇒ 5 markets (with 60-minute bids it would have been 9)
+      expect(r.planned).toHaveLength(5);
+      expect(f.placeLimit.mock.calls[0][4]).toMatchObject({ ttlMinutes: 30 });
+      expect(r.refreshAt).toBe(NOW + 25 * 60_000);
     });
 
     it('F3: skips a forecast whose token or complement has an open exit flag on any bot, and cancels its bids there', async () => {

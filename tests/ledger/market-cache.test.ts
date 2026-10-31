@@ -152,7 +152,7 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     expect([...tags]).toEqual(expect.arrayContaining(['inflation', 'cpi', 'unemployment', 'economy', 'economics']));
     expect(tags.has('sports')).toBe(false);
     // Pagination: a full page fetches the next one; a short page ends it
-    expect(urls.filter((u) => u.searchParams.get('tag_slug') === 'unemployment').map((u) => u.searchParams.get('offset'))).toEqual(['0', '50']);
+    expect(urls.filter((u) => u.searchParams.get('tag_slug') === 'unemployment').map((u) => u.searchParams.get('offset'))).toEqual(['0', '50']); // at most 2 pages
     // Merged, deduplicated, only open economics markets, ranked by 24h volume
     expect(hits.map((x) => x.marketId).slice(0, 3)).toEqual(['m5', 'm1', 'u49']);
     expect(hits).toHaveLength(2 + 51);
@@ -166,6 +166,21 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     await expect(h.cache.searchGamma({ category: 'weather-climate' })).rejects.toMatchObject({ status: 429 });
     h.fetchFn.mockImplementation(async () => ({ ok: false, status: 503, headers: new Headers(), json: async () => ({}) }) as unknown as Response);
     await expect(h.cache.searchGamma({ category: 'weather-climate' })).rejects.toThrow(/503/);
+  });
+
+  it('category fan-out has a total deadline: tags finished by then are returned', async () => {
+    h.cache.categorySearchDeadlineMs = 100;
+    h.fetchFn.mockImplementation(async (url: string) => {
+      const tag = new URL(url).searchParams.get('tag_slug');
+      if (tag !== 'inflation') return new Promise(() => {}); // never answers
+      return { ok: true, status: 200, json: async () => [{ id: 'e1', title: 'US CPI', tags: [{ slug: 'inflation', label: 'Inflation' }], markets: [gammaMarket('m1')] }] } as unknown as Response;
+    });
+    const started = Date.now();
+    const hits = await h.cache.searchGamma({ category: 'economics' });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(hits.map((x) => x.marketId)).toEqual(['m1']);
+    h.fetchFn.mockImplementation(async () => new Promise(() => {}));
+    await expect(h.cache.searchGamma({ category: 'economics' })).rejects.toThrow(/timed out/);
   });
 
   it('ambiguity: unassessed ⇒ null (buys rejected); assessed; auto-raised to 2 for 7 days after a rules change and on dispute', async () => {

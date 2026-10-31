@@ -204,7 +204,10 @@ export function exitDecision(
   const riskPrice = (): number | null => {
     let price = bestAsk !== null ? floorTick(bestAsk - tick, tick) : bestBid !== null ? ceilTick(bestBid + tick, tick) : null;
     if (price !== null && bestBid !== null && price <= bestBid + 1e-9) price = ceilTick(bestBid + tick, tick);
-    return price === null ? null : Math.min(Math.max(price, MIN_PRICE), MAX_PRICE);
+    if (price === null) return null;
+    price = Math.min(Math.max(price, MIN_PRICE), MAX_PRICE);
+    // No price above the bid within [0.01, 0.99] (bid at 0.99): a post-only exit would cross ⇒ marketable at once
+    return bestBid !== null && price <= bestBid + 1e-9 ? null : price;
   };
   const risk = (kind: ExitKind, reason: string): ExitDecision => ({ kind, reason, restingPrice: riskPrice() });
 
@@ -226,7 +229,11 @@ export function exitDecision(
   if (fair < p.avgPrice - 1e-9) return risk('flipped', `forecast now ${fair.toFixed(3)} < entry ${p.avgPrice.toFixed(3)}`);
   if (bestBid !== null && bestBid + 1e-9 >= fair - cfg.takeProfitMargin) {
     const price = Math.min(Math.max(ceilTick(Math.max(bestBid + tick, fair - cfg.takeProfitMargin), tick), MIN_PRICE), MAX_PRICE);
-    return { kind: 'take_profit', reason: `converged: bid ${bestBid} >= fair ${fair.toFixed(3)} − ${cfg.takeProfitMargin}`, restingPrice: price };
+    return {
+      kind: 'take_profit',
+      reason: `converged: bid ${bestBid} >= fair ${fair.toFixed(3)} − ${cfg.takeProfitMargin}`,
+      restingPrice: price <= bestBid + 1e-9 ? null : price,
+    };
   }
   if (cfg.minHoldEdgePerDay > 0 && bestBid !== null && minutesToEnd !== null) {
     const days = Math.max(minutesToEnd / (DAY_MS / MIN_MS), 1);
@@ -253,11 +260,14 @@ interface ExitState {
 
 /**
  * Resting fallback when a marketable exit is refused: the lowest price that does not cross (one tick above the
- * best bid; it may join the best ask), else the trigger's own resting price; null when the book is empty.
+ * best bid; it may join the best ask), else the trigger's own resting price; null when the book is empty or no
+ * such price is ≤ 0.99 (a post-only exit would cross).
  */
 export function fallbackExitPrice(top: Top, restingPrice: number | null): number | null {
   if (top.bestBid === null) return restingPrice;
-  return Math.min(Math.max(ceilTick(top.bestBid + top.tick, top.tick), MIN_PRICE), MAX_PRICE);
+  const price = ceilTick(top.bestBid + top.tick, top.tick);
+  if (price > MAX_PRICE + 1e-9) return null;
+  return Math.max(price, MIN_PRICE);
 }
 
 const stateKey = (p: { botId: string; tokenId: string }) => `exit:${p.botId}:${p.tokenId}`;
@@ -339,10 +349,12 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
     const fallback = fallbackExitPrice(top, decision.restingPrice);
     // A recent refusal of the marketable exit: keep resting at the fallback until the retry window passed (F2)
     const refusedRecently =
-      wantMarketable &&
-      typeof state.marketableRefusedAt === 'number' &&
-      now - state.marketableRefusedAt < MARKETABLE_RETRY_MINUTES * MIN_MS &&
-      fallback !== null;
+      wantMarketable && typeof state.marketableRefusedAt === 'number' && now - state.marketableRefusedAt < MARKETABLE_RETRY_MINUTES * MIN_MS;
+    if (refusedRecently && fallback === null) {
+      // Nothing can rest without crossing (bid at the top of the range): wait for the retry window, no refused attempt per cycle
+      ctx.log.debug(`position manager: ${p.tokenId} (${decision.kind}): marketable exit refused recently, no resting price; retry after the window`);
+      continue;
+    }
     const escalate = wantMarketable && !refusedRecently;
     const restingPrice = refusedRecently ? (fallback as number) : decision.restingPrice;
 
@@ -387,12 +399,16 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
         ...(top.bestBid !== null ? { price: Math.max(floorTick(top.bestBid - cfg.escalateSlippage, top.tick), MIN_PRICE) } : {}),
         reason: `${decision.kind} (marketable): ${decision.reason}`,
       });
-      if (!r.ok && fallback !== null) {
-        // Refused (e.g. top of book too thin): never leave the position without an exit order (F2)
-        ctx.log.warn(`position manager: marketable exit of ${p.botName ?? p.botId} ${p.tokenId} refused (${r.error ?? r.status}); resting at ${fallback}`);
+      if (!r.ok) {
         await ctx.storage.set(key, { ...state, marketableRefusedAt: now });
-        r = await resting(fallback, `${decision.kind} (fallback, marketable refused): ${decision.reason}`);
-        marketable = false;
+        if (fallback !== null) {
+          // Refused (e.g. top of book too thin): never leave the position without an exit order (F2)
+          ctx.log.warn(`position manager: marketable exit of ${p.botName ?? p.botId} ${p.tokenId} refused (${r.error ?? r.status}); resting at ${fallback}`);
+          r = await resting(fallback, `${decision.kind} (fallback, marketable refused): ${decision.reason}`);
+          marketable = false;
+        } else {
+          ctx.log.warn(`position manager: marketable exit of ${p.botName ?? p.botId} ${p.tokenId} refused (${r.error ?? r.status}); no non-crossing resting price, retry in ${MARKETABLE_RETRY_MINUTES} min`);
+        }
       }
     } else {
       r = await resting(restingPrice as number, `${decision.kind}${refusedRecently ? ' (fallback, marketable refused)' : ''}: ${decision.reason}`);

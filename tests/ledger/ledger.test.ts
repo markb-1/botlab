@@ -329,6 +329,25 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       h.ledger.forceRightsState('economics', 'short', 'shadow', 'pause', HUMAN);
       expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'resume', HUMAN)).toMatchObject({ state: 'trading', forced: false });
     });
+
+    it('un-forcing the short bucket re-evaluates the medium bucket that qualified only on its relaxation', () => {
+      // 20 good medium events: enough only while the short bucket trades (relaxed threshold)
+      for (let i = 0; i < 20; i++) {
+        h.forecastRepo.insertSuperseding({
+          id: `md${i}`, marketId: `mm${i}`, tokenId: `mt${i}`, eventId: `me${i}`, category: 'economics', probability: 0.7,
+          marketPriceAtForecast: 0.5, bestBid: 0.49, bestAsk: 0.51, liquidityUsd: 1e4, rationale: 'r', sources: [],
+          ambiguityScore: 0, tradeable: false, daysToResolution: 20, horizonBucket: 'medium', createdBy: 'human',
+          createdAt: new Date(T0 - 60 * DAY + i * DAY).toISOString(),
+        });
+        h.forecastRepo.setScore(`md${i}`, { outcome: i % 5 === 0 ? 0 : 1, brierAgent: 0, brierMarket: 0, skill: i % 5 === 0 ? -0.24 : 0.16, resolvedAt: new Date(T0 - 35 * DAY + i * DAY).toISOString() });
+      }
+      h.ledger.forceRightsState('economics', 'short', 'trading', 'test', HUMAN);
+      h.ledger.evaluateRights();
+      expect(h.rightsRepo.get('economics', 'medium')).toMatchObject({ state: 'trading', qualified_n: 20 });
+      h.ledger.forceRightsState('economics', 'short', 'auto', 'done', HUMAN);
+      expect(h.rightsRepo.get('economics', 'short')).toMatchObject({ state: 'shadow' });
+      expect(h.rightsRepo.get('economics', 'medium')).toMatchObject({ state: 'shadow', max_allocation_usd: 0 });
+    });
   });
 
   describe('risk engine path for ledger-driven buys', () => {

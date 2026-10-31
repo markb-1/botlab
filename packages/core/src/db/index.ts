@@ -645,6 +645,9 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     )`,
     `INSERT OR IGNORE INTO copy_leader_blocks (address, bot_id, reason, blocked_at)
        SELECT address, bot_id, dropped_reason, COALESCE(dropped_at, updated_at) FROM copy_leaders WHERE status = 'dropped'`,
+    // Mac test follow-ups: Position Manager stops across bots (ctx.risk.getRecentStops) and the rejection cooldown
+    'CREATE INDEX IF NOT EXISTS idx_orders_placed_by ON orders(placed_by, simulated, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_orders_bot_status_created ON orders(bot_id, status, created_at)',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
