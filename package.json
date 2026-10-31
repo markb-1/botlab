@@ -3,7 +3,7 @@
     "version": "3.0.0-dev",
     "scripts": {
         "dev": "concurrently -k -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
-        "dev:server": "tsx watch --clear-screen=false apps/server/src/main.ts",
+        "dev:server": "node --watch --watch-preserve-output --import tsx apps/server/src/main.ts",
         "dev:web": "vite --config apps/web/vite.config.mts",
         "build": "npm run clean && npm run build:server && npm run build:web",
         "build:server": "tsc -p apps/server/tsconfig.build.json",

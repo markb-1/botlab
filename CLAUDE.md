@@ -21,7 +21,7 @@ Self-hosted trading lab for Polymarket (prediction markets) and Binance (crypto 
 
 ### Development
 ```bash
-npm run dev                # server (tsx watch, :3780) + Vite UI with /api proxy (http://localhost:3000)
+npm run dev                # server (node --watch + tsx, :3780) + Vite UI with /api proxy (http://localhost:3000)
 npm run dev:server         # server only
 npm run cli -- <command>   # migrate-key | gen-key | set-password | token create/list/revoke (add --prod for npm start paths)
 ```

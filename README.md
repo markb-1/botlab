@@ -318,7 +318,7 @@ You can **fork** any template to create your own version, or **import/export** s
 ## Development
 
 ```bash
-npm run dev            # server (tsx watch) + Vite UI with /api proxy
+npm run dev            # server (node --watch + tsx) + Vite UI with /api proxy
 npm run build          # tsc → dist/ (server + core), vite → apps/web/dist
 npm start              # built server serving the built UI (production paths)
 npm run typecheck      # core + server + web
