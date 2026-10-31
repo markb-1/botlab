@@ -298,6 +298,17 @@ export const TOOLS: ToolDef[] = [
     untrusted: 'polymarket',
     run: (a, { services }) => services.markets.leaderboard(a),
   }),
+  def({
+    name: 'get_copy_leaders',
+    group: 'read',
+    description:
+      `A copy-trading bot's leaders (spec §9.5): status (active / dropped / removed, dropped reason), orders copied, closed and open copied trades, hit rate, realised and unrealised P&L, and the auto-drop window (last 20 closed copies: net P&L < 0 and hit rate < 50 % ⇒ dropped). Use it in the daily review. ${NO_RISK}`,
+    input: BotIdInputSchema,
+    readOnly: true,
+    untrusted: 'bot',
+    target: (a) => a.botId as string,
+    run: (a, { services }) => services.copy.leaders(a.botId),
+  }),
 
   // ── Build ─────────────────────────────────────────────────────────────
   def({

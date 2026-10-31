@@ -26,6 +26,7 @@ import {
   BotListFilterSchema,
   BotUpdateSchema,
   ClearHaltSchema,
+  CopyLeaderReactivateSchema,
   ConfigFileSchema,
   ForecastListFilterSchema,
   KillSwitchSchema,
@@ -459,9 +460,25 @@ export function agentControlRoutes(control: AgentControl): RouteDef[] {
   ];
 }
 
+// ── Copy-trading leaders (5c): per-leader scores; re-activating a dropped leader is a human action ──
+
+export function copyRoutes(copy: CoreServices['copy']): RouteDef[] {
+  return [
+    { method: 'get', path: '/api/bots/:id/copy-leaders', allow: READ_ALL, handler: ({ param }) => copy.leaders(param('id')) },
+    {
+      method: 'post',
+      path: '/api/bots/:id/copy-leaders/reactivate',
+      allow: ADMIN,
+      domainErrors: 'conflict',
+      handler: ({ param, body, actor }) => copy.reactivate(param('id'), parseInput(CopyLeaderReactivateSchema, body).address, actor()),
+    },
+  ];
+}
+
 export function apiRoutes(services: CoreServices): RouteDef[] {
   return [
     ...botRoutes(services.bots),
+    ...copyRoutes(services.copy),
     ...walletRoutes(services.wallets),
     ...settingsRoutes(services.settings),
     ...scriptRoutes(services.scripts),

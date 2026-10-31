@@ -152,6 +152,10 @@ export const botApi = {
   getLogs: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/logs${qs({ limit })}`),
   /** Recent custom ctx.emit events (oldest first) */
   getEvents: (botId: string, limit?: number) => call('GET', `/bots/${enc(botId)}/events${qs({ limit })}`),
+  /** Copy-trading leaders with their scores (copy bots, 5c) */
+  getCopyLeaders: (botId: string) => call('GET', `/bots/${enc(botId)}/copy-leaders`),
+  /** Re-activate a dropped leader (human only) */
+  reactivateCopyLeader: (botId: string, address: string) => call('POST', `/bots/${enc(botId)}/copy-leaders/reactivate`, { address }),
 };
 
 // ── Wallets ───────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { botApi } from '../lib/api';
-import type { Bot, BotTrade, BotPosition, BotStats, DashboardBotStats } from '../types';
+import type { Bot, BotTrade, BotPosition, BotStats, CopyLeader, DashboardBotStats } from '../types';
 
 /** Bot list + mutations. `{ list: false }`: mutations only (no list polling, e.g. on Bot detail). */
 export function useBots(opts: { list?: boolean } = {}) {
@@ -141,6 +141,24 @@ export function useBotStats(botId: string) {
   });
 
   return { stats, isLoading, error, refetch };
+}
+
+/** Leaders of a copy-trading bot with their scores (5c); `enabled` only for copy bots */
+export function useCopyLeaders(botId: string, enabled: boolean) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: ['copy-leaders', botId],
+    queryFn: async () => ((await botApi.getCopyLeaders(botId)) as { leaders: CopyLeader[] }).leaders,
+    enabled: !!botId && enabled,
+    refetchInterval: 60000,
+  });
+  const reactivate = useMutation({
+    mutationFn: async (address: string) => {
+      await botApi.reactivateCopyLeader(botId, address);
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['copy-leaders', botId] }),
+  });
+  return { leaders: query.data, isLoading: query.isLoading, error: query.error, reactivate: reactivate.mutateAsync, isReactivating: reactivate.isPending };
 }
 
 export function useDashboardStats() {

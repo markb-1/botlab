@@ -87,6 +87,7 @@ const EXPECTED_TOOLS = [
   'get_notes',
   'get_run_history',
   'get_leaderboard',
+  'get_copy_leaders',
   'validate_script',
   'create_template',
   'update_template',
@@ -309,6 +310,48 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, token_id: '333' } })).text).toMatch(/not in the bot's marketIds/);
     expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 2 } })).text).toMatch(/target_entry_price must be <= 0.99/);
     expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 0.42 } })).json.config).toMatchObject({ target_entry_price: 0.42 });
+  });
+
+  it('copy bots (5c): only when the mandate allows copy; leaders validated; own bots only; dropped leaders not re-added; get_copy_leaders', async () => {
+    const copyTpl = core.services.scripts.templates().find((t) => t.name === 'Copy Trading')!;
+    expect(copyTpl).toMatchObject({ trust: 'new' });
+    const A = '0x' + 'aa'.repeat(20);
+    const B = '0x' + 'bb'.repeat(20);
+    // Copy is off in the default mandate (spec §3.2): refused server-side, audited
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A] } })).text).toMatch(/strategy copy is not in mandate.strategies.allow/);
+    expect(audit('bot.create').some((r) => r.actor === 'agent' && String(r.result).includes('strategy copy'))).toBe(true);
+
+    // The mandate now allows copy (the test's partial limits.yaml cannot be reloaded, so the config read is stubbed)
+    const cfg = core.configService.getConfig()!;
+    vi.spyOn(core.configService, 'getConfig').mockReturnValue({ ...cfg, mandate: { ...cfg.mandate, strategies: { ...cfg.mandate.strategies, allow: [...cfg.mandate.strategies.allow, 'copy'] } } });
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: ['0x123'] } })).text).toMatch(/leaders must be 0x addresses/);
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [] } })).text).toMatch(/names no leader/);
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A], ttl_minutes: 1 } })).text).toMatch(/ttl_minutes must be >= 3/);
+    const ok = await call('create_bot', { templateId: copyTpl.id, name: 'cp', config: { leaders: [A], copy_fraction: 0.05 } });
+    expect(ok.json).toMatchObject({ mode: 'paper', stage: 'paper', createdBy: 'agent', role: 'copy' });
+    // Leaders recorded as added by the agent; the agent adds one through update_bot_config
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).isError).toBe(false);
+    const leaders = await call('get_copy_leaders', { botId: ok.json.id });
+    expect(leaders.text.startsWith('<untrusted_data')).toBe(true);
+    expect(leaders.json.leaders.map((l: { address: string; status: string; addedBy: string }) => [l.address, l.status, l.addedBy])).toEqual([
+      [A, 'active', 'agent'],
+      [B, 'active', 'agent'],
+    ]);
+    // A dropped leader cannot be re-added by the agent
+    core.db.prepare("UPDATE copy_leaders SET status = 'dropped', dropped_reason = 'auto-drop' WHERE address = ?").run(B);
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A] } })).isError).toBe(false);
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).text).toMatch(/was dropped on this bot/);
+    // A human's copy bot: the agent cannot reconfigure or start it
+    const human = await core.services.bots.create({ name: 'human copy', scriptId: copyTpl.id, config: { leaders: [A] } }, asHuman('test'));
+    expect((await call('update_bot_config', { botId: human.id, config: { leaders: [B] } })).text).toMatch(/only do this for bots it created/);
+    expect((await call('start_bot', { botId: human.id })).text).toMatch(/only do this for bots it created/);
+    // Re-activation is a human action over HTTP (agent token refused)
+    const res = await app.request(`/api/bots/${ok.json.id}/copy-leaders/reactivate`, {
+      method: 'POST',
+      headers: { host: HOST, authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ address: B }),
+    });
+    expect(res.status).toBe(403);
   });
 
   it('5b review: exclusive_sum legs must share an event; exhaustive needs the whole negRisk event; forecast_id must be the token\'s', async () => {

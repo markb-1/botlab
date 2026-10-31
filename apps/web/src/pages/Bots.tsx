@@ -12,12 +12,14 @@ const ROLE_LABELS: Record<string, string> = {
   'position-manager': 'position manager',
   consistency: 'consistency',
   'resolution-rule': 'resolution rule',
+  copy: 'copy',
 };
 const ROLE_TITLES: Record<string, string> = {
   'forecast-executor': 'Standing forecast executor: bids on tradeable ledger forecasts (one per mode)',
   'position-manager': "Standing position manager: exits every bot's positions as risk exits (one per mode)",
   consistency: 'Consistency bot: trades violations of a constraint between markets with hedged baskets',
   'resolution-rule': 'Resolution-rule bot: bids up to a target on one outcome per its thesis, holds to resolution',
+  copy: 'Copy-trading bot: mirrors selected leaders with limits near their fill; leaders are scored and dropped when their copies lose',
 };
 
 function StatusBadge({ status }: { status: Bot['status'] }) {

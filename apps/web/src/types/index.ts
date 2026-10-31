@@ -153,6 +153,26 @@ export interface BotStats {
   mode: 'live' | 'paper';
 }
 
+// Copy-trading leader with its score (GET /api/bots/:id/copy-leaders, 5c)
+export interface CopyLeader {
+  address: string;
+  status: 'active' | 'dropped' | 'removed';
+  addedAt: string;
+  addedBy: string;
+  activeSince: string;
+  droppedAt: string | null;
+  droppedReason: string | null;
+  ordersCopied: number;
+  closedTrades: number;
+  openTrades: number;
+  wins: number;
+  hitRate: number | null;
+  realisedPnlUsd: number;
+  unrealisedPnlUsd: number | null;
+  openCostUsd: number;
+  window: { trades: number; size: number; pnlUsd: number; hitRate: number | null };
+}
+
 // Dashboard stats per bot (batch endpoint)
 export interface DashboardBotStats {
   botId: string;
