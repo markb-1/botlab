@@ -11,6 +11,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { auditActorOf, humanDenial, isHumanActor, type HumanActor } from '../services/actors';
 import { GLOBAL_SCOPE, type RiskStateRepository, type RiskStateRow } from '../db/repositories/RiskStateRepository';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { BotCancelResult, OrderCanceller } from '../orders/OrderCanceller';
@@ -147,9 +148,10 @@ export class HaltService extends EventEmitter {
   }
 
   /** Clear a halt. Human-only, reason required. Throws if not allowed or not halted. */
-  clearHalt(scope: string, reason: string, actor: AuditActor): void {
-    if (actor !== 'human') {
-      this.deps.audit.record(actor, 'risk.halt_clear', scope, { reason }, 'denied: human only');
+  clearHalt(scope: string, reason: string, humanActor: HumanActor): void {
+    const actor = auditActorOf(humanActor);
+    if (!isHumanActor(humanActor)) {
+      this.deps.audit.record(actor, 'risk.halt_clear', scope, { reason }, humanDenial(humanActor));
       throw new Error('Only a human can clear a halt');
     }
     if (typeof scope !== 'string' || !scope) throw new Error('scope required');

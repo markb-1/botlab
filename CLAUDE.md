@@ -140,6 +140,7 @@ web/client/src/            # React renderer
 - **Worker thread isolation**: Bot scripts run in worker threads — they can only communicate via the RPC message channel, not access main process directly
 - **Binance credentials**: Encrypted in settings table, decrypted only in `BotManager.getSettings()`. Only `hasBinanceCredentials: boolean` is ever sent to renderer
 - **Script templates**: Registered in `packages/core/src/db/seed.ts`, source lives in `templates/`
+- **Actors**: services take branded actors from `packages/core/src/services/actors.ts` (`asHuman`/`asAgent`/`asSystem`). Only a transport creates them, from the authenticated principal, never from request data; human-only actions (clear halt, config write/restore, adopt positions, market ambiguity, forced category rights) refuse anything but a minted `HumanActor`
 - **Core is transport-free**: nothing under `packages/core` may import `electron` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not IPC handlers
 - **Data dir**: `createCore({ dataDir })` — Electron passes `app.getPath('userData')`, tests a temp dir; without one the DB defaults to `BOTLAB_DATA_DIR` or `./data`
 

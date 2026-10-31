@@ -8,6 +8,9 @@ import { sqliteAvailable } from '../orders/db';
 import { openRiskHarness, type RiskHarness } from './riskHarness';
 import { GLOBAL_SCOPE } from '../../packages/core/src/db/repositories/RiskStateRepository';
 import { RISK_HALT_EVENT, type RiskHaltEvent } from '../../packages/core/src/risk/HaltService';
+import { asHuman, asSystem } from '../../packages/core/src/services/actors';
+
+const HUMAN = asHuman('test');
 
 const DAY = 86_400_000;
 const DAY_START = Date.parse('2026-06-02T00:00:00Z');
@@ -79,11 +82,11 @@ describe.skipIf(!sqliteAvailable)('halts, daily loss limits and the kill switch'
     expect(h.riskStateRepo.isHalted('b1')).toBe(true);
 
     // Clearing: human only, reason required
-    expect(() => h.halts.clearHalt('b1', 'looks fine', 'system')).toThrow(/human/);
+    expect(() => h.halts.clearHalt('b1', 'looks fine', asSystem('test') as never)).toThrow(/human/);
     expect(() => h.halts.clearHalt('b1', 'looks fine', 'bot:b1')).toThrow(/human/);
-    expect(() => h.halts.clearHalt('b1', '  ', 'human')).toThrow(/reason/);
+    expect(() => h.halts.clearHalt('b1', '  ', HUMAN)).toThrow(/reason/);
     expect(h.riskStateRepo.isHalted('b1')).toBe(true);
-    h.halts.clearHalt('b1', 'reviewed the loss', 'human');
+    h.halts.clearHalt('b1', 'reviewed the loss', HUMAN);
     expect(h.riskStateRepo.isHalted('b1')).toBe(false);
     expect(h.riskStateRepo.get('b1')!.last_halted_at).not.toBeNull();
 
@@ -117,7 +120,7 @@ describe.skipIf(!sqliteAvailable)('halts, daily loss limits and the kill switch'
     h.marks['polymarket:t1'] = 0.2;
     h.clock.now += 60_000;
     await h.monitor.runOnce(); // halts b1 at 0.20; 0.20 becomes the last known mark
-    h.halts.clearHalt('b1', 'test', 'human');
+    h.halts.clearHalt('b1', 'test', HUMAN);
 
     delete h.marks['polymarket:t1']; // book unavailable
     h.clock.now += 60_000;
@@ -139,7 +142,7 @@ describe.skipIf(!sqliteAvailable)('halts, daily loss limits and the kill switch'
     h.clock.now += 60_000;
     await h.monitor.runOnce();
     expect(h.riskStateRepo.isHalted('b1')).toBe(true);
-    h.halts.clearHalt('b1', 'accepting the risk', 'human');
+    h.halts.clearHalt('b1', 'accepting the risk', HUMAN);
     expect(h.riskStateRepo.getLossBaseline('b1')).toMatchObject({ live: expect.closeTo(-60, 5) });
 
     h.marks['polymarket:t1'] = 0.3; // −80 today, −20 since the clear
@@ -153,7 +156,7 @@ describe.skipIf(!sqliteAvailable)('halts, daily loss limits and the kill switch'
     expect(h.riskStateRepo.get('b1')!.halted_reason).toMatch(/live loss 52\.00 USD since the halt was cleared/);
 
     // A new day ignores the old baseline
-    h.halts.clearHalt('b1', 'again', 'human');
+    h.halts.clearHalt('b1', 'again', HUMAN);
     h.clock.now = T0 + DAY;
     h.marks['polymarket:t1'] = 0.22;
     await h.monitor.runOnce();

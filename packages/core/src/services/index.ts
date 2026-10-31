@@ -1,4 +1,5 @@
 export * from './errors';
+export * from './actors';
 export * from './schemas';
 export type * from './types';
 export { BotService, walletChangeBlocker } from './BotService';

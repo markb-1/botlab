@@ -20,6 +20,9 @@ import { Reconciler, RECONCILER_FAILURE_ALERT, type ReconcilerDeps } from '../..
 import type { DataApiPosition, DataApiTrade } from '../../packages/core/src/reconcile/dataApi';
 import type { MarketView } from '../../packages/core/src/ledger/MarketCacheService';
 import type { ClobTrade } from '../../packages/core/src/orders/ExchangeAdapter';
+import { asHuman } from '../../packages/core/src/services/actors';
+
+const HUMAN = asHuman('test');
 
 const TAKER = 0.02;
 
@@ -302,7 +305,7 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
     expect(audit.some((a) => /^warning: pre-existing/.test(a.result))).toBe(true);
 
     await expect(r.adoptPositions('w1', 'b1', 'agent')).rejects.toThrow(/human/);
-    const adopted = await r.adoptPositions('w1', 'b1', 'human');
+    const adopted = await r.adoptPositions('w1', 'b1', HUMAN);
     expect(adopted.adopted).toEqual([{ tokenId: 'old', marketId: 'c-old', quantity: 200, price: 0.5 }]);
     const pos = h.tradeRepo.getRiskPositions({ simulated: false });
     expect(pos).toEqual([expect.objectContaining({ bot_id: 'b1', symbol: 'old', net_quantity: 200, cost_basis: 100 })]);
@@ -463,24 +466,24 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
     positions = [position('old', 200, 0.5)];
     const r = makeReconciler();
     const id = unknownMarketBuy();
-    await expect(r.adoptPositions('w1', 'b1', 'human')).rejects.toThrow(/unknown outcome/);
+    await expect(r.adoptPositions('w1', 'b1', HUMAN)).rejects.toThrow(/unknown outcome/);
     h.orderRepo.update(id, { status: 'expired' });
 
     h.addBot('gone', { stage: 'retired' });
-    await expect(r.adoptPositions('w1', 'gone', 'human')).rejects.toThrow(/retired/);
+    await expect(r.adoptPositions('w1', 'gone', HUMAN)).rejects.toThrow(/retired/);
     h.riskStateRepo.setHalted('b1', true, 'test');
-    await expect(r.adoptPositions('w1', 'b1', 'human')).rejects.toThrow(/halted/);
+    await expect(r.adoptPositions('w1', 'b1', HUMAN)).rejects.toThrow(/halted/);
     h.riskStateRepo.setHalted('b1', false);
     // The expired order is now the wallet's first order: only what was held before it is adoptable
     walletTrades = [{ tokenId: 'old', side: 'BUY', size: 200, price: 0.5, timestampMs: h.clock.now - 2 * 86_400_000 }];
-    expect((await r.adoptPositions('w1', 'b1', 'human')).adopted).toHaveLength(1);
+    expect((await r.adoptPositions('w1', 'b1', HUMAN)).adopted).toHaveLength(1);
   });
 
   it('S2: adoption syncs the wallet’s orders first', async () => {
     const id = h.addOpenOrder('b1', 'ex-5'); // limit buy 10 @ 0.4, filled on the exchange but not recorded yet
     h.poly.getOrder.mockResolvedValue({ status: 'matched', sizeMatched: 10, originalSize: 10, price: 0.4 });
     positions = [position('t1', 10, 0.4)];
-    const res = await makeReconciler().adoptPositions('w1', 'b1', 'human');
+    const res = await makeReconciler().adoptPositions('w1', 'b1', HUMAN);
     expect(fillsOf(id)).toHaveLength(1);
     expect(res).toEqual({ adopted: [], skipped: [] });
   });
@@ -493,19 +496,19 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
       { tokenId: 'mix', side: 'BUY', size: 20, price: 0.5, timestampMs: h.clock.now - 60_000 },
     ];
     const r = makeReconciler();
-    const first = await r.adoptPositions('w1', 'b1', 'human');
+    const first = await r.adoptPositions('w1', 'b1', HUMAN);
     expect(first.adopted.map((a) => a.quantity)).toEqual([130]);
     expect(first.skipped[0].reason).toMatch(/20\.00 bought after/);
 
-    const second = await r.adoptPositions('w1', 'b1', 'human');
+    const second = await r.adoptPositions('w1', 'b1', HUMAN);
     expect(second.adopted).toEqual([]);
-    const third = await r.adoptPositions('w1', 'b1', 'human', { includePostFirstOrder: true });
+    const third = await r.adoptPositions('w1', 'b1', HUMAN, { includePostFirstOrder: true });
     expect(third.adopted).toEqual([expect.objectContaining({ quantity: 20, postFirstOrderQuantity: 20 })]);
     const audits = h.auditRepo.list({ action: 'reconcile.adopt' }).map((a) => JSON.parse(a.payload ?? '{}'));
     expect(audits.some((p) => p.includePostFirstOrder === true)).toBe(true);
 
     walletTrades = [];
-    await expect(makeReconciler({ fetchTrades: async () => Promise.reject(new Error('down')) }).adoptPositions('w1', 'b1', 'human')).resolves.toBeDefined(); // nothing left to adopt
+    await expect(makeReconciler({ fetchTrades: async () => Promise.reject(new Error('down')) }).adoptPositions('w1', 'b1', HUMAN)).resolves.toBeDefined(); // nothing left to adopt
   });
 
   it('S3: orders and fills keep the wallet they were made on; a wallet change is refused while the bot holds anything', async () => {

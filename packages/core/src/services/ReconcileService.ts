@@ -7,7 +7,8 @@
 
 import type { Reconciler } from '../reconcile/Reconciler';
 import type { OrderbookSnapshotRepository } from '../db/repositories/OrderbookSnapshotRepository';
-import type { AuditActor, AuditService } from '../audit/AuditService';
+import type { AuditService } from '../audit/AuditService';
+import { auditActorOf, requireActor, type Actor, type HumanActor } from './actors';
 import { ServiceError, invalidInput } from './errors';
 
 export class ReconcileService {
@@ -31,7 +32,7 @@ export class ReconcileService {
   }
 
   /** One-time adoption of pre-existing exchange positions (R8) into a bot on the same wallet */
-  async adoptPositions(walletId: unknown, botId: unknown, actor: AuditActor, opts?: { includePostFirstOrder?: unknown }) {
+  async adoptPositions(walletId: unknown, botId: unknown, actor: HumanActor, opts?: { includePostFirstOrder?: unknown }) {
     const r = this.reconciler();
     if (typeof walletId !== 'string' || !walletId || typeof botId !== 'string' || !botId) throw invalidInput('walletId and botId are required');
     return r.adoptPositions(walletId, botId, actor, { includePostFirstOrder: opts?.includePostFirstOrder === true });
@@ -41,7 +42,9 @@ export class ReconcileService {
     return this.deps.snapshotRepo.watchlist();
   }
 
-  watchlistAdd(tokenId: unknown, marketId: unknown, note: unknown, actor: AuditActor): void {
+  /** Human or agent */
+  watchlistAdd(tokenId: unknown, marketId: unknown, note: unknown, by: Actor): void {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'recorder.watchlistAdd'));
     if (typeof tokenId !== 'string' || !/^[0-9A-Za-z]{1,100}$/.test(tokenId)) throw invalidInput('tokenId must be a token id');
     const m = typeof marketId === 'string' && marketId ? marketId.slice(0, 100) : null;
     const n = typeof note === 'string' && note ? note.slice(0, 500) : null;
@@ -49,7 +52,9 @@ export class ReconcileService {
     this.deps.audit.record(actor, 'recorder.watch_add', tokenId, { marketId: m, note: n });
   }
 
-  watchlistRemove(tokenId: unknown, actor: AuditActor): { removed: boolean } {
+  /** Human or agent */
+  watchlistRemove(tokenId: unknown, by: Actor): { removed: boolean } {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'recorder.watchlistRemove'));
     if (typeof tokenId !== 'string' || !tokenId) throw invalidInput('tokenId required');
     const removed = this.deps.snapshotRepo.removeWatch(tokenId);
     this.deps.audit.record(actor, 'recorder.watch_remove', tokenId, undefined, removed ? 'ok' : 'not found');

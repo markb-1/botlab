@@ -15,6 +15,7 @@
  */
 
 import fs from 'fs';
+import { auditActorOf, humanDenial, isHumanActor, type HumanActor } from '../services/actors';
 import path from 'path';
 import chokidar, { type FSWatcher } from 'chokidar';
 import writeFileAtomic from 'write-file-atomic';
@@ -433,9 +434,10 @@ export class ConfigService {
    * atomically (comments kept where possible) and apply it. Throws ConfigError when invalid.
    * Only a human may write config (it is never writable by the agent).
    */
-  write(file: ConfigFileName, newValue: unknown, actor: AuditActor, expectedSha256?: string): Promise<ConfigChangedEvent | null> {
+  write(file: ConfigFileName, newValue: unknown, humanActor: HumanActor, expectedSha256?: string): Promise<ConfigChangedEvent | null> {
+    const actor = auditActorOf(humanActor);
     return this.exclusive(async () => {
-      this.assertHuman(actor, 'config.write', file);
+      this.assertHuman(humanActor, 'config.write', file);
       if (!CONFIG_FILE_NAMES.includes(file)) throw new Error(`Unknown config file: ${String(file)}`);
       const current = this.requireConfig();
 
@@ -488,9 +490,10 @@ export class ConfigService {
   }
 
   /** Re-apply the file text of a previous version (validated like any edit). */
-  restore(file: ConfigFileName, versionId: string, actor: AuditActor): Promise<ConfigChangedEvent | null> {
+  restore(file: ConfigFileName, versionId: string, humanActor: HumanActor): Promise<ConfigChangedEvent | null> {
+    const actor = auditActorOf(humanActor);
     return this.exclusive(async () => {
-      this.assertHuman(actor, 'config.restore', file);
+      this.assertHuman(humanActor, 'config.restore', file);
       if (!this.store) throw new Error('Config history is not available');
       if (!CONFIG_FILE_NAMES.includes(file)) throw new Error(`Unknown config file: ${String(file)}`);
       const text = this.store.read(file, versionId);
@@ -516,9 +519,9 @@ export class ConfigService {
     return { ...this.hashes };
   }
 
-  private assertHuman(actor: AuditActor, action: string, file: string): void {
-    if (actor !== 'human') {
-      this.audit?.record(actor, action, file, undefined, 'denied: human only');
+  private assertHuman(actor: unknown, action: string, file: string): void {
+    if (!isHumanActor(actor)) {
+      this.audit?.record(auditActorOf(actor), action, file, undefined, humanDenial(actor));
       throw new Error('Only a human can change config');
     }
   }

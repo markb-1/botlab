@@ -7,7 +7,7 @@
 import type { HaltService } from '../risk/HaltService';
 import type { KillSwitch } from '../risk/KillSwitch';
 import type { BotRepository } from '../db/repositories/BotRepository';
-import type { AuditActor } from '../audit/AuditService';
+import { auditActorOf, requireActor, type Actor, type HumanActor } from './actors';
 
 export class RiskService {
   constructor(private deps: { halts: HaltService; killSwitch: KillSwitch; botRepo: BotRepository }) {}
@@ -36,13 +36,17 @@ export class RiskService {
     return { global: state.global, bots };
   }
 
-  /** `scope` is 'global' or a bot id. Human only. */
-  clearHalt(scope: string, reason: string, actor: AuditActor): void {
+  /** `scope` is 'global' or a bot id. Human only (HaltService re-checks and audits a denial). */
+  clearHalt(scope: string, reason: string, actor: HumanActor): void {
     this.deps.halts.clearHalt(scope, reason, actor);
   }
 
-  /** Global halt + cancel every open order + stop every bot */
-  async killSwitch(reason: unknown, actor: AuditActor) {
+  /**
+   * Global halt + cancel every open order + stop every bot. Anyone may press it (human, agent or
+   * system), but only as an authenticated actor, which is recorded in the audit log.
+   */
+  async killSwitch(reason: unknown, by: Actor) {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'risk.killSwitch'));
     const result = await this.deps.killSwitch.activate(typeof reason === 'string' && reason.trim() ? reason : 'manual kill switch', actor);
     return {
       stopped: result.stopped,

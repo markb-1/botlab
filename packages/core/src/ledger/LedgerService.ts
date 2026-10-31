@@ -15,6 +15,7 @@
  */
 
 import { z } from 'zod';
+import { auditActorOf, humanDenial, isHumanActor, type Actor, type HumanActor } from '../services/actors';
 import type { AuditActor, AuditService } from '../audit/AuditService';
 import type { LimitsConfig, MandateConfig } from '../config/schema';
 import { MAX_HORIZON_DAYS } from '../config/schema';
@@ -267,7 +268,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
   // ── Writing ──────────────────────────────────────────────────────
 
   /** Validate and record a forecast (spec §6.1). Throws LedgerValidationError on bad input or market state. */
-  async submitForecast(input: unknown, actor: AuditActor): Promise<ForecastView> {
+  async submitForecast(input: unknown, by: AuditActor | Actor): Promise<ForecastView> {
+    const actor = auditActorOf(by);
     const parsed = SubmitForecastSchema.safeParse(input);
     if (!parsed.success) {
       const issues = parsed.error.issues.map((i) => `${i.path.length ? i.path.join('.') : '(input)'}: ${i.message}`);
@@ -387,7 +389,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     return view;
   }
 
-  withdrawForecast(id: string, reason: string, actor: AuditActor): ForecastView {
+  withdrawForecast(id: string, reason: string, by: AuditActor | Actor): ForecastView {
+    const actor = auditActorOf(by);
     if (typeof id !== 'string' || !id) throw new LedgerValidationError('forecast id required');
     const why = typeof reason === 'string' ? reason.trim().slice(0, 1000) : '';
     if (!why) throw new LedgerValidationError('reason is required');
@@ -693,9 +696,10 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
    * Human override (spec §6.3 "human can force any state", logged). `auto` hands the bucket back to
    * the automatic rules. A category outside the mandate allow list can never be `trading`.
    */
-  forceRightsState(category: string, bucket: HorizonBucket, state: CategoryRightsState | 'auto', reason: string, actor: AuditActor): BucketStatsView | null {
-    if (actor !== 'human') {
-      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state }, 'denied: human only');
+  forceRightsState(category: string, bucket: HorizonBucket, state: CategoryRightsState | 'auto', reason: string, humanActor: HumanActor): BucketStatsView | null {
+    const actor = auditActorOf(humanActor);
+    if (!isHumanActor(humanActor)) {
+      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state }, humanDenial(humanActor));
       throw new Error('Only a human can force category rights');
     }
     if (!BUCKET_ORDER.includes(bucket)) throw new LedgerValidationError(`Unknown horizon bucket ${String(bucket)}`);

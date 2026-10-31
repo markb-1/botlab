@@ -378,9 +378,32 @@ export function createCore(options: CoreOptions): Core {
 
   // ── Lifecycle ─────────────────────────────────────────────────────
 
-  async function start(): Promise<void> {
-    if (started) return;
-    started = true;
+  let startPromise: Promise<void> | null = null;
+  /** The startup halt / shutdown marker is applied once per core, even if start() is retried */
+  let startupHaltApplied = false;
+
+  /** start() once; a failed start is rolled back and may be retried. Concurrent calls share one run. */
+  function start(): Promise<void> {
+    if (started) return Promise.resolve();
+    if (!startPromise) {
+      startPromise = startOnce().then(
+        () => {
+          started = true;
+        },
+        async (err) => {
+          startPromise = null;
+          await rollbackStart();
+          throw err;
+        }
+      );
+    }
+    return startPromise;
+  }
+
+  /** Listeners registered by startOnce (removed by rollbackStart) */
+  let startUnsubs: Array<() => void> = [];
+
+  async function startOnce(): Promise<void> {
     console.log('[Core] Starting (pre-unlock services)...');
 
     // Config: limits, mandate, fees, server, categories. Loaded and validated here, then hot-reloaded
@@ -393,9 +416,11 @@ export function createCore(options: CoreOptions): Core {
       audit.record('system', 'config.load', configService.configDir, { stage: 'startup', error: err instanceof Error ? err.message : String(err) }, 'error');
     }
     configService.start();
-    configService.onChange((e) => {
-      events.emit('config:changed', { changes: e.changes, raises: e.raises.map((c) => `${c.file}.${c.path}`), source: e.source });
-    });
+    startUnsubs.push(
+      configService.onChange((e) => {
+        events.emit('config:changed', { changes: e.changes, raises: e.raises.map((c) => `${c.file}.${c.path}`), source: e.source });
+      })
+    );
 
     // Telegram before the startup halt below, so that a halt after a crash is announced
     notifications.attachConfig(configService);
@@ -403,20 +428,26 @@ export function createCore(options: CoreOptions): Core {
     telegram.start();
 
     // Market cache (category, rules hash, ambiguity) and ledger (scorer hourly, refresh every 30 min)
-    configService.onChange((e) => {
-      if (e.changes.some((c) => c.file === 'categories')) {
-        const n = marketCache.recategorizeAll();
-        console.log(`[Core] categories.yaml changed: ${n} cached market(s) re-categorized`);
-      }
-    });
+    startUnsubs.push(
+      configService.onChange((e) => {
+        if (e.changes.some((c) => c.file === 'categories')) {
+          const n = marketCache.recategorizeAll();
+          console.log(`[Core] categories.yaml changed: ${n} cached market(s) re-categorized`);
+        }
+      })
+    );
     marketCache.start();
     ledger.start();
     recorder.start();
 
     // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
-    const startHaltedAfterCrash: boolean | null = configService.getConfig()?.limits.server.start_halted_after_crash ?? null;
-    shutdownMarker = new ShutdownMarker(dataDir);
-    applyStartupHalt({ marker: shutdownMarker, startHaltedAfterCrash, halts, audit });
+    // Once only: a retried start() must not read its own "running" marker as a crash.
+    if (!startupHaltApplied) {
+      const startHaltedAfterCrash: boolean | null = configService.getConfig()?.limits.server.start_halted_after_crash ?? null;
+      shutdownMarker = new ShutdownMarker(dataDir);
+      applyStartupHalt({ marker: shutdownMarker, startHaltedAfterCrash, halts, audit });
+      startupHaltApplied = true;
+    }
 
     // Seed script templates (compiles with esbuild)
     const templates = getBuiltinTemplates(options.templatesDir);
@@ -429,12 +460,43 @@ export function createCore(options: CoreOptions): Core {
     console.log('[Core] Started');
   }
 
+  /** Undo a failed start: stop what it started and drop its listeners, so start() can run again. */
+  async function rollbackStart(): Promise<void> {
+    console.error('[Core] Start failed; rolling back');
+    for (const u of startUnsubs) u();
+    startUnsubs = [];
+    const quiet = (what: string) => (error: unknown) => console.error(`[Core] Error stopping ${what} after failed start:`, error);
+    await recorder.stop().catch(quiet('recorder'));
+    await ledger.stop().catch(quiet('ledger'));
+    await marketCache.stop().catch(quiet('market cache'));
+    await notifications.stop().catch(quiet('notifications')); // also detaches its config listeners
+    await telegram.stop().catch(quiet('Telegram'));
+    await configService.stop().catch(quiet('config watcher'));
+  }
+
+  let unlocking = false;
+
   async function unlock(encryptionKey: string): Promise<boolean> {
-    // Guard against double initialization
-    if (botManager) {
+    if (!started) throw new Error('Core not started: call start() first (and wait for it to succeed)');
+    // Guard against double initialization (also while an unlock is in progress)
+    if (botManager || unlocking) {
       console.log('[Core] Protected services already initialized');
       return false;
     }
+    unlocking = true;
+    try {
+      await unlockOnce(encryptionKey);
+      return true;
+    } catch (err) {
+      console.error('[Core] Unlock failed; rolling back:', err);
+      await rollbackUnlock();
+      throw err;
+    } finally {
+      unlocking = false;
+    }
+  }
+
+  async function unlockOnce(encryptionKey: string): Promise<void> {
     console.log('[Core] Unlocking: initializing protected services...');
     keyManager.setKey(encryptionKey);
 
@@ -451,7 +513,6 @@ export function createCore(options: CoreOptions): Core {
     console.log('[Core] WalletManager initialized');
 
     walletManager = wm;
-    // Assigned before initialize() so a concurrent unlock returns at the guard above
     const manager = new BotManager(wm, botRepo, walletRepo, settingsRepo, scriptRepo, storageRepo, tradeRepo, {
       db,
       orderRepo,
@@ -464,12 +525,13 @@ export function createCore(options: CoreOptions): Core {
       clock: clockGuard,
     });
     botManager = manager;
+    // No bot may start until startup recovery below has finished (set before initialize so there is no gap)
+    manager.setRecoveryInProgress(true);
     await manager.initialize();
     console.log('[Core] BotManager initialized');
 
     // Startup recovery: sync and cancel orphaned open orders (no bot runs yet; starts are refused
     // until this finishes). Runs in the background so unlocking is not blocked.
-    manager.setRecoveryInProgress(true);
     recoverOpenOrders({ botRepo, canceller, audit, isBotRunning: (id) => manager.isRunning(id) })
       .catch((err) => {
         console.error('[Core] Startup order recovery failed:', err);
@@ -539,8 +601,24 @@ export function createCore(options: CoreOptions): Core {
     });
 
     console.log('[Core] Unlocked — all services ready');
-    return true;
   }
+
+  /** Undo a failed unlock: stop what was created, forget the managers and the key, so unlock can be retried. */
+  async function rollbackUnlock(): Promise<void> {
+    const quiet = (what: string) => (error: unknown) => console.error(`[Core] Error stopping ${what} after failed unlock:`, error);
+    await riskMonitor?.stop().catch(quiet('risk monitor'));
+    await reconciler?.stop().catch(quiet('reconciler'));
+    if (botManager) {
+      botManager.removeAllListeners('bot:event');
+      await botManager.shutdown().catch(quiet('bot manager'));
+    }
+    riskMonitor = null;
+    reconciler = null;
+    botManager = null;
+    walletManager = null;
+    keyManager.clear();
+  }
+
 
   let shutdownPromise: Promise<{ clean: boolean }> | null = null;
 
@@ -622,7 +700,7 @@ export function createCore(options: CoreOptions): Core {
     unlock,
     shutdown,
     close: () => {
-      closeDatabase();
+      closeDatabase(db);
       console.log('[Core] Database closed');
     },
   };

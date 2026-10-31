@@ -9,6 +9,9 @@ import { openLedgerHarness, gammaMarket, DAY, type LedgerHarness } from './harne
 import { MARKET_RULES_CHANGED_EVENT, parseGammaMarketFull, type RulesChangedEvent } from '../../packages/core/src/ledger/MarketCacheService';
 import type { MarketInfo } from '../../packages/core/src/orders/MarketDataService';
 import { NotificationService } from '../../packages/core/src/notify/NotificationService';
+import { asHuman } from '../../packages/core/src/services/actors';
+
+const HUMAN = asHuman('test');
 
 const info = (marketId: string, labels: string[] = ['Economy']): MarketInfo => ({
   marketId, question: 'q', outcome: 'Yes', tokenIds: [`${marketId}-yes`, `${marketId}-no`], endDate: null, volume24hrUsd: 1, labels, closed: false,
@@ -82,7 +85,7 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     h.gamma.set('m1', gammaMarket('m1'));
     expect(await h.cache.get(info('m1'))).toEqual({ category: 'economics', ambiguityScore: null, rulesChangedAt: null });
 
-    await h.cache.setAmbiguity('m1', 0, 'human', 'objective BLS source');
+    await h.cache.setAmbiguity('m1', 0, HUMAN, 'objective BLS source');
     expect((await h.cache.get(info('m1'))).ambiguityScore).toBe(0);
     expect(h.auditActions('market.ambiguity')[0]).toMatchObject({ actor: 'human', payload: { to: 0, effective: 0 } });
 
@@ -100,13 +103,13 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     expect(h.cache.getCached('m1')).toMatchObject({ disputed: true, ambiguityScore: 2, ambiguityRaisedBecause: 'UMA dispute detected' });
     expect(h.auditActions('market.disputed')).toHaveLength(1);
 
-    await expect(h.cache.setAmbiguity('m1', 4, 'human')).rejects.toThrow(/0-3/);
-    await expect(h.cache.setAmbiguity('m1', 1.5, 'human')).rejects.toThrow(/0-3/);
+    await expect(h.cache.setAmbiguity('m1', 4, HUMAN)).rejects.toThrow(/0-3/);
+    await expect(h.cache.setAmbiguity('m1', 1.5, HUMAN)).rejects.toThrow(/0-3/);
   });
 
   it('order path never throws on Gamma failure: cached row is used; nothing cached ⇒ labels category, ambiguity unknown', async () => {
     h.gamma.set('m1', gammaMarket('m1'));
-    await h.cache.setAmbiguity('m1', 1, 'human');
+    await h.cache.setAmbiguity('m1', 1, HUMAN);
     h.gammaDown.value = true;
     h.clock.now += 60 * 60_000;
     expect(await h.cache.get(info('m1'))).toEqual({ category: 'economics', ambiguityScore: 1, rulesChangedAt: null });
@@ -115,7 +118,7 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
 
   it('order path: a row not refreshed for 2 h ⇒ ambiguity unknown (buys rejected)', async () => {
     h.gamma.set('m1', gammaMarket('m1'));
-    await h.cache.setAmbiguity('m1', 0, 'human');
+    await h.cache.setAmbiguity('m1', 0, HUMAN);
     h.gammaDown.value = true;
     h.clock.now += 2 * 3_600_000 - 1000;
     expect((await h.cache.get(info('m1'))).ambiguityScore).toBe(0);

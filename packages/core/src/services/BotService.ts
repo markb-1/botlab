@@ -16,7 +16,8 @@ import type { SettingsRepository } from '../db/repositories/SettingsRepository';
 import type { BotManager } from '../bots/BotManager';
 import type { WalletManager } from '../bots/WalletManager';
 import type { IpcBot, IpcBotTrade } from './types';
-import type { AuditActor, AuditService } from '../audit/AuditService';
+import type { AuditService } from '../audit/AuditService';
+import { auditActorOf, requireActor, type Actor } from './actors';
 import { initialStage, lowerStage } from '../risk/ramp';
 import type { BotStage } from '../risk/types';
 import logger from '../utils/logger';
@@ -307,7 +308,8 @@ export class BotService {
     return this.toView(row);
   }
 
-  async create(data: BotCreateInput, actor: AuditActor): Promise<IpcBot> {
+  async create(data: BotCreateInput, by: Actor): Promise<IpcBot> {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.create'));
     const { botRepo, scriptRepo, audit } = this.deps;
     let walletId = data.walletId;
 
@@ -345,7 +347,8 @@ export class BotService {
     return this.toView(row);
   }
 
-  update(id: string, data: BotUpdateInput, actor: AuditActor): IpcBot {
+  update(id: string, data: BotUpdateInput, by: Actor): IpcBot {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.update'));
     const { botRepo, scriptRepo, tradeRepo, orderRepo, audit } = this.deps;
     const before = botRepo.findById(id);
     if (!before) throw notFound('Bot not found');
@@ -379,7 +382,8 @@ export class BotService {
     return this.toView(fresh);
   }
 
-  async delete(id: string, actor: AuditActor): Promise<void> {
+  async delete(id: string, by: Actor): Promise<void> {
+    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.delete'));
     const { botRepo, walletRepo, audit } = this.deps;
     // Check if the bot has a paper wallet that should be cleaned up
     const botRow = botRepo.findById(id);
@@ -397,16 +401,16 @@ export class BotService {
     }
   }
 
-  async start(id: string, actor: AuditActor): Promise<void> {
-    await this.manager().startBot(id, actor);
+  async start(id: string, by: Actor): Promise<void> {
+    await this.manager().startBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.start')));
   }
 
-  async stop(id: string, actor: AuditActor): Promise<void> {
-    await this.manager().stopBot(id, actor);
+  async stop(id: string, by: Actor): Promise<void> {
+    await this.manager().stopBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.stop')));
   }
 
-  async restart(id: string, actor: AuditActor): Promise<void> {
-    await this.manager().restartBot(id, actor);
+  async restart(id: string, by: Actor): Promise<void> {
+    await this.manager().restartBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.restart')));
   }
 
   /** A bot's trades; resolves missing market names from the Polymarket API and backfills the database */

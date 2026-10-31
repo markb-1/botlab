@@ -26,6 +26,7 @@
  */
 
 import type Database from 'better-sqlite3';
+import { auditActorOf, humanDenial, isHumanActor, type HumanActor } from '../services/actors';
 import { generateId } from '../db/index';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { BotTradeRepository, RiskPositionRow } from '../db/repositories/BotTradeRepository';
@@ -1012,13 +1013,17 @@ export class Reconciler implements ClockSkewGuard {
    * trade history cannot be read. Per token only the quantity held before the wallet's first order is
    * adopted; anything beyond needs `includePostFirstOrder: true` (audited).
    */
-  async adoptPositions(walletId: string, botId: string, actor: AuditActor, opts: { includePostFirstOrder?: boolean } = {}): Promise<AdoptResult> {
+  async adoptPositions(walletId: string, botId: string, humanActor: HumanActor, opts: { includePostFirstOrder?: boolean } = {}): Promise<AdoptResult> {
+    const actor = auditActorOf(humanActor);
     const includePost = opts.includePostFirstOrder === true;
     const deny = (why: string): never => {
       this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost }, `denied: ${why}`);
       throw new Error(why);
     };
-    if (actor !== 'human') deny('Only a human can adopt positions');
+    if (!isHumanActor(humanActor)) {
+      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost }, humanDenial(humanActor));
+      throw new Error('Only a human can adopt positions');
+    }
     const bot = this.deps.botRepo.findById(botId);
     if (!bot) deny(`Bot ${botId} not found`);
     if (bot!.wallet_id !== walletId) deny(`Bot ${botId} does not use wallet ${walletId}`);

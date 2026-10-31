@@ -5,7 +5,7 @@
  */
 
 import type { MarketCacheService } from '../ledger/MarketCacheService';
-import type { AuditActor } from '../audit/AuditService';
+import type { HumanActor } from './actors';
 import { invalidInput } from './errors';
 
 export class MarketService {
@@ -16,8 +16,8 @@ export class MarketService {
     return this.markets.getMarket(marketId);
   }
 
-  /** Ambiguity 0–3 (buys need an assessed market, R51) */
-  async setAmbiguity(marketId: string, score: number, actor: AuditActor, note?: string | null) {
+  /** Ambiguity 0–3 (buys need an assessed market, R51). Human only (agents assess through forecasts). */
+  async setAmbiguity(marketId: string, score: number, actor: HumanActor, note?: string | null) {
     return this.markets.setAmbiguity(marketId, score, actor, note ?? null);
   }
 }

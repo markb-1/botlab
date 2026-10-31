@@ -1,6 +1,6 @@
 import { ipcMain } from 'electron';
 import type { ConfigFileService } from '../../../packages/core/src/services/ConfigFileService';
-import { respond, UNTRUSTED, type TrustedSenderCheck } from '../respond';
+import { respond, UNTRUSTED, type TrustedSenderCheck, ipcHuman } from '../respond';
 
 /**
  * Config IPC (spec §3). Human only: every call must come from the app's main window; the actor
@@ -10,21 +10,21 @@ import { respond, UNTRUSTED, type TrustedSenderCheck } from '../respond';
 export function registerConfigHandlers(config: ConfigFileService, isTrustedSender: TrustedSenderCheck): void {
   ipcMain.handle('config:get', async (event) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => config.get());
+    return respond(() => config.get(ipcHuman(event)));
   });
 
   ipcMain.handle('config:write', async (event, file: string, value: unknown, expectedSha256?: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => config.write(file, value, 'human', expectedSha256));
+    return respond(() => config.write(file, value, ipcHuman(event), expectedSha256));
   });
 
   ipcMain.handle('config:history', async (event, file: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => config.history(file));
+    return respond(() => config.history(file, ipcHuman(event)));
   });
 
   ipcMain.handle('config:restore', async (event, file: string, versionId: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => config.restore(file, versionId, 'human'));
+    return respond(() => config.restore(file, versionId, ipcHuman(event)));
   });
 }

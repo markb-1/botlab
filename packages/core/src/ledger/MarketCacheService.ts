@@ -20,6 +20,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { auditActorOf, humanDenial, isHumanActor, type HumanActor } from '../services/actors';
 import type { AuditActor, AuditService } from '../audit/AuditService';
 import type { CategoriesConfig } from '../config/categoriesSchema';
 import type { MarketCacheRepository, MarketCacheRow, MarketCacheUpsert, MarketToken } from '../db/repositories/MarketCacheRepository';
@@ -529,9 +530,10 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
    * Human assessment (0–3). Always replaces the stored score; from then on forecasts cannot change it
    * until a human sets it again. The market is fetched first when not cached.
    */
-  async setAmbiguity(marketId: string, score: number, actor: AuditActor, note: string | null = null): Promise<MarketView> {
+  async setAmbiguity(marketId: string, score: number, humanActor: HumanActor, note: string | null = null): Promise<MarketView> {
+    const actor = auditActorOf(humanActor);
     if (!Number.isInteger(score) || score < 0 || score > 3) throw new Error('ambiguity score must be an integer 0-3');
-    if (actor !== 'human') throw new Error('Only a human can set a market assessment directly (forecasts use recordForecastAmbiguity)');
+    if (!isHumanActor(humanActor)) throw new Error('Only a human can set a market assessment directly (forecasts use recordForecastAmbiguity)');
     const cleanNote = typeof note === 'string' && note.trim() ? note.trim().slice(0, 2000) : null;
     const row = await this.requireRow(marketId);
     const at = new Date(this.now()).toISOString();

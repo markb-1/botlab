@@ -10,6 +10,9 @@ import { DbRiskStateProvider } from '../../packages/core/src/orders/DbRiskStateP
 import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
 import { LimitsSchema, MandateSchema } from '../../packages/core/src/config';
 import type { OrderRequest } from '../../packages/core/src/risk/types';
+import { asHuman } from '../../packages/core/src/services/actors';
+
+const HUMAN = asHuman('test');
 
 const HOUR = 3_600_000;
 
@@ -151,10 +154,10 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       await h.ledger.submitForecast(valid('m1-yes', { ambiguityScore: 2 }), 'human'); // higher: raises
       expect(h.cache.getCached('m1')!.assessedAmbiguity).toBe(2);
 
-      await h.cache.setAmbiguity('m2', 0, 'human', 'read the rules');
+      await h.cache.setAmbiguity('m2', 0, HUMAN, 'read the rules');
       await h.ledger.submitForecast(valid('m2-yes', { ambiguityScore: 3 }), 'human');
       expect(h.cache.getCached('m2')).toMatchObject({ assessedAmbiguity: 0, ambiguitySource: 'human' });
-      await h.cache.setAmbiguity('m2', 1, 'human'); // a human can change it
+      await h.cache.setAmbiguity('m2', 1, HUMAN); // a human can change it
       expect(h.cache.getCached('m2')!.assessedAmbiguity).toBe(1);
       await expect(h.cache.setAmbiguity('m2', 0, 'agent')).rejects.toThrow(/human/);
     });
@@ -289,15 +292,15 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       // A later category with the same record could never trade
       h.mandate.value = MandateSchema.parse({ categories: { allow: ['weather-climate'], later: ['economics', 'geopolitics'] } });
       expect(h.ledger.evaluateRights()).toEqual([expect.objectContaining({ from: 'trading', to: 'shadow' })]);
-      expect(() => h.ledger.forceRightsState('economics', 'short', 'trading', 'try', 'human')).toThrow(/later/);
+      expect(() => h.ledger.forceRightsState('economics', 'short', 'trading', 'try', HUMAN)).toThrow(/later/);
     });
 
     it('human force is audited and human only', () => {
       expect(() => h.ledger.forceRightsState('economics', 'short', 'trading', 'test', 'agent')).toThrow(/human/);
-      const s = h.ledger.forceRightsState('economics', 'short', 'trading', 'manual test', 'human')!;
+      const s = h.ledger.forceRightsState('economics', 'short', 'trading', 'manual test', HUMAN)!;
       expect(s).toMatchObject({ state: 'trading', forced: true, maxAllocationUsd: 50 });
       expect(h.auditActions('category_rights.change').at(-1)).toMatchObject({ actor: 'human', payload: { forced: true, to: 'trading' } });
-      expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'back to rules', 'human')!.forced).toBe(false);
+      expect(h.ledger.forceRightsState('economics', 'short', 'auto', 'back to rules', HUMAN)!.forced).toBe(false);
     });
   });
 
@@ -337,7 +340,7 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       expect(rejected).toMatchObject({ allowed: false, failedCheck: 'category_exposure' });
       expect(rejected.reason).toMatch(/shadow/);
 
-      h.ledger.forceRightsState('economics', 'short', 'trading', 'test', 'human');
+      h.ledger.forceRightsState('economics', 'short', 'trading', 'test', HUMAN);
       // Live tradeable (ctx.ledger and orders): the shadow-era forecast is tradeable now; the stored flag is history
       expect(h.ledger.botForecast('m1-yes')).toMatchObject({ id: shadowF.id, tradeable: false, tradeableNow: true, bucketState: 'trading' });
       expect(await h.ledger.get(shadowF.id, 'm1-yes')).toEqual({ forecastId: shadowF.id, probability: 0.6 });

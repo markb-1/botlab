@@ -7,7 +7,7 @@
 
 import type { ConfigChangedEvent, ConfigService } from '../config/ConfigService';
 import { CONFIG_FILE_NAMES, type ConfigFileName } from '../config/changes';
-import type { AuditActor } from '../audit/AuditService';
+import { requireActor, type Actor, type HumanActor } from './actors';
 import { invalidInput } from './errors';
 
 export interface ConfigChangeSummary {
@@ -26,22 +26,26 @@ const summary = (e: ConfigChangedEvent | null): ConfigChangeSummary =>
 export class ConfigFileService {
   constructor(private config: ConfigService) {}
 
-  /** Current config (secrets masked), the last load error and each file's SHA-256 */
-  get() {
+  /** Current config (secrets masked), the last load error and each file's SHA-256. Human or agent. */
+  get(actor: Actor) {
+    requireActor(actor, ['human', 'agent'], 'config.get');
     const { config } = this;
     return { config: config.getRedacted(), error: config.getLastError(), hashes: config.getFileHashes() };
   }
 
-  /** `expectedSha256`: the hash from `get()`; the write is refused if the file changed since */
-  async write(file: unknown, value: unknown, actor: AuditActor, expectedSha256?: unknown): Promise<ConfigChangeSummary> {
+  /** Human only. `expectedSha256`: the hash from `get()`; the write is refused if the file changed since */
+  async write(file: unknown, value: unknown, actor: HumanActor, expectedSha256?: unknown): Promise<ConfigChangeSummary> {
     return summary(await this.config.write(asFile(file), value, actor, typeof expectedSha256 === 'string' ? expectedSha256 : undefined));
   }
 
-  history(file: unknown) {
+  /** Version metadata (no file text). Human or agent. */
+  history(file: unknown, actor: Actor) {
+    requireActor(actor, ['human', 'agent'], 'config.history');
     return this.config.history(asFile(file));
   }
 
-  async restore(file: unknown, versionId: unknown, actor: AuditActor): Promise<ConfigChangeSummary> {
+  /** Human only */
+  async restore(file: unknown, versionId: unknown, actor: HumanActor): Promise<ConfigChangeSummary> {
     return summary(await this.config.restore(asFile(file), String(versionId), actor));
   }
 }

@@ -1,6 +1,6 @@
 import { ipcMain } from 'electron';
 import type { RiskService } from '../../../packages/core/src/services/RiskService';
-import { respond, UNTRUSTED, type TrustedSenderCheck } from '../respond';
+import { respond, UNTRUSTED, type TrustedSenderCheck, ipcHuman } from '../respond';
 
 /**
  * Risk IPC (spec §4.2, §4.3, §4.6). Everything arriving over IPC comes from the UI, so the actor
@@ -15,11 +15,11 @@ export function registerRiskHandlers(
 
   ipcMain.handle('risk:clearHalt', async (event, scope: string, reason: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => risk.clearHalt(scope, reason, 'human'));
+    return respond(() => risk.clearHalt(scope, reason, ipcHuman(event)));
   });
 
   ipcMain.handle('risk:killSwitch', async (event, reason: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => risk.killSwitch(reason, 'human'));
+    return respond(() => risk.killSwitch(reason, ipcHuman(event)));
   });
 }

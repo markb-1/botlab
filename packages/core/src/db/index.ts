@@ -191,8 +191,24 @@ CREATE INDEX IF NOT EXISTS idx_storage_bot ON bot_storage(bot_id);
  * Initialize the SQLite database.
  * Creates tables if they don't exist and enables WAL mode.
  */
+/** Same database file? (':memory:' compares equal to itself, as before) */
+function samePath(a: string, b: string): boolean {
+  if (a === ':memory:' || b === ':memory:') return a === b;
+  return path.resolve(a) === path.resolve(b);
+}
+
+/**
+ * Open the process's database (one per process). Calling it again with the same path (or none)
+ * returns the open handle; a different path while one is open throws instead of silently handing
+ * back the other database.
+ */
 export function initializeDatabase(dbPath?: string): Database.Database {
-  if (db) return db;
+  if (db) {
+    if (dbPath && dbFilePath && !samePath(dbPath, dbFilePath)) {
+      throw new Error(`Another database is already open in this process (${dbFilePath}); close it before opening ${dbPath}`);
+    }
+    return db;
+  }
 
   const resolvedPath = dbPath || getDbPath();
   dbFilePath = resolvedPath;
@@ -546,9 +562,14 @@ export function getDatabase(): Database.Database {
 }
 
 /**
- * Close the database connection.
+ * Close the database connection (the process's open one, or only `handle` if given).
  */
-export function closeDatabase(): void {
+export function closeDatabase(handle?: Database.Database): void {
+  // With a handle: close only that one (a core never closes a database it did not open)
+  if (handle && handle !== db) {
+    if (handle.open) handle.close();
+    return;
+  }
   if (db) {
     db.close();
     db = null;

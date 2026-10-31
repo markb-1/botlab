@@ -2,30 +2,30 @@ import { ipcMain, dialog, BrowserWindow } from 'electron';
 import * as fs from 'fs';
 import type { ScriptService } from '../../../packages/core/src/services/ScriptService';
 import { ScriptCreateSchema, ScriptUpdateSchema, parseInput } from '../../../packages/core/src/services/schemas';
-import { respond } from '../respond';
+import { respond, ipcHuman } from '../respond';
 
 /** Script IPC. The actor is `human`. Export/import use the native save/open dialogs; the files' content goes through ScriptService. */
 export function registerScriptHandlers(scripts: ScriptService): void {
   ipcMain.handle('scripts:list', () => respond(() => scripts.list()));
 
-  ipcMain.handle('scripts:get', (_event, id: string) => respond(() => scripts.get(id)));
+  ipcMain.handle('scripts:get', (event, id: string) => respond(() => scripts.get(id)));
 
   // Compile script (check only, does not save)
-  ipcMain.handle('scripts:compile', (_event, source: string) => respond(() => scripts.compile(source)));
+  ipcMain.handle('scripts:compile', (event, source: string) => respond(() => scripts.compile(source)));
 
-  ipcMain.handle('scripts:create', (_event, data: unknown) => respond(() => scripts.create(parseInput(ScriptCreateSchema, data), 'human')));
+  ipcMain.handle('scripts:create', (event, data: unknown) => respond(() => scripts.create(parseInput(ScriptCreateSchema, data), ipcHuman(event))));
 
-  ipcMain.handle('scripts:update', (_event, id: string, data: unknown) => respond(() => scripts.update(id, parseInput(ScriptUpdateSchema, data), 'human')));
+  ipcMain.handle('scripts:update', (event, id: string, data: unknown) => respond(() => scripts.update(id, parseInput(ScriptUpdateSchema, data), ipcHuman(event))));
 
-  ipcMain.handle('scripts:delete', (_event, id: string) => respond(() => scripts.delete(id, 'human')));
+  ipcMain.handle('scripts:delete', (event, id: string) => respond(() => scripts.delete(id, ipcHuman(event))));
 
-  ipcMain.handle('scripts:getSchema', (_event, id: string) => respond(() => scripts.getSchema(id)));
+  ipcMain.handle('scripts:getSchema', (event, id: string) => respond(() => scripts.getSchema(id)));
 
   // Fork a template script
-  ipcMain.handle('scripts:fork', (_event, id: string, newName?: string) => respond(() => scripts.fork(id, newName, 'human')));
+  ipcMain.handle('scripts:fork', (event, id: string, newName?: string) => respond(() => scripts.fork(id, newName, ipcHuman(event))));
 
   // Export a script to a .botlab file
-  ipcMain.handle('scripts:export', (_event, id: string) =>
+  ipcMain.handle('scripts:export', (event, id: string) =>
     respond(async () => {
       const { fileName, file } = scripts.exportScript(id);
 
@@ -49,7 +49,7 @@ export function registerScriptHandlers(scripts: ScriptService): void {
   );
 
   // Import script(s) from .botlab file(s)
-  ipcMain.handle('scripts:import', () =>
+  ipcMain.handle('scripts:import', (event) =>
     respond(async () => {
       const win = BrowserWindow.getFocusedWindow();
       const result = await dialog.showOpenDialog(win!, {
@@ -74,7 +74,7 @@ export function registerScriptHandlers(scripts: ScriptService): void {
           readErrors.push(`${filePath}: ${(fileErr as Error).message}`);
         }
       }
-      const imported = await scripts.importScripts(files, 'human');
+      const imported = await scripts.importScripts(files, ipcHuman(event));
       const errors = [...readErrors, ...(imported.errors ?? [])];
       return { ...imported, errors: errors.length > 0 ? errors : undefined };
     })

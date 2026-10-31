@@ -6,7 +6,8 @@
 
 import type { ScriptRepository } from '../db/repositories/ScriptRepository';
 import type { IpcScript } from './types';
-import type { AuditActor, AuditService } from '../audit/AuditService';
+import type { AuditService } from '../audit/AuditService';
+import { auditActorOf, requireActor, type Actor } from './actors';
 import { compileScript } from '../runtime/compileScript';
 import { conflict, notFound } from './errors';
 import type { ScriptCreateInput, ScriptImportFile, ScriptUpdateInput } from './schemas';
@@ -57,12 +58,12 @@ export class ScriptService {
   constructor(private deps: ScriptServiceDeps) {}
 
   private auditScript(
-    actor: AuditActor,
+    by: Actor,
     action: string,
     row: { id: string; name: string; revision: number; trust: string; source_hash: string | null },
     extra: Record<string, unknown> = {}
   ): void {
-    this.deps.audit?.record(actor, action, row.id, { name: row.name, revision: row.revision, trust: row.trust, sourceHash: row.source_hash, ...extra });
+    this.deps.audit?.record(auditActorOf(by), action, row.id, { name: row.name, revision: row.revision, trust: row.trust, sourceHash: row.source_hash, ...extra });
   }
 
   list(): IpcScript[] {
@@ -84,7 +85,8 @@ export class ScriptService {
     return { compiled: true };
   }
 
-  async create(data: ScriptCreateInput, actor: AuditActor): Promise<IpcScript> {
+  async create(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
+    requireActor(actor, ['human', 'agent'], 'scripts.create');
     // Compile TypeScript to JavaScript
     let compiled: string | undefined;
     const compileResult = await compileScript(data.source);
@@ -106,7 +108,8 @@ export class ScriptService {
     return scriptRowToIpc(row);
   }
 
-  async update(id: string, input: ScriptUpdateInput, actor: AuditActor): Promise<IpcScript> {
+  async update(id: string, input: ScriptUpdateInput, actor: Actor): Promise<IpcScript> {
+    requireActor(actor, ['human', 'agent'], 'scripts.update');
     const { scriptRepo } = this.deps;
     const data = { ...input };
     // Don't allow editing templates directly
@@ -148,10 +151,11 @@ export class ScriptService {
     return scriptRowToIpc(row);
   }
 
-  delete(id: string, actor: AuditActor): void {
+  delete(id: string, actor: Actor): void {
+    requireActor(actor, ['human', 'agent'], 'scripts.delete');
     const deleted = this.deps.scriptRepo.delete(id);
     if (!deleted) throw conflict('Script not found, is a template, or has bots using it');
-    this.deps.audit?.record(actor, 'script.delete', id);
+    this.deps.audit?.record(auditActorOf(actor), 'script.delete', id);
   }
 
   /** Config schema of a script */
@@ -162,7 +166,8 @@ export class ScriptService {
   }
 
   /** Copy a script (typically a template) into a new, editable custom script */
-  async fork(id: string, newName: string | undefined, actor: AuditActor): Promise<IpcScript> {
+  async fork(id: string, newName: string | undefined, actor: Actor): Promise<IpcScript> {
+    requireActor(actor, ['human', 'agent'], 'scripts.fork');
     const { scriptRepo } = this.deps;
     const original = scriptRepo.findById(id);
     if (!original) throw notFound('Script not found');
@@ -211,7 +216,8 @@ export class ScriptService {
   }
 
   /** Import `.botlab` files; a bad file is reported in `errors` and does not stop the others */
-  async importScripts(files: ScriptImportFile[], actor: AuditActor): Promise<ScriptImportResult> {
+  async importScripts(files: ScriptImportFile[], actor: Actor): Promise<ScriptImportResult> {
+    requireActor(actor, ['human', 'agent'], 'scripts.import');
     const imported: IpcScript[] = [];
     const errors: string[] = [];
 

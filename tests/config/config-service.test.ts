@@ -12,6 +12,9 @@ import { ConfigService, renderYaml, type ConfigChangedEvent } from '../../packag
 import { RiskEngine } from '../../packages/core/src/risk/RiskEngine';
 import { DEFAULT_LIMITS_YAML, ConfigError } from '../../packages/core/src/config';
 import { sha256 } from '../../packages/core/src/config/history';
+import { asHuman } from '../../packages/core/src/services/actors';
+
+const HUMAN = asHuman('test');
 
 interface AuditCall {
   actor: string;
@@ -164,7 +167,7 @@ describe('ConfigService write / history / restore', () => {
     const events: ConfigChangedEvent[] = [];
     s.onChange((e) => events.push(e));
 
-    const e = await s.write('limits', next, 'human');
+    const e = await s.write('limits', next, HUMAN);
     expect(e!.changes.map((c) => c.path)).toEqual(['per_bot_defaults.max_order_usd']);
     expect(e!.raises).toHaveLength(0);
     const text = fs.readFileSync(limitsPath(), 'utf8');
@@ -174,7 +177,7 @@ describe('ConfigService write / history / restore', () => {
     expect(YAML.parse(text).per_bot_defaults.max_order_usd).toBe(20);
     expect(text).toMatch(/max_order_usd: 20\n/);
 
-    expect(await s.write('limits', next, 'human')).toBeNull();
+    expect(await s.write('limits', next, HUMAN)).toBeNull();
     expect(events).toHaveLength(1);
     expect(calls.filter((c) => c.action === 'config.changed')).toHaveLength(1);
   });
@@ -186,11 +189,11 @@ describe('ConfigService write / history / restore', () => {
 
     const bad = structuredClone(cfg.limits);
     bad.global.max_total_exposure_pct = 5;
-    await expect(s.write('limits', bad, 'human')).rejects.toThrow(ConfigError);
+    await expect(s.write('limits', bad, HUMAN)).rejects.toThrow(ConfigError);
 
     const cross = structuredClone(cfg.limits);
     cross.global.max_total_exposure_usd = 10;
-    await expect(s.write('limits', cross, 'human')).rejects.toThrow(/budget_usd/);
+    await expect(s.write('limits', cross, HUMAN)).rejects.toThrow(/budget_usd/);
 
     await expect(s.write('limits', cfg.limits, 'agent')).rejects.toThrow(/human/);
     await expect(s.write('limits', cfg.limits, 'bot:b1')).rejects.toThrow(/human/);
@@ -207,19 +210,19 @@ describe('ConfigService write / history / restore', () => {
 
     const next = structuredClone(cfg.limits);
     next.global.max_open_orders = 70;
-    await s.write('limits', next, 'human');
+    await s.write('limits', next, HUMAN);
     const versions = s.history('limits');
     expect(versions).toHaveLength(2);
     expect(versions[0]).toMatchObject({ actor: 'human', source: 'write' });
 
-    const restored = await s.restore('limits', v1[0].versionId, 'human');
+    const restored = await s.restore('limits', v1[0].versionId, HUMAN);
     expect(restored!.changes.map((c) => c.path)).toEqual(['global.max_open_orders']);
     expect(s.getConfig()!.limits.global.max_open_orders).toBe(50);
     expect(fs.readFileSync(limitsPath(), 'utf8')).toBe(original);
     expect(s.history('limits')).toHaveLength(3);
     expect(calls.filter((c) => c.action === 'config.changed').pop()!.payload.restoredFrom).toBe(v1[0].versionId);
 
-    await expect(s.restore('limits', 'nope', 'human')).rejects.toThrow(/Unknown version/);
+    await expect(s.restore('limits', 'nope', HUMAN)).rejects.toThrow(/Unknown version/);
     await expect(s.restore('limits', v1[0].versionId, 'agent')).rejects.toThrow(/human/);
   });
 
@@ -229,14 +232,14 @@ describe('ConfigService write / history / restore', () => {
     const withToken = structuredClone(cfg.server);
     withToken.notify.telegram.bot_token = '123:SECRET';
     withToken.notify.telegram.chat_id = '42';
-    await s.write('server', withToken, 'human');
+    await s.write('server', withToken, HUMAN);
     expect(s.getConfig()!.server.notify.telegram.bot_token).toBe('123:SECRET');
     expect(s.getRedacted()!.server.notify.telegram.bot_token).toBe('***');
     expect(JSON.stringify(calls)).not.toContain('SECRET');
 
     const fromUi = structuredClone(s.getRedacted()!.server);
     fromUi.timezone = 'UTC';
-    await s.write('server', fromUi, 'human');
+    await s.write('server', fromUi, HUMAN);
     expect(s.getConfig()!.server.notify.telegram.bot_token).toBe('123:SECRET');
     expect(s.getConfig()!.server.timezone).toBe('UTC');
   });
@@ -250,7 +253,7 @@ describe('ConfigService hot-reload hardening', () => {
     const cfg = s.load();
     const tight = structuredClone(cfg.limits);
     tight.global.max_open_orders = 20;
-    await s.write('limits', tight, 'human');
+    await s.write('limits', tight, HUMAN);
     expect(s.getConfig()!.limits.global.max_open_orders).toBe(20);
 
     for (const bad of ['', '   \n\n', '# just a comment\n', 'global:\n  max_open_orders: 20\n']) {
@@ -274,7 +277,7 @@ describe('ConfigService hot-reload hardening', () => {
     const cfg = s.load();
     const server = structuredClone(cfg.server);
     server.notify.telegram.bot_token = 'plainSecretTok';
-    await s.write('server', server, 'human');
+    await s.write('server', server, HUMAN);
     const seen: string[] = [];
     s.onInvalid((e) => seen.push(e.error, ...e.issues));
 
@@ -297,7 +300,7 @@ describe('ConfigService hot-reload hardening', () => {
     // writes throw scrubbed errors as well
     const bad = structuredClone(s.getConfig()!.server);
     bad.timezone = 'plainSecretTok';
-    await expect(s.write('server', bad, 'human')).rejects.not.toThrow(/plainSecretTok/);
+    await expect(s.write('server', bad, HUMAN)).rejects.not.toThrow(/plainSecretTok/);
   });
 
   it('write refuses when the file changed on disk since the UI loaded it', async () => {
@@ -308,11 +311,11 @@ describe('ConfigService hot-reload hardening', () => {
     next.global.max_open_orders = 40;
 
     edit('max_open_orders: 50', 'max_open_orders: 55'); // someone edits the file by hand
-    await expect(s.write('limits', next, 'human', hash)).rejects.toThrow(/changed on disk/);
+    await expect(s.write('limits', next, HUMAN, hash)).rejects.toThrow(/changed on disk/);
     expect(fs.readFileSync(limitsPath(), 'utf8')).toContain('max_open_orders: 55');
 
     await s.reload();
-    await s.write('limits', next, 'human', s.getFileHashes().limits);
+    await s.write('limits', next, HUMAN, s.getFileHashes().limits);
     expect(s.getConfig()!.limits.global.max_open_orders).toBe(40);
     expect(sha256(fs.readFileSync(limitsPath(), 'utf8'))).toBe(s.getFileHashes().limits);
   });
@@ -326,8 +329,8 @@ describe('ConfigService hot-reload hardening', () => {
 
     const next = structuredClone(cfg.limits);
     next.global.max_open_orders = 40;
-    await expect(s.write('limits', next, 'human')).rejects.toThrow(/mandate/);
-    await expect(s.restore('limits', oldVersion, 'human')).rejects.toThrow(/mandate/);
+    await expect(s.write('limits', next, HUMAN)).rejects.toThrow(/mandate/);
+    await expect(s.restore('limits', oldVersion, HUMAN)).rejects.toThrow(/mandate/);
     expect(fs.readFileSync(limitsPath(), 'utf8')).toBe(before);
     expect(s.getConfig()!.limits.global.max_open_orders).toBe(50);
   });

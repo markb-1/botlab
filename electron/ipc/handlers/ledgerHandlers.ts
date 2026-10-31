@@ -4,7 +4,7 @@ import type { MarketService } from '../../../packages/core/src/services/MarketSe
 import type { ForecastFilter } from '../../../packages/core/src/db/repositories/ForecastRepository';
 import type { CategoryRightsState, HorizonBucket } from '../../../packages/core/src/risk/types';
 import { ForecastListFilterSchema, parseInput } from '../../../packages/core/src/services/schemas';
-import { respond, UNTRUSTED, type TrustedSenderCheck } from '../respond';
+import { respond, UNTRUSTED, type TrustedSenderCheck, ipcHuman } from '../respond';
 
 /**
  * Forecast ledger and market IPC (spec §6). Everything arriving over IPC comes from the UI, so the
@@ -14,15 +14,15 @@ import { respond, UNTRUSTED, type TrustedSenderCheck } from '../respond';
 export function registerLedgerHandlers(ledger: LedgerService, markets: MarketService, isTrustedSender: TrustedSenderCheck): void {
   ipcMain.handle('ledger:submitForecast', async (event, input: unknown) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => ledger.submitForecast(input, 'human'));
+    return respond(() => ledger.submitForecast(input, ipcHuman(event)));
   });
 
   ipcMain.handle('ledger:withdrawForecast', async (event, id: string, reason: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => ledger.withdrawForecast(id, reason, 'human'));
+    return respond(() => ledger.withdrawForecast(id, reason, ipcHuman(event)));
   });
 
-  ipcMain.handle('ledger:list', (_event, filter?: unknown) =>
+  ipcMain.handle('ledger:list', (event, filter?: unknown) =>
     respond(() => ledger.list((parseInput(ForecastListFilterSchema, filter && typeof filter === 'object' ? filter : undefined) ?? {}) as ForecastFilter))
   );
 
@@ -30,13 +30,13 @@ export function registerLedgerHandlers(ledger: LedgerService, markets: MarketSer
 
   ipcMain.handle('ledger:setRightsState', async (event, category: string, bucket: HorizonBucket, state: CategoryRightsState | 'auto', reason: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => ledger.forceRightsState(category, bucket, state, reason, 'human'));
+    return respond(() => ledger.forceRightsState(category, bucket, state, reason, ipcHuman(event)));
   });
 
-  ipcMain.handle('markets:get', (_event, marketId: string) => respond(() => markets.get(marketId)));
+  ipcMain.handle('markets:get', (event, marketId: string) => respond(() => markets.get(marketId)));
 
   ipcMain.handle('markets:setAmbiguity', async (event, marketId: string, score: number, note?: string) => {
     if (!isTrustedSender(event.sender)) return UNTRUSTED;
-    return respond(() => markets.setAmbiguity(marketId, score, 'human', note ?? null));
+    return respond(() => markets.setAmbiguity(marketId, score, ipcHuman(event), note ?? null));
   });
 }
