@@ -224,12 +224,49 @@ export class OrderRepository {
     return this.findById(id);
   }
 
-  /** Orders a bot attempted since `sinceIso` (all statuses — rejections count toward the rate limit). */
+  /**
+   * Orders the bot itself submitted to the exchange / paper engine since `sinceIso` (per_bot_defaults.max_orders_per_hour):
+   * risk rejections (`rejected_risk`) and orders another bot placed on its behalf (Position Manager exits,
+   * `placed_by`) are not counted (Mac test F1: a bot spinning on rejections, or a manager exiting for it, locked
+   * it out of the rate limit). Rejections have their own short cooldown (`countOwnRejectionsSince`).
+   */
   countByBotSince(botId: string, sinceIso: string, simulated = false): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM orders WHERE bot_id = ? AND created_at >= ? AND simulated = ?')
+      .prepare(
+        `SELECT COUNT(*) AS n FROM orders WHERE bot_id = ? AND created_at >= ? AND simulated = ?
+           AND status != 'rejected_risk' AND placed_by IS NULL`
+      )
       .get(botId, sinceIso, simulated ? 1 : 0) as { n: number };
     return row.n;
+  }
+
+  /**
+   * The bot's own risk rejections since `sinceIso` (not orders placed for it by another bot), oldest first, without
+   * the cooldown's own refusals (`failedCheck` = `excludeCheck`): the rejection cooldown's input.
+   */
+  ownRejectionTimesSince(botId: string, sinceIso: string, simulated: boolean, excludeCheck: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT created_at FROM orders WHERE bot_id = ? AND created_at >= ? AND simulated = ? AND status = 'rejected_risk'
+           AND placed_by IS NULL AND COALESCE(json_extract(risk_decision, '$.failedCheck'), '') != ?
+         ORDER BY created_at`
+      )
+      .all(botId, sinceIso, simulated ? 1 : 0, excludeCheck) as Array<{ created_at: string }>;
+    return rows.map((r) => r.created_at);
+  }
+
+  /**
+   * Latest Position Manager stop per token in one mode since `sinceIso` (sells placed by another bot with a
+   * "position manager: stop" reason, any status: the decision to stop counts even when the exit was refused).
+   */
+  recentStops(simulated: boolean, sinceIso: string, tokenId?: string): Array<{ token_id: string; stopped_at: string }> {
+    const sql = `SELECT token_id, MAX(created_at) AS stopped_at FROM orders
+       WHERE simulated = ? AND created_at >= ? AND side = 'sell' AND placed_by IS NOT NULL
+         AND reason LIKE 'position manager: stop%' ${tokenId ? 'AND token_id = ?' : ''}
+       GROUP BY token_id`;
+    const args: unknown[] = [simulated ? 1 : 0, sinceIso];
+    if (tokenId) args.push(tokenId);
+    return this.db.prepare(sql).all(...args) as Array<{ token_id: string; stopped_at: string }>;
   }
 
   /** Open orders across all bots (or one bot). */

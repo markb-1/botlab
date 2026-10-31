@@ -66,6 +66,8 @@ export interface ScriptBotRunnerDeps {
   exitPolicy?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['exitPolicy']>>;
   /** ctx.polymarket.getEventMarketIds */
   eventMarketIds?: RpcHandlerDeps['eventMarketIds'];
+  /** Flagged tokens on any bot's position; the runner passes its mode (ctx.risk.getFlaggedTokens) */
+  flaggedTokens?: (simulated: boolean) => ReturnType<NonNullable<RpcHandlerDeps['flaggedTokens']>>;
   /** ctx.risk.getMandateSummary */
   mandateSummary?: RpcHandlerDeps['mandateSummary'];
   /** ctx.copy and copy-order attribution: builtin Copy Trading template only */
@@ -122,6 +124,7 @@ export class ScriptBotRunner extends BaseBotRunner {
       ...(this.deps.exitPolicy ? { exitPolicy: () => this.deps.exitPolicy!(this.deps.mode === 'paper') } : {}),
       eventMarketIds: this.deps.eventMarketIds,
       mandateSummary: this.deps.mandateSummary,
+      ...(this.deps.flaggedTokens ? { flaggedTokens: () => this.deps.flaggedTokens!(this.deps.mode === 'paper') } : {}),
       ...(this.deps.role === 'copy' && this.deps.copy ? { copy: this.deps.copy } : {}),
     };
 

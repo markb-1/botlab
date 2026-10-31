@@ -497,4 +497,54 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     });
     expect(binance.marketBuy).toHaveBeenCalledTimes(1);
   });
+
+  describe('order rate and rejection cooldown (Mac test F1)', () => {
+    it('max_orders_per_hour counts only orders the bot itself submitted: no risk rejections, no exits placed for it', async () => {
+      const svc = makeService('bot-1');
+      expect(await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 100 })).toMatchObject({ failedCheck: 'max_order' });
+      expect((await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })).ok).toBe(true);
+      // A Position Manager exit placed on bot-1's behalf
+      t.orderRepo.create({ botId: 'bot-1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'sell', orderType: 'limit', price: 0.6, size: 5, notionalUsd: 3, status: 'open', placedBy: 'pm', reason: 'position manager: flag: x' });
+      expect(t.orderRepo.countByBotSince('bot-1', new Date(0).toISOString(), false)).toBe(1);
+      const budget = await svc.getBudget();
+      expect(budget.ordersPerHour).toBe(20);
+      expect(budget.ordersRemainingThisHour).toBe(19);
+    });
+
+    it('a burst of own rejections pauses own submissions briefly; exits placed by another bot are exempt', async () => {
+      clock = Date.now(); // row timestamps use the wall clock
+      market = { ...MARKET, endDate: new Date(clock + 10 * DAY).toISOString() };
+      const svc = makeService('bot-1');
+      for (let i = 0; i < 6; i++) expect((await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 100 })).failedCheck).toBe('max_order');
+      const paused = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+      expect(paused).toMatchObject({ ok: false, status: 'rejected_risk', failedCheck: 'rejection_cooldown' });
+      expect(poly.postLimitOrder).not.toHaveBeenCalled();
+      // The cooldown's own refusals do not extend it
+      expect(t.orderRepo.ownRejectionTimesSince('bot-1', new Date(0).toISOString(), false, 'rejection_cooldown')).toHaveLength(6);
+      // A risk exit placed by the Position Manager still reaches the risk engine (refused there for other reasons)
+      const exit = await svc.placeLimit({ tokenId: 't1', side: 'sell', price: 0.6, size: 5, riskExit: true, placedBy: 'pm' });
+      expect(exit.failedCheck).not.toBe('rejection_cooldown');
+      // Another bot is unaffected
+      expect((await makeService('bot-2').placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })).ok).toBe(true);
+      // Ten minutes later the window has drained
+      clock += 11 * 60_000;
+      expect((await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 })).ok).toBe(true);
+    });
+  });
+
+  it('getRecentStops: Position Manager stops on any bot in the same mode, latest per token (Mac test F4)', async () => {
+    t.addBot('exec-a');
+    t.addBot('exec-b');
+    const row = (botId: string, tokenId: string, reason: string, simulated: boolean, side: 'buy' | 'sell' = 'sell', placedBy: string | null = 'pm') =>
+      t.orderRepo.create({ botId, exchange: 'polymarket', marketId: 'm1', tokenId, side, orderType: 'limit', price: 0.4, size: 5, notionalUsd: 2, status: 'filled', placedBy, reason, simulated });
+    row('exec-a', 't1', 'position manager: stop: bid 0.3 <= entry 0.5', true);
+    row('exec-a', 't2', 'position manager: take_profit: converged', true);
+    row('exec-a', 't3', 'position manager: stop (marketable): x', false); // live: not in paper
+    row('exec-a', 't4', 'position manager: stop: but the bot sold it itself', true, 'sell', null);
+    const ps = new PaperTradingState('exec-b', 1000, t.storageRepo);
+    const svcB = makeService('exec-b', 'paper', ps);
+    expect(svcB.getRecentStops()).toEqual([{ tokenId: 't1', stoppedAt: expect.any(String) }]);
+    expect(svcB.getRecentStops('t2')).toEqual([]);
+    expect(makeService('bot-1').getRecentStops().map((s) => s.tokenId)).toEqual(['t3']);
+  });
 });

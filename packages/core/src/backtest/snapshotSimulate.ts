@@ -448,7 +448,7 @@ function buildCtx(market: SnapshotMarket, mem: InMemoryStorageRepo, input: Snaps
       getMarket: disabled('getMarket'),
       getEventMarketIds: disabled('getEventMarketIds'),
     },
-    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false }), getExitFlags: async () => [], getExitPolicy: async () => defaultExitPolicy(), getMandateSummary: async () => null },
+    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false, ordersPerHour: null, ordersRemainingThisHour: null }), getExitFlags: async () => [], getExitPolicy: async () => defaultExitPolicy(), getMandateSummary: async () => null, getFlaggedTokens: async () => [], getRecentStops: async () => [] },
     copy: { getLeaders: disabled('copy.getLeaders'), getHoldings: disabled('copy.getHoldings') },
     requestRetire: async () => ({ accepted: false }),
     ledger: { getActiveForecasts: async () => [], getForecast: async () => null },

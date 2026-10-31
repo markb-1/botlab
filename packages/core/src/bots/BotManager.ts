@@ -765,6 +765,20 @@ export class BotManager extends EventEmitter {
                 .map((f) => ({ id: f.id, tokenId: f.token_id, marketId: f.market_id, reason: f.reason, createdBy: f.created_by, createdAt: f.created_at })),
           }
         : {}),
+      ...(this.orderDeps?.exitFlags
+        ? {
+            flaggedTokens: (simulated: boolean) => {
+              // Mode-scoped, any bot: latest flag per token, no reasons (they are another bot's business)
+              const byToken = new Map<string, { tokenId: string; marketId: string | null; flaggedAt: string }>();
+              for (const f of this.orderDeps!.exitFlags!.list({ status: 'open', limit: 1000 })) {
+                if ((f.simulated === 1) !== simulated) continue;
+                const prev = byToken.get(f.token_id);
+                if (!prev || f.created_at > prev.flaggedAt) byToken.set(f.token_id, { tokenId: f.token_id, marketId: f.market_id ?? prev?.marketId ?? null, flaggedAt: f.created_at });
+              }
+              return [...byToken.values()];
+            },
+          }
+        : {}),
       exitPolicy: (simulated: boolean) => this.getExitPolicy(simulated),
       ...(this.orderDeps?.marketCache ? { eventMarketIds: (eventId: string) => this.orderDeps!.marketCache!.getEventMarketIds(eventId) } : {}),
       mandateSummary: () => this.getMandateSummary(),
