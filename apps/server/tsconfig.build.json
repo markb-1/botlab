@@ -1,0 +1,12 @@
+{
+  // `npm run build:server`: compiles the server, the agent runner (apps/agent) and all of packages/core (incl. the worker entries,
+  // which nothing imports statically) to dist/apps/server/src and dist/packages/core/src.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "../..",
+    "outDir": "../../dist",
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "../agent/src/**/*.ts", "../../packages/core/src/**/*.ts"]
+}

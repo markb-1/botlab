@@ -1,0 +1,17 @@
+# BotLab agent mandate (spec §3.2). Human-owned: the agent can read but never write this file.
+# Copy to mandate.yaml (or start the app once and it is created with these defaults).
+budget_usd: 300                       # must be <= limits.global.max_total_exposure_usd
+categories:
+  allow: [weather-climate, economics, politics-non-us]
+  later: [geopolitics, science-tech]   # forecasts recorded (shadow), no bots
+  deny:  [sports, crypto-price, mentions, culture-entertainment, us-elections-headline]
+markets:
+  resolves_within_days: [0, 30]       # default horizon
+  long_horizon_days: [30, 90]         # allowed only within limits.global.max_long_horizon_pct
+  min_liquidity_usd: 5000
+  max_ambiguity_score: 1              # skip markets rated 2-3
+strategies:
+  allow: [forecast, consistency, resolution_rule]   # template keys
+  allow_custom_templates: true
+notes: |
+  Free-text guidance for the agent (themes of interest, things to avoid).

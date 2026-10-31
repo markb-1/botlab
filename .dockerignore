@@ -1,0 +1,13 @@
+node_modules
+dist
+apps/web/dist
+data
+logs
+config/*.yaml
+!config/*.example.yaml
+.git
+.github
+.env
+*.db
+master.key
+coverage

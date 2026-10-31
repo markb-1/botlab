@@ -1,0 +1,17 @@
+{
+  // Typecheck the server (and the core it imports). `tsconfig.build.json` emits to dist/.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "node",
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "../agent/src/**/*.ts"]
+}

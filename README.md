@@ -1,88 +1,329 @@
 # BotLab
 
-Desktop trading bot platform for **Polymarket** prediction markets and **Binance** spot crypto. Write TypeScript bot scripts, run them in paper or live mode, and manage everything from a single app.
+Self-hosted trading lab for **Polymarket** prediction markets (and **Binance** spot). Bots are TypeScript
+scripts that run in sandboxed worker threads; every order goes through a server-side **risk engine**
+with human-set hard limits. One Node server holds the database, the bots and the risk controls; you use
+it from a browser.
 
-Built with Electron, React, and SQLite.
-
----
-
-## Features
-
-- **Script-based bots** — Write trading logic in TypeScript with a full SDK (`ctx.buy()`, `ctx.binance.getPrice()`, `ctx.fetch()`, etc.)
-- **Paper & live trading** — Test strategies with simulated balances before risking real funds
-- **Polymarket integration** — Trade prediction markets via the CLOB API (order books, positions, market data)
-- **Binance integration** — Spot trading on Binance (BTCUSDT, ETHUSDT, and any USDT-quoted pair)
-- **Built-in templates** — Copy Trading, Odds Threshold, Trader Discovery, Binance Spot, and a blank starter
-- **Script editor** — Edit bot scripts in-app with a full API reference
-- **Wallet management** — Import Ethereum wallets with encrypted private key storage
-- **Persistent state** — Bots can save/load state across restarts via key-value storage
-- **Password protection** — App locks behind a password on launch; all secrets encrypted at rest
+Runs natively on **macOS, Windows and Linux** (Node 22), or in **Docker** on a home server.
 
 ---
 
-## Getting Started
+## Quick start
 
-### Prerequisites
+You need **Node.js 22** (LTS, 22.12 or newer) and git. No Docker, Tailscale, Telegram or exchange
+credentials are needed to start: a fresh install runs **paper bots only**.
 
-- **Node.js** 18+
-- **npm** 9+
-- A Polymarket-compatible **Ethereum wallet** (with proxy address for trading)
-- *(Optional)* Binance API credentials for spot trading
+**Use Node 22, not the newest Node.** `better-sqlite3` (the only native module) does not build on Node 25+
+yet, so `engines` is `>=22.12 <25` and `npm install` stops with a message on other versions (`.nvmrc` says
+22). On macOS the current Homebrew `node` is too new: `brew install node@22` and put it first on your
+`PATH` (`brew link --overwrite --force node@22`), or use `nvm install` / `fnm use` in the repo. npm 11
+(bundled with newer Node) also skips dependency install scripts unless they are allowed, which leaves
+`better-sqlite3` / `esbuild` without their binaries; with Node 22's npm 10 this does not apply. If you
+must use npm 11, allow the scripts it lists (`better-sqlite3`, `esbuild`, `fsevents`) as its warning
+explains, then run `npm rebuild better-sqlite3 esbuild`.
 
-### Install
+### macOS / Linux
 
 ```bash
-git clone <repo-url>
-cd polymarket-bot-app
+git clone <repo-url> botlab && cd botlab
 npm install
-npm run electron:rebuild   # Rebuild native modules (better-sqlite3) for Electron
+npm run dev          # server on :3780 (auto-restart) + UI with hot reload on http://localhost:3000
 ```
 
-### Run in Development
+### Windows (PowerShell)
+
+```powershell
+git clone <repo-url> botlab; cd botlab
+npm install
+npm run dev          # then open http://localhost:3000
+```
+
+Open the UI and choose an **admin password** (first-run setup). From the same machine (server bound to
+127.0.0.1) that is all; from anywhere else (another device, Tailscale, Docker) the setup screen also asks
+for the **one-time setup code** the server prints in its log at start. In dev, data lives in `./data` and
+the config files in `./config` (created with defaults on first start).
+
+**Production mode** (built server serving the built UI, data in the OS app-data dir):
 
 ```bash
-npm run electron:dev
+npm run build
+npm run cli -- gen-key --prod   # once: creates the master key (see "Master key" below)
+npm start                       # http://127.0.0.1:3780
 ```
 
-This compiles the Electron main process, starts the Vite dev server with hot reload, and launches the app.
+| | data dir (`BOTLAB_DATA_DIR`) | config dir (`BOTLAB_CONFIG_DIR`) |
+|---|---|---|
+| `npm run dev` | `./data` | `./config` |
+| `npm start` on macOS | `~/Library/Application Support/BotLab` | `…/BotLab/config` |
+| `npm start` on Windows | `%APPDATA%\BotLab` | `%APPDATA%\BotLab\config` |
+| `npm start` on Linux | `~/.local/share/botlab` | `~/.local/share/botlab/config` |
+| Docker | `/data` (volume `./data`) | `/config` (volume `./config`) |
 
-### Build for Distribution
+With `npm start`, setting only `BOTLAB_DATA_DIR` moves the config dir with it (`<data dir>/config`).
+
+The data dir holds `botlab.db`, `backups/` (nightly, 14 kept), `logs/`, `config-history/` and, unless
+you set the variables below, `master.key`.
+
+### Docker (home server)
 
 ```bash
-npm run electron:build
+git clone <repo-url> botlab && cd botlab
+mkdir -p data config secrets
+openssl rand -hex 32 > secrets/master.key        # back this file up!
+sudo chown -R 1000:1000 data config secrets/master.key && chmod 600 secrets/master.key   # container user `node`
+docker compose up -d --build
 ```
 
-Outputs packaged apps to `release/` — DMG/ZIP on macOS, NSIS/portable on Windows, AppImage/deb on Linux.
+The port is published on `127.0.0.1:3780` only. For remote access use **Tailscale** (never port
+forwarding): either install Tailscale on the host and run `tailscale serve --bg 3780`, or use the
+commented Tailscale sidecar in `docker-compose.yml`. `*.ts.net` host names are accepted by default;
+other names go in `BOTLAB_ALLOWED_HOSTS` or `http.allowed_hosts` in `config/server.yaml`.
+The image builds for `linux/amd64` and `linux/arm64` (`docker buildx build --platform linux/amd64,linux/arm64 .`).
+`TZ=Europe/Dublin` is set for schedules and the daily digest; stored timestamps are UTC.
 
 ---
 
-## How It Works
+## First run, paper mode and going live
 
-### App Structure
+1. Open the UI, set the admin password (with the setup code from the log when not on the server
+   itself: `docker compose logs botlab | grep "Setup code"`).
+2. Create a bot from a template — new bots are **paper** bots (simulated balance, real market data).
+3. Live trading is **off** until you enable it explicitly: add a wallet (Wallets page), set
+   `live_trading.enabled: true` (Risk page → Limits, or `limits.yaml`), and create the bot in **Live** mode. Until then live
+   bots are refused at start and any live order is rejected (`live_disabled`).
+4. All hard limits (exposure, loss limits, order sizes, ramp) are in `config/limits.yaml` and
+   `config/mandate.yaml`; edit them on the Risk page (validated, risk raises flagged, history with
+   diff and restore) or by hand — edits are picked up without a restart.
+5. Before a bot may **buy** a Polymarket market, the market's rules must be assessed: Markets page →
+   open the market → **Set ambiguity** (or a forecast with an ambiguity score).
 
-When you launch BotLab, you'll see these pages:
-
-| Page | What it does |
-|------|-------------|
-| **Dashboard** | Overview of all bots — count, status, last heartbeat |
-| **Bots** | Create, start, stop, and monitor bot instances |
-| **Scripts** | Browse templates, write custom scripts, import/export |
-| **Wallets** | Add Ethereum wallets (private keys are AES-encrypted) |
-| **Settings** | Configure RPC endpoint, CLOB URL, and Binance API credentials |
-
-### Creating a Bot
-
-1. Go to **Scripts** and pick a template (or write your own)
-2. Go to **Bots** → **Create Bot**
-3. Choose the script, fill in the config form, pick a wallet, and select **Paper** or **Live** mode
-4. Start the bot — it runs in a background worker thread
-
-### Paper vs Live Mode
-
-- **Paper mode**: Bot uses a virtual USDT balance (default $10,000). Trades execute against real order book data but no real money moves. Great for testing.
-- **Live mode**: Bot executes real trades on Polymarket or Binance using your wallet and API credentials.
+After an unclean stop (crash, power cut, Windows Update reboot, a second Ctrl+C) the server starts with a
+**global halt**; open orders are cancelled. Clear it after checking: **Clear halt** on the Dashboard or the
+Risk page (a reason and, if your last password check is older than 15 minutes, your password).
 
 ---
+
+## Master key
+
+Wallet private keys and Binance credentials are encrypted (AES-256-GCM) with a 32-byte **master key**,
+loaded at boot from, in order:
+
+1. `BOTLAB_MASTER_KEY` — 64 hex characters (`openssl rand -hex 32`);
+2. `BOTLAB_MASTER_KEY_FILE` — path to a file containing them;
+3. `<data dir>/master.key`.
+
+With none of these, `npm run dev` generates `<data dir>/master.key` (and warns); `npm start` refuses to
+start — create one with `npm run cli -- gen-key --prod`. **Back the key up** (password manager): without
+it the encrypted secrets are lost. The admin password only protects the UI; it does not encrypt anything.
+
+### Upgrading from the Electron app
+
+The Electron app derived the encryption key from your unlock password. `npm start` uses the same data
+dir as the Electron app on macOS and Windows, so it finds your database; the server then stays
+**locked** (the login screen says why) until you migrate once:
+
+```bash
+# stop the server first
+npm run migrate-key -- --prod
+#   asks for your old BotLab password (hidden; or set BOTLAB_OLD_PASSWORD). A "skipped password" install
+#   needs none. --password <pw> also works but ends up in your shell history. --data-dir for another location.
+npm start
+```
+
+This re-encrypts every secret with the master key (creating `master.key` if none is configured), in one
+transaction (a wrong password changes nothing), and makes your old password the admin login password if it
+has 8+ characters; otherwise it asks for a new admin password (or `BOTLAB_NEW_ADMIN_PASSWORD`).
+If you edited `config/*.yaml` in the repo while using Electron in dev, copy them into the production config
+dir (table above); otherwise defaults are created there.
+
+### Upgrade notes (2026-10-31 fix-up round)
+
+- **Config dir with `BOTLAB_DATA_DIR`:** with `npm start` and only `BOTLAB_DATA_DIR` set, the config dir is now
+  `<data dir>/config` (it used to stay in the OS app-data dir). The server prints a warning at startup if your
+  old config files are still in the old place; move them, or set `BOTLAB_CONFIG_DIR` to the old dir.
+- **`resting_order_ttl_minutes` must be ≥ 3** in `limits.yaml`: Polymarket refuses GTD orders that expire less
+  than 3 minutes ahead. A smaller value makes `limits.yaml` invalid: at startup everything that needs the config
+  fails closed (no orders, the Risk page shows the error); on a live edit the previous valid config stays. Raise
+  it to 3 or more. Scripts calling `placeLimit` with `ttlMinutes` < 3 get an error.
+- **`categories.yaml` / `fees.yaml`** you already have are not rewritten: see `docs/PROGRESS.md` (R50, R125) for
+  the economics-tag and sports-fee changes to apply by hand.
+
+---
+
+## Windows home server (service)
+
+```powershell
+winget install NSSM.NSSM            # service manager (once)
+npm run build
+npm run service:install             # in an elevated PowerShell (Run as Administrator)
+```
+
+This registers the **BotLab** Windows service (delayed auto-start at boot, no login needed; restart on
+crash; graceful stop via Ctrl+C so the clean-shutdown marker is written; logs in
+`%APPDATA%\BotLab\logs\service.log`). It runs as **your Windows account**, not LocalSystem: the script
+asks for your Windows password (hidden; for a Microsoft account the account password, not the PIN) and
+NSSM grants the account "Log on as a service". If that fails it removes the service and explains how to
+set the account in `services.msc` → Log On. The data/config dirs and the master key file are passed
+explicitly (`%APPDATA%\BotLab`). When you change your Windows password, update it in `services.msc` too.
+`npm run service:uninstall` removes the service.
+After `git pull`: `npm install`, `npm run build`, `nssm restart BotLab`.
+
+Power and updates (spec §15.1): set **Sleep: Never** (Settings → System → Power), keep the PC on a UPS
+if you can, and set Windows Update **active hours**. An update reboot is handled like a power cut:
+resting orders expire on their own (GTD), BotLab restarts **halted**, and you clear the halt after checking.
+Install Tailscale for Windows for remote access. Load is negligible next to gaming.
+
+On macOS and Linux, `npm run service:install` prints a launchd / systemd unit with your paths.
+
+---
+
+## Configuration
+
+| variable | default | |
+|---|---|---|
+| `BOTLAB_DATA_DIR` | see table above | database, backups, logs, master.key |
+| `BOTLAB_CONFIG_DIR` | see table above | limits / mandate / fees / server / categories `.yaml` |
+| `BOTLAB_MASTER_KEY` / `BOTLAB_MASTER_KEY_FILE` | — | master key (above) |
+| `BOTLAB_HOST` | `127.0.0.1` | bind address (`http.host` in server.yaml). Never a public interface; a warning is logged for `0.0.0.0` |
+| `BOTLAB_PORT` | `3780` | `http.port` in server.yaml |
+| `BOTLAB_ALLOWED_HOSTS` | — | extra UI host names, comma-separated (IPs, `localhost`, `*.ts.net` always allowed) |
+| `BOTLAB_LOG_DIR` | `<data dir>/logs` | daily log files |
+| `TELEGRAM_BOT_TOKEN` | — | overrides `notify.telegram.bot_token` in server.yaml |
+| `ANTHROPIC_API_KEY` | — | the scheduled agent's API key (only from the environment; never stored by BotLab). See "Running the agent" |
+| `TZ` | system | e.g. `Europe/Dublin` |
+
+A `.env` file in the working directory is read at start.
+
+## Access, API and tokens
+
+- **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days
+  max). Human-only actions (clear a halt, config writes/restores, position adoption, market ambiguity,
+  forcing category rights, wallets, Binance credentials, settings, creating API tokens) also need the
+  password entered within the last 15 minutes; the UI asks for it when needed.
+- **Password guessing**: 5 wrong passwords per 15 minutes per client address, then 429. Behind a local
+  proxy such as `tailscale serve`, every client arrives from 127.0.0.1, so logins share one bucket
+  (someone guessing can lock you out for 15 minutes; re-auth is keyed per session). Use the CLI
+  (`set-password`) if you are ever locked out of a fresh setup.
+- **HTTP API**: `/api/*`, JSON `{ success, data?, error?, code? }`; mutations need the `X-BotLab: 1`
+  header when using the cookie. Events: `GET /api/events` (server-sent events: `bot:event`, `bot:log`,
+  `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`, `agent:run`). Health: `GET /healthz`
+  (no auth; 503 when the DB fails, the server is locked, the reconciler is stale > 3 min or a bot
+  worker crashed).
+- **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (the MCP agent, below; on `/api` it keeps
+  read routes, scripts, backtests, paper bot create / config update of its own bots / start of its own bots /
+  stop, forecasts, kill switch — never wallets, credentials, settings, config writes or halt clearing) or
+  `readonly` (GET only, and not wallets, settings, config or script export).
+  `npm run cli -- token create --scope agent --name mcp` · `token list` · `token revoke <id>`.
+- Forgot the admin password: `npm run cli -- set-password` (add `--prod` for the `npm start` data dir).
+
+## MCP server (AI agent)
+
+BotLab exposes its agent interface as an MCP server (spec §7.3): **Streamable HTTP at `/mcp`**, authenticated
+with an **agent-scope token only** (a readonly token or the admin session is refused). Everything the agent can
+do goes through the same core services and rules as the UI: its bots are paper bots on their own paper wallet,
+it may change / start / retire only bots it created (it may pause any), bot creation is capped by
+`limits.yaml` `agent.max_bots_created_per_day` / `max_active_bots`, its ambiguity assessments can only set or
+raise a score (never lower it or override yours), new runs are refused once `agent.monthly_llm_budget_usd` is
+used, and tool calls are capped per run (`max_tool_calls_per_run`) and per token per hour
+(`max_tool_calls_per_hour`, also for its `/api` calls). LLM cost is recorded only by BotLab's agent runner (4b):
+**interactive use from Claude Code / Claude Desktop is not cost-tracked by BotLab** (that bill is your client's). It cannot touch limits, the mandate, wallets, credentials, settings or orders, and
+cannot clear halts. Every tool call is in the audit log (`mcp.<tool>`, actor `agent`). The Agent page shows
+runs, notes, budget and exit flags.
+
+Tools: read — `get_overview`, `search_markets`, `get_market`, `get_orderbook`, `get_price_history`,
+`get_positions`, `get_open_orders`, `get_trades`, `list_bots`, `get_bot`, `get_bot_logs`, `list_templates`,
+`get_script`, `get_forecasts`, `get_ledger_stats`, `get_notes`, `get_run_history`, `get_leaderboard`;
+build — `validate_script` (compile + typecheck against `botlab-sdk.d.ts`), `create_template`,
+`update_template`, `run_backtest`, `get_backtest`; operate — `create_bot`, `update_bot_config`, `start_bot`,
+`pause_bot`, `retire_bot`, `submit_forecast`, `withdraw_forecast`, `assess_market`, `flag_position_exit`,
+`kill_switch`, `watch_market`, `unwatch_market`, `write_note`, `delete_note`, `start_run`, `finish_run`.
+Resources: `botlab://sdk/types.d.ts`, `botlab://sdk/guide.md`, `botlab://templates/{id}`,
+`botlab://config/mandate`, `botlab://config/limits`, `botlab://fees`.
+
+Create a token first (with the server running or not): `npm run cli -- token create --scope agent --name claude`
+(add `--prod` for the `npm start` data dir), or Settings → API tokens.
+
+**Claude Code** (HTTP, any OS):
+
+```bash
+claude mcp add --transport http botlab http://127.0.0.1:3780/mcp --header "Authorization: Bearer blt_…"
+```
+
+**Claude Desktop** (stdio): Desktop starts a local process, so BotLab ships a stdio proxy
+(`dist/apps/server/src/mcp-stdio.js`, built by `npm run build`; `npm run mcp:stdio` runs it). It does not open the
+database: it forwards every message to the running server's `/mcp` with the token. Edit
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or
+`%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "botlab": {
+      "command": "node",
+      "args": ["/Users/you/botlab/dist/apps/server/src/mcp-stdio.js"],
+      "env": { "BOTLAB_URL": "http://127.0.0.1:3780", "BOTLAB_AGENT_TOKEN": "blt_…" }
+    }
+  }
+}
+```
+
+On Windows use `"args": ["C:\\Users\\you\\botlab\\dist\\apps\\server\\src\\mcp-stdio.js"]`. The same
+proxy works for Claude Code (`claude mcp add botlab -e BOTLAB_URL=http://127.0.0.1:3780 -e BOTLAB_AGENT_TOKEN=blt_… -- node /path/to/mcp-stdio.js`).
+Revoking the token (`npm run cli -- token revoke <id>` or Settings) cuts the agent off at once. The proxy refuses
+to send the token over plain `http://` except to loopback or Tailscale (`*.ts.net`, 100.64.0.0/10); use https
+or set `BOTLAB_ALLOW_INSECURE=1` to override.
+
+Tool results that contain third-party text (market questions and rules, names, log lines) are wrapped in
+`<untrusted_data>` blocks and the guide tells the agent not to follow instructions in them; the real protection
+is structural (what the agent cannot do, above).
+
+## Running the agent
+
+The server can run the agent itself on a schedule (spec §7.1): a separate runner process (`apps/agent`, the
+Claude Agent SDK) that talks to BotLab only through `/mcp`, plus web search and web fetch — no shell, no file
+access. It is **off by default**. Before you switch it on:
+
+1. Keep live trading off (`limits.yaml` `live_trading.enabled: false`) while you watch the first days: the
+   agent only ever creates **paper** bots, and its forecasts go to the ledger ("shadow" mode).
+2. Set the agent limits in `limits.yaml` → `agent:` (Risk page): `monthly_llm_budget_usd` (start low, e.g. 30),
+   `max_run_cost_usd` (default 1.50), `max_bots_created_per_day`, `max_active_bots`.
+3. Get an API key from the Anthropic Console and put it **in the server's environment** as
+   `ANTHROPIC_API_KEY` (never in a config file or the database):
+   - **macOS / Linux** (`npm start` in a terminal): `export ANTHROPIC_API_KEY=sk-ant-…` before starting, or add
+     it to the launchd plist (`EnvironmentVariables`) / systemd unit (`Environment=`) printed by
+     `npm run service:install`.
+   - **Windows service (NSSM)**, in an elevated PowerShell (the `+` appends to the variables the installer set):
+
+     ```powershell
+     nssm set BotLab AppEnvironmentExtra +ANTHROPIC_API_KEY=sk-ant-...
+     nssm restart BotLab
+     nssm get BotLab AppEnvironmentExtra      # check: BOTLAB_* paths and the key
+     ```
+
+     `npm run service:install` rewrites the service settings: add the key again after reinstalling.
+   - **Windows, in a terminal**: `$env:ANTHROPIC_API_KEY = "sk-ant-..."` then `npm start`.
+   - **Docker**: `ANTHROPIC_API_KEY` in the compose `environment:` (from your shell or an `.env` file next to
+     `docker-compose.yml`).
+4. In `server.yaml` (Risk → Server), set `agent.enabled: true`. Recommended: `model: claude-sonnet-5-5` (default;
+   `claude-opus-5-5` is about twice the cost per token). The change applies without a restart.
+
+Schedule (local times in `server.yaml` `timezone`, default Europe/Dublin): daily review at 07:30 and cycles at
+11:30, 15:30, 19:30 and 23:30 (`agent.schedule`); nothing between 00:00 and 07:00 — bots keep running and the
+risk engine keeps enforcing. **Event runs** (maintenance only: no new bots, templates or forecasts — the server
+refuses them) start when a held market's rules change, a bot is halted or reconciliation finds a mismatch: at
+most 4 a day and one per 30 minutes; at night only bot halts start one. Start a run by hand from the Agent page
+("Run now") or Telegram `/run [cycle|review]`.
+
+What the server enforces for every run: it opens the run itself (the agent cannot skip run accounting), gives the
+runner a fresh agent token that is revoked when the run ends, refuses the run when one is already active or the
+monthly budget is used (one Telegram notice a month), records the token usage and cost the runner reports, and
+stops the run at `max_run_cost_usd`, `agent.max_turns` or 30 minutes (the runner aborts; the server kills it if
+it does not exit). The Telegram run report (cost, duration, summary) follows every run, including failures, and
+the 08:00 digest lists the last 24 hours of runs and the month's spend. With the agent enabled but no
+`ANTHROPIC_API_KEY`, the server logs a warning and schedules nothing. Budget: with the defaults (5 scheduled plus
+up to 4 event runs a day, ≤ $1.50 each) the theoretical maximum is about $400 a month; typical Sonnet runs cost
+far less, and `monthly_llm_budget_usd` is the hard stop.
 
 ## Writing Bot Scripts
 
@@ -195,77 +436,42 @@ You can **fork** any template to create your own version, or **import/export** s
 
 ---
 
-## Settings
+## Security notes
 
-### Polymarket
-
-- **RPC URL** — Polygon RPC endpoint (for on-chain transactions)
-- **CLOB URL** — Polymarket CLOB API endpoint (default: `https://clob.polymarket.com`)
-- **USDC Contract** — Polygon USDC contract address
-
-### Binance
-
-- **API Key** / **API Secret** — Binance API credentials for spot trading
-- Credentials are AES-encrypted and stored locally — never sent to any external service
-- Use the **Test Connection** button to verify your credentials
-- Paper trading works without Binance credentials (uses simulated balances with real market data)
-
----
-
-## Security
-
-- **Password protection** — The app requires a password on first launch. All wallet private keys and API credentials are encrypted with a key derived from this password.
-- **Encrypted storage** — Private keys and Binance secrets are AES-encrypted in the local SQLite database. They are decrypted only in the main process and never exposed to the renderer.
-- **Worker isolation** — Bot scripts run in sandboxed worker threads. They communicate with the main process via an RPC message channel — no direct access to the filesystem, database, or private keys.
+- Bind to `127.0.0.1` (default) or the Tailscale interface; never expose BotLab to the internet.
+- Binance API key: trading only, **withdrawals disabled**, IP allowlist. Polymarket: a dedicated wallet
+  funded only with risk capital.
+- Bot scripts run in sandboxed worker threads (no filesystem, no environment, bounded heap); they reach
+  trading APIs only through the RPC layer, and every order passes the risk engine.
+- Secrets are decrypted only inside the server process; the UI only ever sees `hasBinanceCredentials`.
 
 ---
 
 ## Development
 
-### Commands
-
 ```bash
-npm run electron:dev       # Dev mode with hot reload
-npm run electron:compile   # Compile TypeScript only
-npm run electron:preview   # Run without Vite dev server
-npm run electron:build     # Package for distribution
-npm test                   # Run all tests
-npm run test:electron      # Electron-layer tests only
-npm run lint               # ESLint
-npm run format             # Prettier
+npm run dev            # server (node --watch + tsx) + Vite UI with /api proxy
+npm run build          # tsc → dist/ (server + core), vite → apps/web/dist
+npm start              # built server serving the built UI (production paths)
+npm run typecheck      # core + server + web
+npm test               # vitest (SKIP_NETWORK_TESTS=1 skips live-API tests)
+npm run lint           # ESLint (0 errors expected)
+npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke
+npm run gen:sdk        # regenerate botlab-sdk.d.ts (packages/core/src/sdk/sdkDts.generated.ts) after editing sdk/types.ts
+npm run mcp:stdio      # MCP stdio proxy (BOTLAB_URL, BOTLAB_AGENT_TOKEN); mcp:stdio:dev runs it from source
 ```
 
-### Project Structure
-
 ```
-electron/                  # Electron main process
-  main.ts                  # App entry, window creation, IPC setup
-  preload.ts               # Context bridge (IPC → renderer)
-  database/                # SQLite database, migrations, repositories
-  ipc/handlers/            # IPC handlers (bots, wallets, settings, scripts, auth)
-  runtime/                 # Bot execution engine (ScriptRunner, RpcHandler, PaperTradingState)
-  sdk/                     # Trading clients (Polymarket, Binance) and shared types
-  scripts/templates/       # Built-in bot script templates
-  security/                # Encryption key management
-
-web/client/                # React renderer (Vite)
-  src/pages/               # UI pages (Dashboard, Bots, Scripts, Wallets, Settings)
-  src/hooks/               # React Query hooks wrapping IPC calls
-  src/lib/electronApi.ts   # IPC call wrappers
-
-src/core/                  # Bot framework
-  BotManager.ts            # Orchestrates bot instances
-  BaseBotRunner.ts         # Abstract bot lifecycle
-  WalletManager.ts         # Encrypted wallet management
+packages/core/src/      all domain logic, no transport code (createCore, services, db, risk, orders,
+                        runtime, ledger, reconcile, recorder, exchange, security, ops/backup)
+apps/server/src/        Hono HTTP API, auth, SSE, /healthz, static UI, CLI, entrypoint; mcp/ (MCP tools,
+                        resources, /mcp transport) and mcp-stdio.ts (stdio proxy)
+apps/web/               React UI (Vite), fetch + EventSource client in src/lib/api.ts
+templates/              built-in bot templates
+config/*.example.yaml   config defaults (real files are created on first start)
+scripts/service.mjs     Windows service (NSSM) / launchd / systemd helper
+docs/SPEC.md, docs/PROGRESS.md
 ```
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `ENCRYPTION_KEY` | AES key for wallet encryption (`openssl rand -hex 32`) |
-| `RPC_URL` | Polygon RPC endpoint |
-| `CLOB_HTTP_URL` | Polymarket CLOB API URL |
 
 ---
 

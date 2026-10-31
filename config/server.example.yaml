@@ -1,0 +1,28 @@
+# BotLab server settings (spec §3, §11). Human-owned.
+# Copy to server.yaml (or start the app once and it is created with these defaults).
+timezone: Europe/Dublin              # time zone of the daily digest
+digest_time: "08:00"                 # local time (HH:MM) of the daily digest
+http:                                # web UI / API server (restart to apply; BOTLAB_HOST / BOTLAB_PORT override)
+  host: 127.0.0.1                    # this machine only; use the Tailscale IP on the home server; never public
+  port: 3780
+  allowed_hosts: []                  # extra host names for the UI (IPs, localhost and *.ts.net always work)
+recorder:                            # order-book snapshots for backtests (top 10 levels)
+  enabled: true
+  interval_seconds: 60
+  max_tokens: 200                    # tokens per cycle: bot scopes, active forecasts, held, watchlist
+agent:                               # scheduled AI agent (spec §7.1); needs ANTHROPIC_API_KEY in the environment
+  enabled: false                     # off until you switch it on (paper bots only; see README "Running the agent")
+  model: claude-sonnet-5-5           # or claude-opus-5-5 (about 2x the cost)
+  max_turns: 80                      # model turns per run; cost per run: limits.yaml agent.max_run_cost_usd
+  schedule:                          # local times in `timezone`; nothing between 00:00 and 07:00
+    review: "07:30"
+    cycles: ["11:30", "15:30", "19:30", "23:30"]
+  events:                            # maintenance runs on rules changes (held market), bot halts, reconciliation mismatches
+    enabled: true
+    max_per_day: 4                   # at most 4 (spec)
+    debounce_minutes: 30             # at most one per 30 minutes
+notify:
+  telegram:
+    enabled: false
+    bot_token: ""                    # from BotFather; the TELEGRAM_BOT_TOKEN environment variable overrides it
+    chat_id: ""                      # your private chat id; messages from any other chat are ignored
