@@ -195,6 +195,13 @@ On macOS and Linux, `npm run service:install` prints a launchd / systemd unit wi
 
 A `.env` file in the working directory is read at start.
 
+**`min_liquidity_usd` is 24 h volume.** Both `limits.yaml per_market.min_liquidity_usd` and `mandate.yaml
+markets.min_liquidity_usd` (default 5000; the larger applies) are compared with the market's Gamma **24 h volume**
+— by the forecast ledger, the risk engine and copy trading alike — not with order-book liquidity. On the
+2026-10-31 Mac test only a handful of in-mandate markets (economics / politics-non-us / weather-climate ending
+within 90 days) cleared $5,000 of 24 h volume, so most forecasts and bids in those categories were refused. If you
+want BotLab to trade more of them, consider lowering `min_liquidity_usd` (your call; the agent cannot change it).
+
 ## Access, API and tokens
 
 - **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days
@@ -474,14 +481,20 @@ superseded, withdrawn, no longer tradeable or the edge is gone. It never sells.
 |---|---|---|
 | `min_edge` | 0.05 | edge after fees, never below 0.03 (the risk engine checks it too) |
 | `kelly_fraction` | 0.25 | fraction of full Kelly |
-| `requote_minutes` | 10 | |
+| `requote_minutes` | 10 | how often quotes are recomputed |
+| `bid_ttl_minutes` | 60 | resting bids' lifetime (min 3); re-placed only when ≤ min(5 min, ttl / 2) remain or the price / size must change |
 | `max_per_market_usd` | 25 | this bot's cost + open bids per market |
 | `max_markets` | 10 | |
 | `min_edge_per_day` | 0.001 | quotes below this edge / day are skipped; **keep equal to the Position Manager's `min_hold_edge_per_day`** |
 
 It leaves its own resting bids out of the book (it never outbids itself) and keeps a bid while it is still at or
-above the best competing bid. After the Position Manager stops a position out, the token is skipped until its
-forecast is renewed. Each cycle it records the best edge per day it could not fund (read by the Position Manager).
+above the best competing bid. It quotes no more markets than `limits.yaml per_bot_defaults.max_orders_per_hour`
+can keep quoted (`ctx.risk.getBudget().ordersPerHour`; about 9 markets at 20/h with 60-minute bids) and places at
+most the orders left this hour. The hourly rate counts only orders a bot itself submitted (not risk rejections,
+not the Position Manager's exits placed for it); 6 risk rejections within 10 minutes pause a bot's own
+submissions until the window drains (`rejection_cooldown`). After the Position Manager stops a position out — on
+any bot's position in the same mode — the token is skipped until its forecast is renewed, and a token (or its
+complement) with an open exit flag on any bot's position is not bid on. Each cycle it records the best edge per day it could not fund (read by the Position Manager).
 
 **Position Manager** (`templates/position-manager.ts`, spec §9.2) — the only bot that can see other bots'
 positions (`ctx.portfolio`, granted by the server to this builtin template only; forks do not get it). It exits a
@@ -504,7 +517,9 @@ Positions bought without a forecast (copy trading, your own scripts) only get th
 ambiguity, flag, end); `ignore_bot_ids` leaves bots alone. Only a human creates, starts or reconfigures these two
 bots (the agent may pause them). Scripts cannot flag their own orders as risk exits; the owning bot's own
 `cancel` / `cancelAll` leave the manager's exits alone. Exits rest post-only first and become marketable
-(best bid − `escalate_slippage`) after `escalate_after_minutes` (30). Risk exits are exempt from hold time, order
+(best bid − `escalate_slippage`) after `escalate_after_minutes` (30). If the risk engine refuses the marketable
+exit (e.g. top of book below `min_top_of_book_usd`), the exit rests post-only one tick above the best bid instead
+and marketable is retried after 10 minutes: a triggered position always has an exit order. Risk exits are exempt from hold time, order
 size, rate and spread limits and pass from any bot stage (a retired bot's positions can still be exited), but not
 from halts: during a halt or kill switch nothing is sold (spec §4.3).
 
@@ -567,7 +582,7 @@ Without `copy` in `strategies.allow` a copy bot (human or agent) buys nothing; i
 | de-dup by timestamp, 20 rows | de-dup by transaction hash + log index (in `ctx.storage`), activity paginated until the last seen trade, `TRADE` rows only, oldest first; the first poll copies no backlog |
 | small-trade boost, own daily cap | size = `copy_fraction` (0.1) × leader USD or `fixed_usd`, capped by `max_order_usd` (25) and the risk budget (allocation, market room) |
 | no leader filtering | buys skipped below `min_leader_trade_usd` (10), above `max_leader_trades_per_day` (40), or within `mm_window_minutes` (30) of an opposite trade by the leader in the same market (market making) |
-| any market | buys only in markets passing the mandate (category, liquidity, horizon, **assessed** ambiguity; `ctx.risk.getMandateSummary`), no dispute / recent rules change, outside the Position Manager's exit window, no exit flag, not sold by the Position Manager in the last `pm_cooldown_days` (7) |
+| any market | buys only in markets passing the mandate (category, 24h volume ≥ `min_liquidity_usd`, horizon, **assessed** ambiguity; `ctx.risk.getMandateSummary`), no dispute / recent rules change, outside the Position Manager's exit window, no exit flag, not sold by the Position Manager in the last `pm_cooldown_days` (7) |
 
 **Leader scoring** (`copy_leaders`, `copy_trades`): every order a copy bot places carries the leader it copies, so
 each fill is attributed. A *copied trade* is a round trip in one token attributed to one leader (opened by a copied

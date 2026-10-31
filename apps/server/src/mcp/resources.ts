@@ -42,7 +42,7 @@ export const RESOURCES: ResourceDef[] = [
   {
     uri: 'botlab://config/mandate',
     name: 'mandate.yaml',
-    description: 'The human-owned mandate: categories (allow / later / deny), horizons, minimum liquidity, maximum ambiguity, strategies. Read only.',
+    description: 'The human-owned mandate: categories (allow / later / deny), horizons, minimum 24h volume (min_liquidity_usd), maximum ambiguity, strategies. Read only.',
     mimeType: 'application/json',
     read: (s, a) => configPart(s, a, 'mandate'),
   },
