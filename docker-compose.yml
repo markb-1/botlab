@@ -18,6 +18,8 @@ services:
       # Extra host names for the UI (IPs, localhost and *.ts.net always work)
       # BOTLAB_ALLOWED_HOSTS: botlab.lan
       # TELEGRAM_BOT_TOKEN: ...                    # or notify.telegram in config/server.yaml
+      # Scheduled agent (server.yaml agent.enabled: true): the key stays in the environment, never in a file
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # taken from the shell / an .env file next to this file
     secrets:
       - botlab_master_key
     volumes:

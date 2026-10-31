@@ -426,9 +426,36 @@ export function agentRoutes(agent: CoreServices['agent']): RouteDef[] {
     { method: 'get', path: '/api/agent/budget', handler: () => agent.budget() },
     { method: 'get', path: '/api/agent/runs', handler: ({ query }) => agent.listRuns(queryNumber(query('limit')), query('before') || undefined) },
     { method: 'get', path: '/api/agent/runs/:id', handler: ({ param }) => agent.getRun(param('id')) },
+    // The run's MCP calls from the audit log (Agent page transcript); admin + readonly like /api/audit
+    { method: 'get', path: '/api/agent/runs/:id/calls', handler: ({ param }) => agent.runCalls(param('id')) },
     { method: 'get', path: '/api/agent/notes', handler: ({ query }) => agent.listNotes({ scope: query('scope'), query: query('q'), limit: queryNumber(query('limit')) }) },
     { method: 'delete', path: '/api/agent/notes/:id', handler: ({ param, actor }) => agent.deleteNote(param('id'), actor()) },
     { method: 'get', path: '/api/agent/exit-flags', handler: ({ query }) => agent.listExitFlags(query('status')) },
+  ];
+}
+
+/** What the agent control routes need from the server's AgentScheduler (4b) */
+export interface AgentControl {
+  status(): unknown;
+  runNow(kind: unknown): Promise<unknown>;
+  cancel(): unknown;
+}
+
+/**
+ * Scheduled agent (4b): schedule / next runs / active run (admin + readonly); "Run now" and cancel are
+ * admin only (the agent cannot start or stop runner processes).
+ */
+export function agentControlRoutes(control: AgentControl): RouteDef[] {
+  return [
+    { method: 'get', path: '/api/agent/schedule', handler: () => control.status() },
+    {
+      method: 'post',
+      path: '/api/agent/runs',
+      allow: ADMIN,
+      handler: ({ body }) => control.runNow((body as { kind?: unknown } | undefined)?.kind ?? 'cycle'),
+      message: 'Agent run started',
+    },
+    { method: 'post', path: '/api/agent/runs/current/cancel', allow: ADMIN, handler: () => control.cancel() },
   ];
 }
 

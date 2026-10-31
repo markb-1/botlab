@@ -32,6 +32,8 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --from=build --chown=node:node /app/apps/web/dist ./apps/web/dist
 COPY --from=build --chown=node:node /app/templates ./templates
+# The agent runner (dist/apps/agent/src) reads its versioned system prompt from here
+COPY --from=build --chown=node:node /app/apps/agent/prompts ./apps/agent/prompts
 USER node
 VOLUME ["/data", "/config"]
 EXPOSE 3780

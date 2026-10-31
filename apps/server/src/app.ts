@@ -12,7 +12,7 @@ import { isHostAllowed } from './http/hosts';
 import { healthReport } from './http/health';
 import { SseHub } from './http/sse';
 import { serveWeb } from './http/static';
-import { apiRoutes } from './routes/api';
+import { agentControlRoutes, apiRoutes, type AgentControl } from './routes/api';
 import { registerAuthRoutes, LoginLimiter } from './routes/auth';
 import { mountMcp } from './mcp/http';
 
@@ -29,6 +29,8 @@ export interface AppOptions {
   limiter?: LoginLimiter;
   /** The server is bound to loopback only: first-run setup from this machine needs no setup code */
   loopbackOnly?: boolean;
+  /** The scheduled agent (4b); without it the schedule / run-now routes answer 409 */
+  agent?: AgentControl;
 }
 
 export interface BotLabApp {
@@ -68,7 +70,12 @@ export function createApp(opts: AppOptions): BotLabApp {
   });
 
   registerAuthRoutes(app, core, { lockReason: opts.lockReason ?? (() => null), limiter: opts.limiter, loopbackOnly: opts.loopbackOnly ?? false });
-  mountRoutes(app, apiRoutes(core.services), {
+  const agentControl: AgentControl = opts.agent ?? {
+    status: () => null,
+    runNow: () => Promise.reject(new HttpError(409, 'conflict', 'The agent scheduler is not running in this process')),
+    cancel: () => ({ cancelled: false, runId: null }),
+  };
+  mountRoutes(app, [...apiRoutes(core.services), ...agentControlRoutes(agentControl)], {
     before: (actor, name) => core.services.agent.beforeToolCall(name, actor),
     after: (runId, action) => core.services.agent.afterToolCall(runId, action),
   });

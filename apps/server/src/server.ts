@@ -17,6 +17,7 @@ import { listSecrets } from '../../../packages/core/src/security/migrateSecrets'
 import { loadMasterKey, type LoadedMasterKey } from './masterKey';
 import { acquireInstanceLock } from './instanceLock';
 import { isProduction, resolveDataDir, resolveWebDir } from './paths';
+import { AgentScheduler } from './agent/AgentScheduler';
 
 export interface ServerOptions {
   env?: NodeJS.ProcessEnv;
@@ -32,6 +33,8 @@ export interface ServerOptions {
   webDir?: string | null;
   /** Default true */
   backups?: boolean;
+  /** Agent scheduler options (tests inject a fake runner) */
+  agent?: Partial<Pick<ConstructorParameters<typeof AgentScheduler>[0], 'spawnRunner' | 'tickMs' | 'now' | 'runTimeoutMs' | 'stopGraceMs' | 'killGraceMs'>>;
   log?: (msg: string) => void;
 }
 
@@ -45,6 +48,8 @@ export interface RunningServer {
   lockReason: string | null;
   /** The first-run setup code printed at boot (null when an admin password exists) */
   setupCode: string | null;
+  /** Scheduled agent runs (spec §7.1); idle unless server.yaml agent.enabled */
+  agent: AgentScheduler;
   /** Graceful stop; `clean` is false when the core shutdown timed out */
   close(opts?: { timeoutMs?: number }): Promise<{ clean: boolean }>;
 }
@@ -107,7 +112,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     const webDir = opts.webDir === undefined ? resolveWebDir(env) : opts.webDir;
 
     const loopbackOnly = host === 'localhost' || host === '::1' || /^127\./.test(host);
-    const { app, sse } = createApp({ core: c, webDir, allowedHosts, loopbackOnly, lockReason: () => lockReason, unlockedAt: () => unlockedAt });
+    // The runner reaches /mcp on this server: loopback when bound to all interfaces, else the bound address
+    let mcpUrl: string | null = null;
+    const agent = new AgentScheduler({ core: c, env, mcpUrl: () => mcpUrl, ...opts.agent });
+    const { app, sse } = createApp({ core: c, webDir, allowedHosts, loopbackOnly, lockReason: () => lockReason, unlockedAt: () => unlockedAt, agent });
 
     // First run: a one-time setup code guards /api/auth/setup against whoever reaches the UI first
     let setupCode: string | null = null;
@@ -132,6 +140,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
     const shownHost = address.family === 'IPv6' ? `[${address.address}]` : address.address;
     const url = `http://${host === '0.0.0.0' || host === '::' ? '127.0.0.1' : shownHost}:${address.port}`;
     log(`[Server] Listening on http://${shownHost}:${address.port}${webDir ? '' : ' (API only: web UI not built)'}`);
+    const mcpHost = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : shownHost;
+    mcpUrl = `http://${mcpHost}:${address.port}/mcp`;
+    agent.start();
     if (host === '0.0.0.0' || host === '::') {
       console.warn(
         `[Server] WARNING: bound to ${host} — reachable from every network interface. BotLab must never be exposed publicly: ` +
@@ -144,6 +155,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
       if (closing) return closing;
       closing = (async () => {
         log('[Server] Shutting down...');
+        await agent.stop().catch((err) => console.error('[Server] Error stopping the agent scheduler:', err));
         sse.closeAll();
         await new Promise<void>((resolve) => {
           server.close(() => resolve());
@@ -165,7 +177,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<RunningServ
 
     const { key: _key, ...masterInfo } = master;
     void _key;
-    return { core: c, url, host, port: address.port, dataDir, masterKey: masterInfo, lockReason, setupCode, close };
+    return { core: c, url, host, port: address.port, dataDir, masterKey: masterInfo, lockReason, setupCode, agent, close };
   } catch (err) {
     if (core) {
       await core.shutdown({ timeoutMs: 10_000 }).catch(() => undefined);

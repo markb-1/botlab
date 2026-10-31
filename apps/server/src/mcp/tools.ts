@@ -488,7 +488,7 @@ export const TOOLS: ToolDef[] = [
     name: 'start_run',
     group: 'operate',
     description:
-      'Start an agent run (one at a time; refused when this month’s LLM budget is used up). Returns the budget (incl. max_run_cost_usd, max_tool_calls_per_run and max_tool_calls_per_hour) and the last run. Calls are counted per run and per hour; after a cap only finish_run and kill_switch work. Risk: none.',
+      'Start an agent run (one at a time; refused when this month’s LLM budget is used up). When the BotLab runner started you, the server has already opened your run and this returns it (with its kind: review, cycle or event). Returns the budget (incl. max_run_cost_usd, max_tool_calls_per_run and max_tool_calls_per_hour) and the last run. Calls are counted per run and per hour; after a cap only finish_run and kill_switch work. Risk: none.',
     input: StartRunSchema,
     run: (a, { services, actor }) => services.agent.startRun({ trigger: a.trigger }, actor),
   }),
