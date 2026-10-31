@@ -3,7 +3,10 @@
  * `node dist/apps/server/src/cli.js <command>`. Paths follow the server: BOTLAB_DATA_DIR, else
  * `./data`, or the OS app-data dir with `--prod` (as `npm start` uses). `--data-dir <dir>` overrides.
  *
- *   migrate-key [--password <pw>]    one-time: re-encrypt an old database's secrets with the master key
+ *   migrate-key                       one-time: re-encrypt an old database's secrets with the master key
+ *                                     (old password: prompt or BOTLAB_OLD_PASSWORD; --password <pw> works but
+ *                                     is discouraged; asks for a new admin password if none would be set,
+ *                                     or BOTLAB_NEW_ADMIN_PASSWORD)
  *   gen-key                           create <data dir>/master.key (never overwrites)
  *   set-password [--password <pw>]   set / reset the admin login password (logs out every session)
  *   token create --scope agent|readonly [--name <name>]
@@ -24,7 +27,7 @@ import { AdminAuthStore, MIN_PASSWORD_LENGTH, type TokenScope } from '../../../p
 import { isProduction, resolveDataDir } from './paths';
 import { defaultKeyFile, generateKeyFile, loadMasterKey, MasterKeyError } from './masterKey';
 import { lockHolder } from './instanceLock';
-import { migrateKey, needsPassword } from './migrateKey';
+import { migrateKey, needsNewAdminPassword, needsPassword } from './migrateKey';
 import fs from 'fs';
 import path from 'path';
 
@@ -72,7 +75,7 @@ function promptHidden(question: string): Promise<string> {
 
 function usage(): never {
   console.log(`Usage: npm run cli -- <command> [--prod] [--data-dir <dir>]
-  migrate-key [--password <pw>]
+  migrate-key            (old password prompted, or BOTLAB_OLD_PASSWORD)
   gen-key
   set-password [--password <pw>]
   token create --scope agent|readonly [--name <name>]
@@ -112,14 +115,27 @@ async function main(): Promise<void> {
         const holder = lockHolder(dataDir);
         if (holder) throw new Error(`The BotLab server (pid ${holder.pid}) is running on ${dataDir}: stop it first`);
         const master = loadMasterKey({ dataDir, production: false, log: (m) => console.warn(m) });
-        let password = typeof flags.password === 'string' ? flags.password : undefined;
-        if (!password && needsPassword(db)) password = await promptHidden('Old BotLab password: ');
-        const r = await migrateKey(db, master.key, password);
+        // Old password: hidden prompt or BOTLAB_OLD_PASSWORD; --password works but lands in shell history
+        let oldPassword = process.env.BOTLAB_OLD_PASSWORD || undefined;
+        if (typeof flags.password === 'string') {
+          console.warn('Note: --password is visible in your shell history and process list; prefer the prompt or BOTLAB_OLD_PASSWORD.');
+          oldPassword = flags.password;
+        }
+        if (!oldPassword && needsPassword(db)) oldPassword = await promptHidden('Old BotLab password: ');
+        let newAdminPassword = process.env.BOTLAB_NEW_ADMIN_PASSWORD || undefined;
+        if (!newAdminPassword && needsNewAdminPassword(db, oldPassword)) {
+          if (!process.stdin.isTTY) throw new Error('No admin password would be set: set BOTLAB_NEW_ADMIN_PASSWORD or run this in a terminal');
+          console.log(`Choose the admin login password for the web UI (at least ${MIN_PASSWORD_LENGTH} characters).`);
+          newAdminPassword = await promptHidden('New admin password: ');
+          if ((await promptHidden('Repeat: ')) !== newAdminPassword) throw new Error('Passwords do not match');
+        }
+        const r = await migrateKey(db, master.key, { oldPassword, newAdminPassword });
         if (r.status === 'already-migrated') console.log('Already using this master key: nothing to do.');
         else if (r.status === 'nothing-to-do') console.log('No password-derived key in this database: master key recorded, nothing to re-encrypt.');
         else {
           console.log(`Re-encrypted ${r.reencrypted.length} secret(s) with the master key${master.file ? ` (${master.file})` : ''}: ${r.reencrypted.join(', ') || 'none'}`);
-          console.log(r.adminPasswordSet ? 'Your old password is now the admin login password.' : 'Set the admin login password on the first visit to the web UI (or with `set-password`).');
+          if (r.adminPassword === 'old') console.log('Your old password is now the admin login password.');
+          else if (r.adminPassword === 'new') console.log('The new admin login password is set.');
         }
         if (!production && master.source === 'generated') console.log('Start the server with the same data dir so it uses this key.');
         break;

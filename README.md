@@ -30,8 +30,10 @@ npm install
 npm run dev          # then open http://localhost:3000
 ```
 
-Open the UI and choose an **admin password** (first-run setup). In dev, data lives in `./data` and the
-config files in `./config` (created with defaults on first start).
+Open the UI and choose an **admin password** (first-run setup). From the same machine (server bound to
+127.0.0.1) that is all; from anywhere else (another device, Tailscale, Docker) the setup screen also asks
+for the **one-time setup code** the server prints in its log at start. In dev, data lives in `./data` and
+the config files in `./config` (created with defaults on first start).
 
 **Production mode** (built server serving the built UI, data in the OS app-data dir):
 
@@ -73,7 +75,8 @@ The image builds for `linux/amd64` and `linux/arm64` (`docker buildx build --pla
 
 ## First run, paper mode and going live
 
-1. Open the UI, set the admin password.
+1. Open the UI, set the admin password (with the setup code from the log when not on the server
+   itself: `docker compose logs botlab | grep "Setup code"`).
 2. Create a bot from a template — new bots are **paper** bots (simulated balance, real market data).
 3. Live trading is **off** until you enable it explicitly: add a wallet (Wallets page), set
    `live_trading.enabled: true` in `limits.yaml`, and create the bot in **Live** mode. Until then live
@@ -109,13 +112,15 @@ dir as the Electron app on macOS and Windows, so it finds your database; the ser
 
 ```bash
 # stop the server first
-npm run migrate-key -- --prod --password "<your old BotLab password>"
-#   (omit --password to be asked; a "skipped password" install needs none; use --data-dir for another location)
+npm run migrate-key -- --prod
+#   asks for your old BotLab password (hidden; or set BOTLAB_OLD_PASSWORD). A "skipped password" install
+#   needs none. --password <pw> also works but ends up in your shell history. --data-dir for another location.
 npm start
 ```
 
-This re-encrypts every secret with the master key (creating `master.key` if none is configured) and makes
-your old password the admin login password (if it has 8+ characters; otherwise you choose one in the UI).
+This re-encrypts every secret with the master key (creating `master.key` if none is configured), in one
+transaction (a wrong password changes nothing), and makes your old password the admin login password if it
+has 8+ characters; otherwise it asks for a new admin password (or `BOTLAB_NEW_ADMIN_PASSWORD`).
 If you edited `config/*.yaml` in the repo while using Electron in dev, copy them into the production config
 dir (table above); otherwise defaults are created there.
 
@@ -131,8 +136,12 @@ npm run service:install             # in an elevated PowerShell (Run as Administ
 
 This registers the **BotLab** Windows service (delayed auto-start at boot, no login needed; restart on
 crash; graceful stop via Ctrl+C so the clean-shutdown marker is written; logs in
-`%APPDATA%\BotLab\logs\service.log`). It pins the data/config dirs and the master key file to your
-user's `%APPDATA%\BotLab` (the service runs as LocalSystem). `npm run service:uninstall` removes it.
+`%APPDATA%\BotLab\logs\service.log`). It runs as **your Windows account**, not LocalSystem: the script
+asks for your Windows password (hidden; for a Microsoft account the account password, not the PIN) and
+NSSM grants the account "Log on as a service". If that fails it removes the service and explains how to
+set the account in `services.msc` → Log On. The data/config dirs and the master key file are passed
+explicitly (`%APPDATA%\BotLab`). When you change your Windows password, update it in `services.msc` too.
+`npm run service:uninstall` removes the service.
 After `git pull`: `npm install`, `npm run build`, `nssm restart BotLab`.
 
 Power and updates (spec §15.1): set **Sleep: Never** (Settings → System → Power), keep the PC on a UPS
@@ -164,16 +173,21 @@ A `.env` file in the working directory is read at start.
 
 - **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days
   max). Human-only actions (clear a halt, config writes/restores, position adoption, market ambiguity,
-  forcing category rights, creating API tokens) also need the password entered within the last
-  15 minutes; the UI asks for it when needed.
+  forcing category rights, wallets, Binance credentials, settings, creating API tokens) also need the
+  password entered within the last 15 minutes; the UI asks for it when needed.
+- **Password guessing**: 5 wrong passwords per 15 minutes per client address, then 429. Behind a local
+  proxy such as `tailscale serve`, every client arrives from 127.0.0.1, so logins share one bucket
+  (someone guessing can lock you out for 15 minutes; re-auth is keyed per session). Use the CLI
+  (`set-password`) if you are ever locked out of a fresh setup.
 - **HTTP API**: `/api/*`, JSON `{ success, data?, error?, code? }`; mutations need the `X-BotLab: 1`
   header when using the cookie. Events: `GET /api/events` (server-sent events: `bot:event`, `bot:log`,
   `risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`). Health: `GET /healthz`
   (no auth; 503 when the DB fails, the server is locked, the reconciler is stale > 3 min or a bot
   worker crashed).
 - **API tokens** (`Authorization: Bearer blt_…`): scope `agent` (for the MCP agent in Phase 4: read,
-  scripts, backtests, bot create/start/stop, forecasts, kill switch — never wallets, credentials,
-  settings, config writes or halt clearing) or `readonly` (GET only).
+  scripts, backtests, paper bot create / config update / start / stop, forecasts, kill switch — never
+  wallets, credentials, settings, config writes or halt clearing) or `readonly` (GET only, and not
+  wallets, settings, config or script export).
   `npm run cli -- token create --scope agent --name mcp` · `token list` · `token revoke <id>`.
 - Forgot the admin password: `npm run cli -- set-password` (add `--prod` for the `npm start` data dir).
 

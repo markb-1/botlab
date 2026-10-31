@@ -112,12 +112,12 @@ describe.skipIf(!sqliteAvailable)('master key check and migrate-key', () => {
     const db2 = initializeDatabase(path.join(dataDir, 'botlab.db'));
     try {
       const before = db2.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string };
-      await expect(migrateKey(db2, master, undefined)).rejects.toThrow(/--password/);
-      await expect(migrateKey(db2, master, 'wrong')).rejects.toThrow(/Incorrect password/);
+      await expect(migrateKey(db2, master)).rejects.toThrow(/BOTLAB_OLD_PASSWORD/);
+      await expect(migrateKey(db2, master, { oldPassword: 'wrong' })).rejects.toThrow(/Incorrect password/);
       expect((db2.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string }).v).toBe(before.v);
 
-      const r = await migrateKey(db2, master, 'old password 1');
-      expect(r).toMatchObject({ status: 'migrated', adminPasswordSet: true });
+      const r = await migrateKey(db2, master, { oldPassword: 'old password 1' });
+      expect(r).toMatchObject({ status: 'migrated', adminPassword: 'old' });
       expect(r.reencrypted.sort()).toEqual(['settings.binance_api_key_encrypted', 'settings.binance_api_secret_encrypted', 'wallet:w1']);
       const w = db2.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string };
       expect(decrypt(w.v, master)).toBe('ab'.repeat(32));
@@ -127,7 +127,7 @@ describe.skipIf(!sqliteAvailable)('master key check and migrate-key', () => {
       expect(s.password_hash).toBeNull();
       expect(await new AdminAuthStore(db2).verifyAdminPassword('old password 1')).toBe(true);
       // Idempotent
-      expect((await migrateKey(db2, master, undefined)).status).toBe('already-migrated');
+      expect((await migrateKey(db2, master)).status).toBe('already-migrated');
     } finally {
       closeDatabase(db2);
     }
@@ -135,13 +135,21 @@ describe.skipIf(!sqliteAvailable)('master key check and migrate-key', () => {
     await bootAndUnlock(dataDir, master);
   }, 60_000);
 
-  it('a skipped-password database migrates without a password', async () => {
+  it('a skipped-password database needs no old password but must get an admin password (all or nothing)', async () => {
     const dataDir = path.join(mkTmp(), 'data');
     const master = hex();
     const db = legacyDb(dataDir, null);
     try {
-      const r = await migrateKey(db, master, undefined);
-      expect(r).toMatchObject({ status: 'migrated', adminPasswordSet: false });
+      const before = db.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string };
+      // No admin password would be set ⇒ refused before anything is written
+      await expect(migrateKey(db, master)).rejects.toThrow(/admin password/);
+      await expect(migrateKey(db, master, { newAdminPassword: 'short' })).rejects.toThrow(/at least 8/);
+      expect((db.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string }).v).toBe(before.v);
+      expect((db.prepare("SELECT password_salt FROM settings WHERE id = 'global'").get() as { password_salt: string | null }).password_salt).not.toBeNull();
+
+      const r = await migrateKey(db, master, { newAdminPassword: 'brand new admin pw' });
+      expect(r).toMatchObject({ status: 'migrated', adminPassword: 'new' });
+      expect(await new AdminAuthStore(db).verifyAdminPassword('brand new admin pw')).toBe(true);
       const w = db.prepare("SELECT private_key_encrypted AS v FROM wallets WHERE id = 'w1'").get() as { v: string };
       expect(decrypt(w.v, master)).toBe('ab'.repeat(32));
     } finally {
@@ -149,4 +157,21 @@ describe.skipIf(!sqliteAvailable)('master key check and migrate-key', () => {
     }
     await bootAndUnlock(dataDir, master);
   }, 60_000);
+});
+
+describe('instance lock', () => {
+  it('one server per data dir: a live holder refuses, a stale lock (dead pid) is replaced', async () => {
+    const { acquireInstanceLock, lockFile } = await import('../../apps/server/src/instanceLock');
+    const dir = mkTmp();
+    const boot = Date.now() - os.uptime() * 1000;
+    // Stale: a pid that does not exist
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: 2 ** 22 + 12345, host: os.hostname(), bootTime: boot, startedAt: 'earlier' }));
+    const release = acquireInstanceLock(dir);
+    expect(JSON.parse(fs.readFileSync(lockFile(dir), 'utf8')).pid).toBe(process.pid);
+    release();
+    expect(fs.existsSync(lockFile(dir))).toBe(false);
+    // Live: our parent process on this host and boot
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: process.ppid, host: os.hostname(), bootTime: boot, startedAt: 'now' }));
+    expect(() => acquireInstanceLock(dir)).toThrow(/Another BotLab server/);
+  });
 });

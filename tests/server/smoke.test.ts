@@ -74,6 +74,7 @@ describe.skipIf(!sqliteAvailable)('server smoke test', () => {
 
   it('boots unlocked on a fresh data dir; /healthz is healthy and minimal', async () => {
     expect(server!.lockReason).toBeNull();
+    expect(server!.setupCode).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/); // printed to the log on first run
     expect(server!.masterKey.source).toBe('env');
     const h = await api('GET', '/healthz');
     expect(h.status).toBe(200);
@@ -142,6 +143,13 @@ describe.skipIf(!sqliteAvailable)('server smoke test', () => {
     expect(asset.headers.get('cache-control')).toMatch(/immutable/);
     expect((await api('GET', '/assets/missing.js')).status).toBe(404);
     expect((await api('GET', '/../../package.json')).text).not.toContain('"name": "botlab"');
+    // Encoded traversal, incl. backslashes (a separator on Windows): never a file outside the web dir
+    fs.writeFileSync(path.join(tmp, 'outside-secret.txt'), 'TOP SECRET');
+    for (const p of ['/..%2foutside-secret.txt', '/..%5coutside-secret.txt', '/assets/..%2f..%2foutside-secret.txt', '/assets/..%5c..%5coutside-secret.txt', '/%2e%2e%5coutside-secret.txt', '/..%5c..%5c..%5cetc%5cpasswd']) {
+      const r = await api('GET', p);
+      expect({ p, leaked: r.text.includes('TOP SECRET') || r.text.includes('root:') }).toEqual({ p, leaked: false });
+      expect([400, 404]).toContain(r.status);
+    }
     const missing = await api('GET', '/api/nope');
     expect(missing.status).toBe(404);
     expect(missing.json).toMatchObject({ success: false, code: 'not_found' });

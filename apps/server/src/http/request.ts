@@ -6,8 +6,9 @@ export function clientAddress(c: Context): string {
   return env?.incoming?.socket?.remoteAddress ?? 'local';
 }
 
-function isLoopback(addr: string): boolean {
-  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1' || addr === 'local';
+/** Loopback peer (`local` = in-process request, tests) */
+export function isLoopbackAddress(addr: string): boolean {
+  return addr === 'local' || addr === '::1' || /^(::ffff:)?127\./.test(addr);
 }
 
 /**
@@ -16,5 +17,5 @@ function isLoopback(addr: string): boolean {
  */
 export function isHttps(c: Context): boolean {
   if (new URL(c.req.url).protocol === 'https:') return true;
-  return c.req.header('x-forwarded-proto') === 'https' && isLoopback(clientAddress(c));
+  return c.req.header('x-forwarded-proto') === 'https' && isLoopbackAddress(clientAddress(c));
 }

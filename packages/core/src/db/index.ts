@@ -535,6 +535,8 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     // 3b: server auth (spec §8.2) and master-key check (§8.3)
     'ALTER TABLE settings ADD COLUMN admin_password_hash TEXT',
     'ALTER TABLE settings ADD COLUMN key_check TEXT',
+    // 3b review: one-time first-run setup code (SHA-256), printed to the server log
+    'ALTER TABLE settings ADD COLUMN setup_code_hash TEXT',
     `CREATE TABLE IF NOT EXISTS auth_sessions (
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,

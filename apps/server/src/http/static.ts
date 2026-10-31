@@ -47,7 +47,8 @@ export function serveWeb(webDir: string) {
     } catch {
       return c.text('Bad request', 400);
     }
-    if (rel.includes('\0')) return c.text('Bad request', 400);
+    // NUL, or a backslash (a path separator on Windows: `..%5c` must not climb out of the web dir)
+    if (rel.includes('\0') || rel.includes('\\')) return c.text('Bad request', 400);
     const file = path.resolve(root, `.${path.posix.normalize(rel)}`);
     // Never outside the web dir (path.relative handles Windows drive letters and separators)
     const inside = path.relative(root, file);

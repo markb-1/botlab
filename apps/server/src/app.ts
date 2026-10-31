@@ -26,6 +26,8 @@ export interface AppOptions {
   /** When unlock finished (health: reconciler "starting" grace period) */
   unlockedAt?: () => number | null;
   limiter?: LoginLimiter;
+  /** The server is bound to loopback only: first-run setup from this machine needs no setup code */
+  loopbackOnly?: boolean;
 }
 
 export interface BotLabApp {
@@ -64,7 +66,7 @@ export function createApp(opts: AppOptions): BotLabApp {
     c.header('Cache-Control', 'no-store');
   });
 
-  registerAuthRoutes(app, core, { lockReason: opts.lockReason ?? (() => null), limiter: opts.limiter });
+  registerAuthRoutes(app, core, { lockReason: opts.lockReason ?? (() => null), limiter: opts.limiter, loopbackOnly: opts.loopbackOnly ?? false });
   mountRoutes(app, apiRoutes(core.services));
 
   app.get('/api/app/info', (c) => {

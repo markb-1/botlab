@@ -3,7 +3,7 @@ import type { SessionInfo } from '../hooks/useAuth';
 
 interface LoginScreenProps {
   session: SessionInfo | null;
-  onSetup: (password: string) => Promise<void>;
+  onSetup: (password: string, setupCode?: string) => Promise<void>;
   onLogin: (password: string) => Promise<void>;
   error: string | null;
   setError: (error: string | null) => void;
@@ -15,9 +15,11 @@ const MIN_PASSWORD = 8;
 export function LoginScreen({ session, onSetup, onLogin, error, setError }: LoginScreenProps) {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [setupCode, setSetupCode] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const isSetup = session?.needsSetup ?? false;
+  const needsCode = isSetup && (session?.setupCodeRequired ?? false);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -25,11 +27,12 @@ export function LoginScreen({ session, onSetup, onLogin, error, setError }: Logi
     if (isSetup) {
       if (password !== confirmPassword) return setError('Passwords do not match');
       if (password.length < MIN_PASSWORD) return setError(`Password must be at least ${MIN_PASSWORD} characters`);
+      if (needsCode && !setupCode.trim()) return setError('Enter the setup code from the server log');
     }
     setIsSubmitting(true);
     setError(null);
     try {
-      await (isSetup ? onSetup(password) : onLogin(password));
+      await (isSetup ? onSetup(password, needsCode ? setupCode.trim() : undefined) : onLogin(password));
     } catch {
       // error shown by the hook
     } finally {
@@ -56,9 +59,9 @@ export function LoginScreen({ session, onSetup, onLogin, error, setError }: Logi
             </div>
           )}
 
-          {session && !session.unlocked && session.lockReason && (
+          {session && !session.unlocked && (
             <div className="mb-4 bg-yellow-500/10 border border-yellow-500/20 rounded-lg px-4 py-2.5">
-              <p className="text-sm text-yellow-300">Server is locked: {session.lockReason}</p>
+              <p className="text-sm text-yellow-300">The server is locked (master key problem). Sign in to see why, or check the server log.</p>
             </div>
           )}
 
@@ -83,6 +86,23 @@ export function LoginScreen({ session, onSetup, onLogin, error, setError }: Logi
                 disabled={isSubmitting}
               />
             </div>
+            {needsCode && (
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1.5">Setup code (printed in the server log)</label>
+                <input
+                  type="text"
+                  autoComplete="one-time-code"
+                  value={setupCode}
+                  onChange={(e) => {
+                    setSetupCode(e.target.value);
+                    setError(null);
+                  }}
+                  placeholder="ABCD-EFGH"
+                  className={inputClass}
+                  disabled={isSubmitting}
+                />
+              </div>
+            )}
             {isSetup && (
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-1.5">Confirm password</label>

@@ -3,11 +3,13 @@
  * input parsed by the shared schemas (`services/schemas.ts`) and the actor derived from the principal.
  *
  * Scopes (spec §8.2, §4.6, §7.3): GET routes are open to admin and readonly tokens unless noted;
- * mutations are admin-only. The agent scope is granted only where the MCP tool list of §7.3 has a
- * counterpart (scripts, backtests, bot create/update/start/stop, forecasts, kill switch, recorder
- * watchlist and read routes); never wallets, credentials, settings, config writes or anything in §4.6.
- * Human-only admin actions (clear halt, config write/restore, adopt, set ambiguity, force rights,
- * API tokens) also need a password check within 15 minutes (`recentAuth`).
+ * mutations are admin-only. Wallets, settings (credentials, API keys) and script export are admin-only
+ * even for reads (`ADMIN`). The agent scope is granted only where the MCP tool list of §7.3 has a
+ * counterpart (scripts, backtests, bot create/update(config only)/start/stop, forecasts, kill switch,
+ * recorder watchlist and read routes); never wallets, credentials, settings, config writes or anything
+ * in §4.6. Human-only admin actions (§4.6: clear halt, config write/restore, adopt, set ambiguity, force
+ * rights; wallets and exchange credentials; settings; API tokens) also need a password check within
+ * 15 minutes (`recentAuth`).
  */
 
 import type { CoreServices } from '../../../../packages/core/src/core';
@@ -41,6 +43,7 @@ import type { Scope } from '../http/principal';
 
 const READ_ALL: Scope[] = ['admin', 'readonly', 'agent'];
 const ADMIN_AGENT: Scope[] = ['admin', 'agent'];
+const ADMIN: Scope[] = ['admin'];
 
 // ── Bots ────────────────────────────────────────────────────────────────
 
@@ -55,49 +58,51 @@ export function botRoutes(bots: CoreServices['bots']): RouteDef[] {
     { method: 'get', path: '/api/dashboard/stats', handler: () => bots.dashboardStats() },
     { method: 'get', path: '/api/trades', handler: ({ query }) => bots.allTrades(queryNumber(query('hours'))) },
     { method: 'get', path: '/api/bots/:id', allow: READ_ALL, handler: ({ param }) => bots.get(param('id')) },
-    { method: 'post', path: '/api/bots', allow: ADMIN_AGENT, handler: ({ body, actor }) => bots.create(parseInput(BotCreateSchema, body), actor()) },
-    { method: 'patch', path: '/api/bots/:id', allow: ADMIN_AGENT, handler: ({ param, body, actor }) => bots.update(param('id'), parseInput(BotUpdateSchema, body), actor()) },
-    { method: 'delete', path: '/api/bots/:id', handler: ({ param, actor }) => bots.delete(param('id'), actor()) },
-    { method: 'post', path: '/api/bots/:id/start', allow: ADMIN_AGENT, handler: ({ param, actor }) => bots.start(param('id'), actor()) },
-    { method: 'post', path: '/api/bots/:id/stop', allow: ADMIN_AGENT, handler: ({ param, actor }) => bots.stop(param('id'), actor()) },
-    { method: 'post', path: '/api/bots/:id/restart', allow: ADMIN_AGENT, handler: ({ param, actor }) => bots.restart(param('id'), actor()) },
-    { method: 'get', path: '/api/bots/:id/trades', allow: READ_ALL, handler: ({ param, query }) => bots.trades(param('id'), queryNumber(query('hours'))) },
-    { method: 'get', path: '/api/bots/:id/positions', allow: READ_ALL, handler: ({ param }) => bots.positions(param('id')) },
-    { method: 'get', path: '/api/bots/:id/stats', allow: READ_ALL, handler: ({ param }) => bots.stats(param('id')) },
+    { method: 'post', path: '/api/bots', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ body, actor }) => bots.create(parseInput(BotCreateSchema, body), actor()) },
+    { method: 'patch', path: '/api/bots/:id', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, body, actor }) => bots.update(param('id'), parseInput(BotUpdateSchema, body), actor()) },
+    { method: 'delete', path: '/api/bots/:id', domainErrors: 'conflict', handler: ({ param, actor }) => bots.delete(param('id'), actor()) },
+    { method: 'post', path: '/api/bots/:id/start', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.start(param('id'), actor()) },
+    { method: 'post', path: '/api/bots/:id/stop', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.stop(param('id'), actor()) },
+    { method: 'post', path: '/api/bots/:id/restart', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ param, actor }) => bots.restart(param('id'), actor()) },
+    { method: 'get', path: '/api/bots/:id/trades', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param, query }) => bots.trades(param('id'), queryNumber(query('hours'))) },
+    { method: 'get', path: '/api/bots/:id/positions', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.positions(param('id')) },
+    { method: 'get', path: '/api/bots/:id/stats', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => bots.stats(param('id')) },
   ];
 }
 
-// ── Wallets (human only, spec §4.6) ─────────────────────────────────────
+// ── Wallets (human only, spec §4.6; changes need a recent password check) ─
 
 export function walletRoutes(wallets: CoreServices['wallets']): RouteDef[] {
   return [
-    { method: 'get', path: '/api/wallets', handler: ({ query }) => wallets.list(parseInput(WalletListFilterSchema, { available: queryBool(query('available')) })) },
-    { method: 'get', path: '/api/wallets/:id', handler: ({ param }) => wallets.get(param('id')) },
-    { method: 'post', path: '/api/wallets', handler: ({ body }) => wallets.create(parseInput(WalletCreateSchema, body)) },
-    { method: 'patch', path: '/api/wallets/:id', handler: ({ param, body }) => wallets.update(param('id'), parseInput(WalletUpdateSchema, body)) },
-    { method: 'delete', path: '/api/wallets/:id', handler: ({ param }) => wallets.delete(param('id')) },
-    { method: 'get', path: '/api/wallets/:id/balance', handler: ({ param }) => wallets.balance(param('id')) },
+    { method: 'get', path: '/api/wallets', allow: ADMIN, handler: ({ query }) => wallets.list(parseInput(WalletListFilterSchema, { available: queryBool(query('available')) })) },
+    { method: 'get', path: '/api/wallets/:id', allow: ADMIN, handler: ({ param }) => wallets.get(param('id')) },
+    { method: 'post', path: '/api/wallets', recentAuth: true, domainErrors: 'invalid_input', handler: ({ body }) => wallets.create(parseInput(WalletCreateSchema, body)) },
+    { method: 'patch', path: '/api/wallets/:id', recentAuth: true, domainErrors: 'invalid_input', handler: ({ param, body }) => wallets.update(param('id'), parseInput(WalletUpdateSchema, body)) },
+    { method: 'delete', path: '/api/wallets/:id', recentAuth: true, domainErrors: 'conflict', handler: ({ param }) => wallets.delete(param('id')) },
+    { method: 'get', path: '/api/wallets/:id/balance', allow: ADMIN, domainErrors: 'unavailable', handler: ({ param }) => wallets.balance(param('id')) },
   ];
 }
 
-// ── Settings (human only) ───────────────────────────────────────────────
+// ── Settings (human only; holds API keys, so reads are admin-only too) ─────
 
 const TestBinanceSchema = z.object({ apiKey: z.string().optional(), apiSecret: z.string().optional() }).optional();
 
 export function settingsRoutes(settings: CoreServices['settings']): RouteDef[] {
   return [
-    { method: 'get', path: '/api/settings', handler: () => settings.get() },
+    { method: 'get', path: '/api/settings', allow: ADMIN, handler: () => settings.get() },
     {
       method: 'patch',
       path: '/api/settings',
+      recentAuth: true,
       message: 'Settings updated. Restart running bots for changes to take effect.',
       handler: ({ body }) => settings.update(parseInput(SettingsUpdateSchema, body)),
     },
-    { method: 'put', path: '/api/settings/binance', message: 'Binance credentials saved.', handler: ({ body }) => settings.saveBinance(parseInput(BinanceCredentialsSchema, body)) },
-    { method: 'delete', path: '/api/settings/binance', message: 'Binance credentials removed.', handler: () => settings.clearBinance() },
+    { method: 'put', path: '/api/settings/binance', recentAuth: true, message: 'Binance credentials saved.', handler: ({ body }) => settings.saveBinance(parseInput(BinanceCredentialsSchema, body)) },
+    { method: 'delete', path: '/api/settings/binance', recentAuth: true, message: 'Binance credentials removed.', handler: () => settings.clearBinance() },
     {
       method: 'post',
       path: '/api/settings/binance/test',
+      domainErrors: 'unavailable',
       message: 'Binance API connected successfully.',
       handler: ({ body }) => {
         const creds = parseInput(TestBinanceSchema, body);
@@ -107,10 +112,11 @@ export function settingsRoutes(settings: CoreServices['settings']): RouteDef[] {
     {
       method: 'post',
       path: '/api/settings/rpc/test',
+      domainErrors: 'unavailable',
       message: (data) => `RPC connected successfully. Current block: ${(data as { blockNumber: number }).blockNumber}`,
       handler: () => settings.testRpc(),
     },
-    { method: 'post', path: '/api/settings/clob/test', message: 'CLOB API connected successfully.', handler: () => settings.testClob() },
+    { method: 'post', path: '/api/settings/clob/test', domainErrors: 'unavailable', message: 'CLOB API connected successfully.', handler: () => settings.testClob() },
   ];
 }
 
@@ -123,16 +129,16 @@ const ImportBodySchema = z.object({ files: ScriptImportSchema });
 export function scriptRoutes(scripts: CoreServices['scripts']): RouteDef[] {
   return [
     { method: 'get', path: '/api/scripts', allow: READ_ALL, handler: () => scripts.list() },
-    { method: 'post', path: '/api/scripts/compile', allow: ADMIN_AGENT, handler: ({ body }) => scripts.compile(parseInput(CompileSchema, body).source) },
-    { method: 'post', path: '/api/scripts/import', handler: ({ body, actor }) => scripts.importScripts(parseInput(ImportBodySchema, body).files, actor()) },
+    { method: 'post', path: '/api/scripts/compile', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ body }) => scripts.compile(parseInput(CompileSchema, body).source) },
+    { method: 'post', path: '/api/scripts/import', domainErrors: 'invalid_input', handler: ({ body, actor }) => scripts.importScripts(parseInput(ImportBodySchema, body).files, actor()) },
     { method: 'get', path: '/api/scripts/:id', allow: READ_ALL, handler: ({ param }) => scripts.get(param('id')) },
-    { method: 'post', path: '/api/scripts', allow: ADMIN_AGENT, handler: ({ body, actor }) => scripts.create(parseInput(ScriptCreateSchema, body), actor()) },
-    { method: 'patch', path: '/api/scripts/:id', allow: ADMIN_AGENT, handler: ({ param, body, actor }) => scripts.update(param('id'), parseInput(ScriptUpdateSchema, body), actor()) },
-    { method: 'delete', path: '/api/scripts/:id', handler: ({ param, actor }) => scripts.delete(param('id'), actor()) },
+    { method: 'post', path: '/api/scripts', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ body, actor }) => scripts.create(parseInput(ScriptCreateSchema, body), actor()) },
+    { method: 'patch', path: '/api/scripts/:id', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ param, body, actor }) => scripts.update(param('id'), parseInput(ScriptUpdateSchema, body), actor()) },
+    { method: 'delete', path: '/api/scripts/:id', domainErrors: 'conflict', handler: ({ param, actor }) => scripts.delete(param('id'), actor()) },
     { method: 'get', path: '/api/scripts/:id/schema', allow: READ_ALL, handler: ({ param }) => scripts.getSchema(param('id')) },
-    { method: 'post', path: '/api/scripts/:id/fork', allow: ADMIN_AGENT, handler: ({ param, body, actor }) => scripts.fork(param('id'), parseInput(ForkSchema, body)?.newName, actor()) },
+    { method: 'post', path: '/api/scripts/:id/fork', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ param, body, actor }) => scripts.fork(param('id'), parseInput(ForkSchema, body)?.newName, actor()) },
     /** `.botlab` file content; the browser saves it (formerly a native save dialog) */
-    { method: 'get', path: '/api/scripts/:id/export', handler: ({ param }) => scripts.exportScript(param('id')) },
+    { method: 'get', path: '/api/scripts/:id/export', allow: ADMIN, handler: ({ param }) => scripts.exportScript(param('id')) },
   ];
 }
 
@@ -140,7 +146,7 @@ export function scriptRoutes(scripts: CoreServices['scripts']): RouteDef[] {
 
 export function backtestRoutes(backtests: CoreServices['backtests']): RouteDef[] {
   return [
-    { method: 'post', path: '/api/backtests', allow: ADMIN_AGENT, handler: ({ body }) => backtests.run(parseInput(BacktestRunSchema, body)) },
+    { method: 'post', path: '/api/backtests', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ body }) => backtests.run(parseInput(BacktestRunSchema, body)) },
     { method: 'get', path: '/api/backtests', allow: READ_ALL, handler: ({ query }) => backtests.list(query('scriptId') || undefined) },
     { method: 'get', path: '/api/backtests/:id', allow: READ_ALL, handler: ({ param }) => backtests.get(param('id')) },
     { method: 'delete', path: '/api/backtests/:id', handler: ({ param }) => backtests.delete(param('id')) },
@@ -158,13 +164,14 @@ export function riskRoutes(risk: CoreServices['risk']): RouteDef[] {
       method: 'post',
       path: '/api/risk/clear-halt',
       recentAuth: true,
+      domainErrors: 'conflict',
       handler: ({ body, human }) => {
         const { scope, reason } = parseInput(ClearHaltSchema, body);
         return risk.clearHalt(scope, reason, human());
       },
     },
     // Anyone may reduce risk (spec D5): admin or agent
-    { method: 'post', path: '/api/risk/kill-switch', allow: ADMIN_AGENT, handler: ({ body, actor }) => risk.killSwitch(parseInput(KillSwitchSchema, body ?? {}).reason, actor()) },
+    { method: 'post', path: '/api/risk/kill-switch', allow: ADMIN_AGENT, domainErrors: 'conflict', handler: ({ body, actor }) => risk.killSwitch(parseInput(KillSwitchSchema, body ?? {}).reason, actor()) },
   ];
 }
 
@@ -181,6 +188,7 @@ export function configRoutes(config: CoreServices['config']): RouteDef[] {
       method: 'put',
       path: '/api/config/:file',
       recentAuth: true,
+      domainErrors: 'invalid_input',
       handler: ({ param, body, human }) => {
         const file = parseInput(ConfigFileSchema, param('file'));
         const { value, expectedSha256 } = parseInput(ConfigWriteBody, body);
@@ -192,6 +200,7 @@ export function configRoutes(config: CoreServices['config']): RouteDef[] {
       method: 'post',
       path: '/api/config/:file/restore',
       recentAuth: true,
+      domainErrors: 'invalid_input',
       handler: ({ param, body, human }) => config.restore(parseInput(ConfigFileSchema, param('file')), parseInput(ConfigRestoreBody, body).versionId, human()),
     },
   ];
@@ -204,11 +213,12 @@ const SetAmbiguityBody = z.object({ score: z.number(), note: z.string().nullish(
 export function ledgerRoutes(ledger: CoreServices['ledger'], markets: CoreServices['markets']): RouteDef[] {
   return [
     // Forecasts: human (UI) or agent (MCP submit_forecast); the service validates the input
-    { method: 'post', path: '/api/ledger/forecasts', allow: ADMIN_AGENT, handler: ({ body, actor }) => ledger.submitForecast(body, actor()) },
+    { method: 'post', path: '/api/ledger/forecasts', allow: ADMIN_AGENT, domainErrors: 'invalid_input', handler: ({ body, actor }) => ledger.submitForecast(body, actor()) },
     {
       method: 'post',
       path: '/api/ledger/forecasts/:id/withdraw',
       allow: ADMIN_AGENT,
+      domainErrors: 'invalid_input',
       handler: ({ param, body, actor }) => ledger.withdrawForecast(param('id'), parseInput(ReasonSchema, body).reason, actor()),
     },
     {
@@ -234,16 +244,18 @@ export function ledgerRoutes(ledger: CoreServices['ledger'], markets: CoreServic
       method: 'post',
       path: '/api/ledger/rights',
       recentAuth: true,
+      domainErrors: 'invalid_input',
       handler: ({ body, human }) => {
         const { category, bucket, state, reason } = parseInput(SetRightsStateSchema, body);
         return ledger.forceRightsState(category, bucket as HorizonBucket, state as CategoryRightsState | 'auto', reason, human());
       },
     },
-    { method: 'get', path: '/api/markets/:id', allow: READ_ALL, handler: ({ param }) => markets.get(param('id')) },
+    { method: 'get', path: '/api/markets/:id', allow: READ_ALL, domainErrors: 'unavailable', handler: ({ param }) => markets.get(param('id')) },
     {
       method: 'post',
       path: '/api/markets/:id/ambiguity',
       recentAuth: true,
+      domainErrors: 'invalid_input',
       handler: ({ param, body, human }) => {
         const { score, note } = parseInput(SetAmbiguityBody, body);
         return markets.setAmbiguity(param('id'), score, human(), note ?? null);
@@ -261,6 +273,7 @@ export function reconcileRoutes(reconcile: CoreServices['reconcile']): RouteDef[
       method: 'post',
       path: '/api/reconcile/adopt',
       recentAuth: true,
+      domainErrors: 'conflict',
       handler: ({ body, human }) => {
         const { walletId, botId, includePostFirstOrder } = parseInput(AdoptPositionsSchema, body);
         return reconcile.adoptPositions(walletId, botId, human(), { includePostFirstOrder });
@@ -271,6 +284,7 @@ export function reconcileRoutes(reconcile: CoreServices['reconcile']): RouteDef[
       method: 'post',
       path: '/api/recorder/watchlist',
       allow: ADMIN_AGENT,
+      domainErrors: 'invalid_input',
       handler: ({ body, actor }) => {
         const { tokenId, marketId, note } = parseInput(WatchlistAddSchema, body);
         return reconcile.watchlistAdd(tokenId, marketId, note, actor());

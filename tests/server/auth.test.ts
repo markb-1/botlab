@@ -15,6 +15,7 @@ import { createCore, type Core } from '../../packages/core/src';
 import { createApp } from '../../apps/server/src/app';
 import { LoginLimiter } from '../../apps/server/src/routes/auth';
 import { isHostAllowed } from '../../apps/server/src/http/hosts';
+import { asAgent } from '../../packages/core/src/services/actors';
 
 const PASSWORD = 'correct horse battery';
 const HOST = '127.0.0.1:3780';
@@ -35,7 +36,8 @@ describe.skipIf(!sqliteAvailable)('HTTP auth', () => {
     core = createCore({ dataDir: path.join(tmp, 'data'), configDir: path.join(tmp, 'config'), backups: false });
     await core.start();
     await core.unlock(crypto.randomBytes(32).toString('hex'));
-    app = createApp({ core, webDir: null, limiter: new LoginLimiter() }).app;
+    // loopbackOnly: in-process requests count as local, so setup needs no code (tested separately)
+    app = createApp({ core, webDir: null, limiter: new LoginLimiter(), loopbackOnly: true }).app;
   }, 60_000);
 
   afterEach(async () => {
@@ -173,6 +175,106 @@ describe.skipIf(!sqliteAvailable)('HTTP auth', () => {
     // Revoked ⇒ 401
     expect((await req('DELETE', `/api/auth/tokens/${created.json.data.id}`, { cookie })).json.data).toEqual({ revoked: true });
     expect((await req('GET', '/api/bots', { bearer: token })).status).toBe(401);
+  });
+
+  it('parallel wrong passwords cannot overtake the rate limit (login, reauth, password change)', async () => {
+    const cookie = await setup();
+    const login = await Promise.all(Array.from({ length: 40 }, () => req('POST', '/api/auth/login', { body: { password: 'wrong password!' } })));
+    expect(login.filter((r) => r.status === 401)).toHaveLength(5);
+    expect(login.filter((r) => r.status === 429)).toHaveLength(35);
+    // Re-auth and password change are keyed on the session behind a loopback peer, and limited the same way
+    const reauth = await Promise.all(Array.from({ length: 20 }, () => req('POST', '/api/auth/reauth', { cookie, body: { password: 'wrong password!' } })));
+    expect(reauth.filter((r) => r.status === 401)).toHaveLength(5);
+    expect(reauth.filter((r) => r.status === 429)).toHaveLength(15);
+    const change = await req('POST', '/api/auth/password', { cookie, body: { currentPassword: PASSWORD, newPassword: 'another password' } });
+    expect(change.status).toBe(429);
+  });
+
+  it('readonly token: no wallets, settings, config, tokens or script export', async () => {
+    const cookie = await setup();
+    const { token } = core.auth.createToken('dashboard', 'readonly');
+    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    for (const p of [
+      '/api/wallets',
+      '/api/wallets/w1',
+      '/api/wallets/w1/balance',
+      '/api/settings',
+      `/api/scripts/${script.id}/export`,
+      '/api/config',
+      '/api/config/limits/history',
+      '/api/auth/tokens',
+    ]) {
+      const r = await req('GET', p, { bearer: token });
+      expect({ p, status: r.status }).toEqual({ p, status: 403 });
+    }
+    // The admin still can
+    expect((await req('GET', '/api/settings', { cookie })).status).toBe(200);
+    expect((await req('GET', '/api/wallets', { cookie })).status).toBe(200);
+  });
+
+  it('wallets, credentials and settings changes need a recent password check', async () => {
+    const cookie = await setup();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + 16 * 60_000);
+    for (const [method, p, body] of [
+      ['POST', '/api/wallets', { name: 'w', address: '0x0', privateKey: 'k' }],
+      ['PATCH', '/api/wallets/w1', { name: 'x' }],
+      ['DELETE', '/api/wallets/w1', undefined],
+      ['PUT', '/api/settings/binance', { apiKey: 'a', apiSecret: 'b' }],
+      ['DELETE', '/api/settings/binance', undefined],
+      ['PATCH', '/api/settings', { rpcUrl: 'https://example.invalid' }],
+    ] as const) {
+      const r = await req(method, p, { cookie, body });
+      expect({ p, method, code: r.json.code }).toEqual({ p, method, code: 'reauth_required' });
+    }
+    expect(core.services.settings.get().rpcUrl).not.toBe('https://example.invalid');
+  });
+
+  it('agent: bots are paper with no wallet choice; updates are config only (enforced in BotService too)', async () => {
+    await setup();
+    const { token } = core.auth.createToken('mcp', 'agent');
+    const script = core.services.scripts.list().find((s) => s.isTemplate)!;
+    const asAgentReq = (method: string, p: string, body: unknown) => req(method, p, { bearer: token, body, csrf: false });
+    expect((await asAgentReq('POST', '/api/bots', { name: 'a', scriptId: script.id, walletId: 'w1', mode: 'paper' })).json).toMatchObject({ code: 'forbidden' });
+    expect((await asAgentReq('POST', '/api/bots', { name: 'a', scriptId: script.id, mode: 'live' })).json).toMatchObject({ code: 'forbidden' });
+    const bot = (await asAgentReq('POST', '/api/bots', { name: 'a', scriptId: script.id })).json.data;
+    expect(bot.mode).toBe('paper');
+    for (const change of [{ name: 'renamed' }, { walletId: 'w2' }, { scriptId: script.id }, { enabled: false }, { name: 'x', config: {} }]) {
+      const r = await asAgentReq('PATCH', `/api/bots/${bot.id}`, change);
+      expect({ change, status: r.status, code: r.json.code }).toEqual({ change, status: 403, code: 'forbidden' });
+    }
+    const ok = await asAgentReq('PATCH', `/api/bots/${bot.id}`, { config: { pollingIntervalMs: 60000 } });
+    expect(ok.json.data.config).toEqual({ pollingIntervalMs: 60000 });
+    expect(audit('bot.update').some((r) => r.actor === 'agent' && r.result === 'denied: agent may change config only')).toBe(true);
+    // The service enforces it without the HTTP layer
+    expect(() => core.services.bots.update(bot.id, { name: 'direct' }, asAgent('token:test'))).toThrow(/config only/);
+    await expect(core.services.bots.create({ name: 'b', scriptId: script.id, walletId: bot.walletId }, asAgent('token:test'))).rejects.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('first-run setup needs the setup code unless it is a direct local request to a loopback-bound server', async () => {
+    const remoteApp = createApp({ core, webDir: null, limiter: new LoginLimiter(), loopbackOnly: false }).app;
+    const call = async (a: typeof app, body: unknown, headers: Record<string, string> = {}) => {
+      const res = await a.request('/api/auth/setup', {
+        method: 'POST',
+        headers: { host: HOST, 'x-botlab': '1', 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, json: (await res.json()) as any };
+    };
+    const session = await (await remoteApp.request('/api/auth/session', { headers: { host: HOST } })).json();
+    expect(session.data).toMatchObject({ needsSetup: true, setupCodeRequired: true });
+
+    const code = core.auth.createSetupCode();
+    expect((await call(remoteApp, { password: PASSWORD })).json.code).toBe('setup_code_required');
+    expect((await call(remoteApp, { password: PASSWORD, setupCode: 'AAAA-AAAA' })).json.code).toBe('setup_code_required');
+    // Loopback-bound but through a proxy (X-Forwarded-For) or with a non-local Host: the code is required too
+    expect((await call(app, { password: PASSWORD }, { 'x-forwarded-for': '100.64.0.7' })).json.code).toBe('setup_code_required');
+    expect((await call(app, { password: PASSWORD }, { host: 'box.tail1234.ts.net' })).json.code).toBe('setup_code_required');
+    expect(audit('auth.setup').some((r) => r.result === 'denied: wrong setup code')).toBe(true);
+
+    const ok = await call(remoteApp, { password: PASSWORD, setupCode: code.toLowerCase().replace('-', ' ') });
+    expect(ok.status).toBe(200);
+    expect(core.auth.verifySetupCode(code)).toBe(false); // one-time: cleared with the password
   });
 
   it('readonly token: GET only; a bad token is 401', async () => {

@@ -44,6 +44,10 @@ export async function verifyPasswordHash(password: string, stored: string | null
   return crypto.timingSafeEqual(actual, expected);
 }
 
+function normalizeSetupCode(code: string): string {
+  return code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
 export function sha256Hex(value: string): string {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
@@ -97,19 +101,44 @@ export class AdminAuthStore {
       throw new Error(`The password must be at least ${MIN_PASSWORD_LENGTH} characters`);
     }
     const hash = await hashPassword(password);
-    this.db.prepare("UPDATE settings SET admin_password_hash = ?, updated_at = datetime('now') WHERE id = 'global'").run(hash);
+    this.db.prepare("UPDATE settings SET admin_password_hash = ?, setup_code_hash = NULL, updated_at = datetime('now') WHERE id = 'global'").run(hash);
+  }
+
+  /**
+   * First-run setup code: a new random one-time code (`ABCD-EFGH`, 40 bits), only its SHA-256 stored.
+   * The server prints it to its log at boot while no admin password exists; `/api/auth/setup` requires
+   * it unless the request comes from this machine to a loopback-bound server.
+   */
+  createSetupCode(): string {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = crypto.randomBytes(8);
+    const raw = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
+    const code = `${raw.slice(0, 4)}-${raw.slice(4)}`;
+    this.db.prepare("UPDATE settings SET setup_code_hash = ? WHERE id = 'global'").run(sha256Hex(normalizeSetupCode(code)));
+    return code;
+  }
+
+  verifySetupCode(code: unknown): boolean {
+    if (typeof code !== 'string' || !code.trim()) return false;
+    const row = this.db.prepare("SELECT setup_code_hash FROM settings WHERE id = 'global'").get() as { setup_code_hash: string | null } | undefined;
+    if (!row?.setup_code_hash) return false;
+    const a = Buffer.from(sha256Hex(normalizeSetupCode(code)), 'hex');
+    const b = Buffer.from(row.setup_code_hash, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
   /**
    * First-run setup: sets the password only if none is set (atomic check-and-set), so two concurrent
-   * setup requests cannot both win.
+   * setup requests cannot both win. Clears the setup code.
    */
   async setInitialAdminPassword(password: string): Promise<boolean> {
     if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
       throw new Error(`The password must be at least ${MIN_PASSWORD_LENGTH} characters`);
     }
     const hash = await hashPassword(password);
-    const r = this.db.prepare("UPDATE settings SET admin_password_hash = ?, updated_at = datetime('now') WHERE id = 'global' AND admin_password_hash IS NULL").run(hash);
+    const r = this.db
+      .prepare("UPDATE settings SET admin_password_hash = ?, setup_code_hash = NULL, updated_at = datetime('now') WHERE id = 'global' AND admin_password_hash IS NULL")
+      .run(hash);
     return r.changes === 1;
   }
 

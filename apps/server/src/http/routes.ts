@@ -8,6 +8,7 @@
 import type { Context, Hono } from 'hono';
 import type { Actor, HumanActor } from '../../../../packages/core/src/services/actors';
 import { HttpError, fail, ok } from './respond';
+import { ServiceError, type ServiceErrorCode } from '../../../../packages/core/src/services/errors';
 import { actorOf, humanOf, requirePrincipal, type AppEnv, type Principal, type Scope } from './principal';
 
 export type Method = 'get' | 'post' | 'put' | 'patch' | 'delete';
@@ -32,6 +33,13 @@ export interface RouteDef {
   allow?: Scope[];
   /** Human-only admin actions (spec §4.6): the session's password check must be < 15 min old */
   recentAuth?: boolean;
+  /**
+   * The domain layer (BotManager, HaltService, ConfigService, wallet manager, exchange clients) throws
+   * plain errors whose messages are meant for the user ("Bot is halted", "Live trading is disabled").
+   * With this set, such errors become `ServiceError(domainErrors)` with their message; without it they
+   * are internal errors (generic 500 + error id).
+   */
+  domainErrors?: ServiceErrorCode;
   /** `message` in the success envelope (shown by the UI) */
   message?: string | ((data: unknown) => string | undefined);
   handler: (ctx: RouteContext) => unknown;
@@ -68,7 +76,7 @@ export function mountRoutes(app: Hono<AppEnv>, defs: RouteDef[]): void {
         const principal = requirePrincipal(c);
         checkScope(principal, def);
         const body = def.method === 'get' || def.method === 'delete' ? undefined : await readJsonBody(c);
-        const data = await def.handler({
+        const ctx: RouteContext = {
           c,
           principal,
           actor: () => actorOf(principal),
@@ -76,7 +84,16 @@ export function mountRoutes(app: Hono<AppEnv>, defs: RouteDef[]): void {
           body,
           param: (name) => c.req.param(name) ?? '',
           query: (name) => c.req.query(name),
-        });
+        };
+        let data: unknown;
+        try {
+          data = await def.handler(ctx);
+        } catch (err) {
+          if (def.domainErrors && err instanceof Error && !(err instanceof ServiceError) && !(err instanceof HttpError)) {
+            throw new ServiceError(def.domainErrors, err.message);
+          }
+          throw err;
+        }
         const message = typeof def.message === 'function' ? def.message(data) : def.message;
         return ok(c, data, message);
       } catch (err) {

@@ -156,6 +156,8 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 - **Core is transport-free**: nothing under `packages/core` may import `hono`, `electron` or `apps/*` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not HTTP handlers
 - **Data dir**: `BOTLAB_DATA_DIR`, else `./data` in dev and the OS app-data dir with `--production` / `NODE_ENV=production` (`apps/server/src/paths.ts`); config dir likewise (`resolveConfigDir`). One server per data dir (`server.lock`)
 - **Worker threads under tsx**: a `.ts` worker entry cannot load through tsx directly; `startWorker()` (`runtime/workerPath.ts`) wraps it in an eval'd shim that registers `tsx/cjs/api` first. Compiled `.js` entries start directly
+- **Route scopes**: new routes must declare `allow` (readonly gets GETs by default — anything returning secrets is `['admin']`), `recentAuth` for §4.6 / credential actions, and `domainErrors` if their plain domain errors are user-facing (otherwise a generic 500 with an error id). Agent restrictions that matter for safety go in the service (e.g. `BotService` agent rules), not only the route
+- **First run**: until an admin password exists the server logs a one-time setup code; `/api/auth/setup` needs it unless the request is local to a loopback-bound server
 - **Shutdown**: an unclean stop (crash, kill, second Ctrl+C after 2 s) ⇒ next start is globally halted (spec §4.3); clear via `POST /api/risk/clear-halt` (human, recent password check)
 
 ## Environment Variables

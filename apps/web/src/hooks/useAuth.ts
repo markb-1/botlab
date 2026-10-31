@@ -40,7 +40,7 @@ export function useAuth() {
     }
   }, []);
 
-  const setup = useCallback((password: string) => run(() => authApi.setup({ password }), 'Setup failed'), [run]);
+  const setup = useCallback((password: string, setupCode?: string) => run(() => authApi.setup({ password, setupCode }), 'Setup failed'), [run]);
   const login = useCallback((password: string) => run(() => authApi.login({ password }), 'Login failed'), [run]);
 
   const logout = useCallback(async () => {

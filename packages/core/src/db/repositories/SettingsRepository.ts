@@ -17,6 +17,8 @@ export interface SettingsRow {
   admin_password_hash: string | null;
   /** Master-key check value: a constant encrypted with the master key (`security/masterKey.ts`) */
   key_check: string | null;
+  /** SHA-256 of the one-time first-run setup code (`security/adminAuth.ts`); null once a password is set */
+  setup_code_hash: string | null;
   created_at: string;
   updated_at: string;
 }

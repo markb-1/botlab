@@ -107,19 +107,21 @@ const enc = encodeURIComponent;
 export interface SessionInfo {
   /** No admin password yet: show the first-run setup screen */
   needsSetup: boolean;
+  /** Setup needs the one-time code printed in the server log */
+  setupCodeRequired: boolean;
   authenticated: boolean;
   scope: 'admin' | 'agent' | 'readonly' | null;
   /** The password was checked less than 15 minutes ago (human-only admin actions) */
   recentAuth: boolean;
   /** The core holds the master key (wallets and bots available) */
   unlocked: boolean;
-  /** Why the core is locked (e.g. the master key does not match this database) */
+  /** Why the core is locked (only shown to logged-in users) */
   lockReason: string | null;
 }
 
 export const authApi = {
   session: (): Promise<SessionInfo> => call('GET', '/auth/session'),
-  setup: (data: { password: string }): Promise<SessionInfo> => call('POST', '/auth/setup', data),
+  setup: (data: { password: string; setupCode?: string }): Promise<SessionInfo> => call('POST', '/auth/setup', data),
   login: (data: { password: string }): Promise<SessionInfo> => call('POST', '/auth/login', data),
   logout: (): Promise<void> => call('POST', '/auth/logout'),
   reauth: (data: { password: string }): Promise<SessionInfo> => call('POST', '/auth/reauth', data),

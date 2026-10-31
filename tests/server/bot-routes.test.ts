@@ -175,7 +175,10 @@ describe('bot routes', () => {
       mockBotRepo.findAll.mockImplementation(() => { throw new Error('DB error'); });
       const result = await invoke('bots:list');
       expect(result.success).toBe(false);
-      expect(result.error).toBe('DB error');
+      // Internal errors are not echoed: generic message + an id that is in the server log
+      expect(result.error).toMatch(/^Internal error \(id [0-9a-f]{8}\)/);
+      expect(result.error).not.toContain('DB error');
+      expect(result).toMatchObject({ code: 'error', errorId: expect.stringMatching(/^[0-9a-f]{8}$/) });
     });
   });
 
@@ -278,7 +281,7 @@ describe('bot routes', () => {
       expect(mockBotManager.startBot).toHaveBeenCalledWith('bot-1', 'human');
     });
 
-    it('should return error on failure', async () => {
+    it('should return the domain error message on failure (domainErrors: conflict)', async () => {
       mockBotManager.startBot.mockRejectedValue(new Error('Start failed'));
       const result = await invoke('bots:start', 'bot-1');
       expect(result.success).toBe(false);

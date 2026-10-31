@@ -309,8 +309,15 @@ export class BotService {
   }
 
   async create(data: BotCreateInput, by: Actor): Promise<IpcBot> {
-    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.create'));
+    const who = requireActor(by, ['human', 'agent'], 'bots.create');
+    const actor = auditActorOf(who);
     const { botRepo, scriptRepo, audit } = this.deps;
+    // The agent creates paper bots only, on their own throwaway paper wallet: it never picks a wallet or
+    // goes live (spec §4.6, §7.3; Decision R109). A human creates the live bot.
+    if (who.kind === 'agent' && (data.walletId !== undefined || (data.mode !== undefined && data.mode !== 'paper'))) {
+      audit?.record(actor, 'bot.create', null, { name: data.name, mode: data.mode, walletId: data.walletId }, 'denied: agent bots are paper bots without a wallet choice');
+      throw new ServiceError('forbidden', 'bots.create: the agent can only create paper bots (no walletId, mode paper)');
+    }
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
     const mode = data.mode ?? 'paper';
@@ -350,8 +357,20 @@ export class BotService {
   }
 
   update(id: string, data: BotUpdateInput, by: Actor): IpcBot {
-    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.update'));
+    const who = requireActor(by, ['human', 'agent'], 'bots.update');
+    const actor = auditActorOf(who);
     const { botRepo, scriptRepo, tradeRepo, orderRepo, audit } = this.deps;
+    // The agent may change a bot's config only (spec §7.3 update_bot_config): not its name, script,
+    // wallet or enabled flag
+    if (who.kind === 'agent') {
+      const other = Object.entries(data)
+        .filter(([k, v]) => k !== 'config' && v !== undefined)
+        .map(([k]) => k);
+      if (other.length > 0) {
+        audit?.record(actor, 'bot.update', id, { fields: other }, 'denied: agent may change config only');
+        throw new ServiceError('forbidden', `bots.update: the agent may change config only (not ${other.join(', ')})`);
+      }
+    }
     const before = botRepo.findById(id);
     if (!before) throw notFound('Bot not found');
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {

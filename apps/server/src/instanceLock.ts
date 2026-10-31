@@ -48,21 +48,41 @@ export function lockHolder(dataDir: string): LockInfo | null {
   return alive(info.pid) ? info : null;
 }
 
+function holderMessage(dataDir: string, holder: LockInfo): string {
+  return (
+    `Another BotLab server (pid ${holder.pid}, started ${holder.startedAt}) is using ${dataDir}. ` +
+    `Stop it first (or delete ${lockFile(dataDir)} if that process is not BotLab).`
+  );
+}
+
+/**
+ * Creates the lock with `wx` (atomic: two servers starting at once cannot both win). If a lock file
+ * exists and its holder is stale, it is removed and creation retried once.
+ */
 export function acquireInstanceLock(dataDir: string): () => void {
-  const holder = lockHolder(dataDir);
-  if (holder) {
-    throw new Error(
-      `Another BotLab server (pid ${holder.pid}, started ${holder.startedAt}) is using ${dataDir}. ` +
-        `Stop it first (or delete ${lockFile(dataDir)} if that process is not BotLab).`
-    );
-  }
   fs.mkdirSync(dataDir, { recursive: true });
+  const file = lockFile(dataDir);
   const info: LockInfo = { pid: process.pid, host: os.hostname(), bootTime: bootTime(), startedAt: new Date().toISOString() };
-  fs.writeFileSync(lockFile(dataDir), JSON.stringify(info), 'utf8');
+  const create = () => fs.writeFileSync(file, JSON.stringify(info), { encoding: 'utf8', flag: 'wx' });
+  try {
+    create();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    const holder = lockHolder(dataDir);
+    if (holder) throw new Error(holderMessage(dataDir, holder));
+    fs.rmSync(file, { force: true });
+    try {
+      create();
+    } catch (retryErr) {
+      if ((retryErr as NodeJS.ErrnoException).code !== 'EEXIST') throw retryErr;
+      const winner = lockHolder(dataDir);
+      throw new Error(winner ? holderMessage(dataDir, winner) : `Could not take the server lock ${file}: another server is starting`);
+    }
+  }
   return () => {
     try {
-      const current = JSON.parse(fs.readFileSync(lockFile(dataDir), 'utf8')) as LockInfo;
-      if (current.pid === process.pid) fs.rmSync(lockFile(dataDir), { force: true });
+      const current = JSON.parse(fs.readFileSync(file, 'utf8')) as LockInfo;
+      if (current.pid === process.pid) fs.rmSync(file, { force: true });
     } catch {
       /* already gone */
     }

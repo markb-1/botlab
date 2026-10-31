@@ -11,8 +11,11 @@
  * Why not node-windows: its wrapper stops the server with TerminateProcess (no SIGINT), so every service
  * stop would look like a crash and the next start would be halted (spec §4.3).
  *
- * The service runs as LocalSystem by default, whose %APPDATA% is not yours, so the data dir, config
- * dir and master key file are fixed to your user's paths at install time.
+ * The service runs as **your Windows account**, not LocalSystem (which would give bot code and the
+ * server full control of the machine): the script asks for your Windows password (hidden input) and
+ * sets it with `nssm set BotLab ObjectName .\<user> <password>`; NSSM grants the account the "Log on as
+ * a service" right. The data dir, config dir and master key file are still passed explicitly (your
+ * %APPDATA%\BotLab), so the service uses exactly the paths shown at install time.
  *
  * macOS / Linux: prints launchd / systemd instructions with the paths filled in.
  */
@@ -23,6 +26,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import readline from 'node:readline';
+import { Writable } from 'node:stream';
 
 const SERVICE = 'BotLab';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -58,6 +63,34 @@ function ensureKey() {
   console.log(`Generated a new master key: ${keyFile}\nBack it up somewhere safe (password manager): without it, wallet keys cannot be decrypted.`);
 }
 
+/** Reads a line without echoing it (visible when stdin is not a terminal) */
+function promptHidden(question) {
+  return new Promise((resolve) => {
+    let muted = false;
+    const output = new Writable({
+      write(chunk, _enc, cb) {
+        if (!muted) process.stdout.write(chunk);
+        cb();
+      },
+    });
+    const rl = readline.createInterface({ input: process.stdin, output, terminal: !!process.stdin.isTTY });
+    rl.question(question, (answer) => {
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer);
+    });
+    muted = !!process.stdin.isTTY;
+  });
+}
+
+function logOnInstructions(account) {
+  return (
+    `Set the service to run as your account by hand: services.msc → "BotLab trading server" → Properties →\n` +
+    `Log On → "This account": ${account} and your Windows password (for a Microsoft account, the account\n` +
+    `password, not the PIN) → OK, then start the service. Or: nssm set ${SERVICE} ObjectName ${account} <password>`
+  );
+}
+
 function nssmPath() {
   if (process.env.NSSM) return process.env.NSSM;
   const r = spawnSync('where', ['nssm'], { encoding: 'utf8' });
@@ -72,7 +105,7 @@ function nssm(bin, args, { allowFail = false } = {}) {
   return out;
 }
 
-function windowsInstall() {
+async function windowsInstall() {
   requireBuild();
   const bin = nssmPath();
   if (!bin) {
@@ -83,6 +116,10 @@ function windowsInstall() {
         '                                   or set $env:NSSM = "C:\\path\\to\\nssm.exe")'
     );
   }
+  const account = `.\\${os.userInfo().username}`;
+  console.log(`The BotLab service will run as your Windows account ${account} (not LocalSystem).`);
+  const password = await promptHidden(`Windows password for ${account} (input hidden; for a Microsoft account use its password, not the PIN): `);
+  if (!password) fail(`No password entered; nothing installed.\n${logOnInstructions(account)}`);
   ensureKey();
   const logs = path.join(dataDir, 'logs');
   fs.mkdirSync(logs, { recursive: true });
@@ -96,6 +133,12 @@ function windowsInstall() {
   const set = (...args) => nssm(bin, ['set', SERVICE, ...args]);
   // Quoted: the repo path may contain spaces (C:\Users\First Last\...)
   set('AppParameters', `"${entry}" --production`);
+  const logon = spawnSync(bin, ['set', SERVICE, 'ObjectName', account, password], { encoding: 'utf8' });
+  if (logon.status !== 0) {
+    nssm(bin, ['remove', SERVICE, 'confirm'], { allowFail: true });
+    const out = `${logon.stdout || ''}${logon.stderr || ''}`.replace(/\0/g, '').trim();
+    fail(`Could not set the service account (wrong password?)${out ? `: ${out}` : ''}. The service was removed.\n${logOnInstructions(account)}`);
+  }
   set('DisplayName', 'BotLab trading server');
   set('Description', 'BotLab: bots, risk engine and web UI (http://127.0.0.1:3780 by default)');
   set('AppDirectory', repo);
@@ -126,6 +169,7 @@ Installed and started the "${SERVICE}" Windows service.
   Config dir:  ${configDir}
   Master key:  ${keyFile}
   Logs:        ${path.join(logs, 'service.log')}
+  Runs as:     ${account}
 
 Check:   nssm status ${SERVICE}    (or services.msc)   ·   http://127.0.0.1:${process.env.BOTLAB_PORT || 3780}/healthz
 Stop:    nssm stop ${SERVICE}      Remove: npm run service:uninstall
@@ -204,7 +248,7 @@ Then:  systemctl --user daemon-reload && systemctl --user enable --now botlab
 
 if (action !== 'install' && action !== 'uninstall') fail('Usage: node scripts/service.mjs install|uninstall');
 if (process.platform === 'win32') {
-  if (action === 'install') windowsInstall();
+  if (action === 'install') await windowsInstall();
   else windowsUninstall();
 } else if (process.platform === 'darwin') {
   if (action === 'install') requireBuild();
