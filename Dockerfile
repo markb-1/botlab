@@ -6,6 +6,7 @@ FROM node:22-slim AS build
 WORKDIR /app
 # better-sqlite3 downloads a prebuilt binary for linux x64/arm64 (glibc), so no compiler toolchain
 COPY package.json package-lock.json ./
+COPY scripts/check-node.mjs ./scripts/
 RUN npm ci
 COPY tsconfig.json ./
 COPY packages ./packages

@@ -59,7 +59,7 @@ const coreTransportPatterns = [
 export default [
     {
         // Ignore build output and compiled files
-        ignores: ['dist/**', 'apps/web/dist/**', 'data/**', 'node_modules/**', 'coverage/**', '*.js'],
+        ignores: ['dist/**', 'dist-electron/**', 'apps/web/dist/**', 'data/**', 'node_modules/**', 'coverage/**', '*.js'],
     },
     { files: ['**/*.{js,mjs,cjs,ts,tsx}'] },
     { languageOptions: { globals: { ...globals.node, ...globals.jest } } }, // Add jest globals

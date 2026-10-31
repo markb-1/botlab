@@ -2,6 +2,7 @@
     "name": "botlab",
     "version": "3.0.0-dev",
     "scripts": {
+        "preinstall": "node scripts/check-node.mjs",
         "dev": "concurrently -k -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
         "dev:server": "node --watch --watch-preserve-output --import tsx apps/server/src/main.ts",
         "dev:web": "vite --config apps/web/vite.config.mts",
@@ -94,6 +95,6 @@
         "zod": "^4.6.7"
     },
     "engines": {
-        "node": ">=22.12"
+        "node": ">=22.12 <25"
     }
 }

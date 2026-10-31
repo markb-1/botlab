@@ -14,6 +14,15 @@ Runs natively on **macOS, Windows and Linux** (Node 22), or in **Docker** on a h
 You need **Node.js 22** (LTS, 22.12 or newer) and git. No Docker, Tailscale, Telegram or exchange
 credentials are needed to start: a fresh install runs **paper bots only**.
 
+**Use Node 22, not the newest Node.** `better-sqlite3` (the only native module) does not build on Node 25+
+yet, so `engines` is `>=22.12 <25` and `npm install` stops with a message on other versions (`.nvmrc` says
+22). On macOS the current Homebrew `node` is too new: `brew install node@22` and put it first on your
+`PATH` (`brew link --overwrite --force node@22`), or use `nvm install` / `fnm use` in the repo. npm 11
+(bundled with newer Node) also skips dependency install scripts unless they are allowed, which leaves
+`better-sqlite3` / `esbuild` without their binaries; with Node 22's npm 10 this does not apply. If you
+must use npm 11, allow the scripts it lists (`better-sqlite3`, `esbuild`, `fsevents`) as its warning
+explains, then run `npm rebuild better-sqlite3 esbuild`.
+
 ### macOS / Linux
 
 ```bash
