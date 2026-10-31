@@ -33,6 +33,8 @@ import type {
   OrderResult,
   OpenOrder,
   FeeRates,
+  MarketDetail,
+  BotExitFlag,
   RiskBudget,
   RpcRequest,
   RpcResponse,
@@ -279,11 +281,16 @@ export function createBotContext(params: {
       getOpenOrders: () => rpcCall('polymarket:getOpenOrders') as Promise<OpenOrder[]>,
       getOrderHistory: (days?: number) => rpcCall('polymarket:getOrderHistory', days) as Promise<OrderHistoryEntry[]>,
       getFee: (tokenId: string) => rpcCall('polymarket:getFee', tokenId) as Promise<FeeRates>,
+      getMarket: (idOrTokenId: string) => rpcCall('polymarket:getMarket', idOrTokenId) as Promise<MarketDetail | null>,
     } as PolymarketContext,
 
     risk: {
       getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
+      getExitFlags: () => rpcCall('risk:getExitFlags') as Promise<BotExitFlag[]>,
     } as RiskContext,
+
+    // Retire this bot (server-side, audited as the bot); the worker is stopped shortly after
+    requestRetire: (reason: string) => rpcCall('bot:requestRetire', reason) as Promise<{ accepted: boolean }>,
 
     // Forecast ledger: read-only
     ledger: {

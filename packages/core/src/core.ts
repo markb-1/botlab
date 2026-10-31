@@ -46,7 +46,7 @@ import { verifyMasterKey } from './security/masterKey';
 import { AdminAuthStore } from './security/adminAuth';
 import { BackupJob } from './ops/BackupJob';
 import { WalletManager } from './bots/WalletManager';
-import { BotManager } from './bots/BotManager';
+import { BotManager, BOT_RETIRE_REQUEST_EVENT } from './bots/BotManager';
 import { seedTemplates, getBuiltinTemplates } from './db/seed';
 import { AuditService } from './audit/AuditService';
 import { OrderCanceller } from './orders/OrderCanceller';
@@ -481,6 +481,8 @@ export function createCore(options: CoreOptions): Core {
         const m = marketCache.getCachedByToken(tokenId);
         return m ? { marketId: m.marketId, question: m.question, outcome: m.tokens.find((t) => t.tokenId === tokenId)?.outcome ?? null } : null;
       },
+      lookupTokenMarket: async (tokenId) => (await marketCache.getMarketByToken(tokenId))?.marketId ?? null,
+      getMandate: () => configService.getConfig()?.mandate ?? null,
     }),
     wallets: new WalletService({ walletRepo, settingsRepo, walletManager: () => walletManager }),
     scripts: new ScriptService({ scriptRepo, audit, getMandate: () => configService.getConfig()?.mandate ?? null, guardAgentRun }),
@@ -711,6 +713,10 @@ export function createCore(options: CoreOptions): Core {
       exitFlags: exitFlagRepo,
     });
     botManager = manager;
+    // ctx.requestRetire (5b): a script retires its own bot, audited as the bot
+    manager.on(BOT_RETIRE_REQUEST_EVENT, ({ botId, reason }: { botId: string; reason: string }) => {
+      services.bots.retireByBot(botId, reason).catch((err) => console.error(`[Core] Retire request of bot ${botId} failed:`, err));
+    });
     // No bot may start until startup recovery below has finished (set before initialize so there is no gap)
     manager.setRecoveryInProgress(true);
     await manager.initialize();

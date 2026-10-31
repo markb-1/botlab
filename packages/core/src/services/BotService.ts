@@ -9,7 +9,8 @@
 import { DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_LINES, type BotActivityLog, type BotCustomEvent, type BotLogLine } from '../bots/BotActivityLog';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { WalletRepository } from '../db/repositories/WalletRepository';
-import { builtinRoleOf, type ScriptRepository } from '../db/repositories/ScriptRepository';
+import { builtinRoleOf, isStandingRole, isStrategyRole, type ScriptRepository, type ScriptRow, type StrategyRole } from '../db/repositories/ScriptRepository';
+import { validateConfigAgainstSchema } from '../utils/configSchema';
 import type { OrderRepository, OrderRow } from '../db/repositories/OrderRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
@@ -24,7 +25,7 @@ import type { BotStage } from '../risk/types';
 import logger from '../utils/logger';
 import { ServiceError, conflict, notFound } from './errors';
 import type { BotCreateInput, BotUpdateInput } from './schemas';
-import type { LimitsConfig } from '../config/schema';
+import type { LimitsConfig, MandateConfig } from '../config/schema';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -360,7 +361,21 @@ export interface BotServiceDeps {
   guardAgentRun?: (by: unknown, action: string) => void;
   /** Cached market question / outcome of a token (positions and orders views) */
   describeToken?: (tokenId: string) => { marketId: string; question: string; outcome: string | null } | null;
+  /** Condition id of a token, refreshing the market cache from Gamma when needed (agent strategy-bot creates) */
+  lookupTokenMarket?: (tokenId: string) => Promise<string | null>;
+  /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
+  getMandate?: () => MandateConfig | null;
   now?: () => number;
+}
+
+/** Mandate `strategies.allow` key of each builtin strategy role */
+const STRATEGY_KEYS: Record<StrategyRole, string> = { consistency: 'consistency', 'resolution-rule': 'resolution_rule' };
+
+/** The token ids a strategy-role bot's config trades (consistency: `tokens`; resolution-rule: `token_id`). */
+export function strategyConfigTokens(role: StrategyRole, config: Record<string, unknown> | undefined): string[] {
+  const c = config ?? {};
+  const raw = role === 'consistency' ? (Array.isArray(c.tokens) ? c.tokens : []) : [c.token_id];
+  return [...new Set(raw.filter((t): t is string => typeof t === 'string' && t.trim() !== '').map((t) => t.trim()))];
 }
 
 /** A position from the order-linked fills the risk engine uses (spec §7.3 get_positions) */
@@ -431,7 +446,7 @@ export class BotService {
     if (script.kind !== 'template') deny('the agent can only create bots from templates (list_templates)');
     // Standing builtin roles (executor, position manager) are set up by a human (R168)
     const role = builtinRoleOf(script);
-    if (role) deny(`the ${role} template is a standing bot only a human can create`);
+    if (isStandingRole(role)) deny(`the ${role} template is a standing bot only a human can create`);
     const limits = this.deps.getLimits?.() ?? null;
     if (!limits) deny('limits unavailable (config invalid)', 'conflict');
     const { max_bots_created_per_day: perDay, max_active_bots: maxActive } = limits!.agent;
@@ -452,9 +467,51 @@ export class BotService {
   /** The agent may not start, restart or reconfigure a bot on a standing builtin-role template (R168); denial audited */
   private refuseAgentOnRole(row: { id: string; script_id: string }, action: string): void {
     const role = builtinRoleOf(this.deps.scriptRepo.findById(row.script_id));
-    if (!role) return;
+    if (!isStandingRole(role)) return;
     this.deps.audit?.record('agent', action, row.id, { role }, `denied: ${role} bot`);
     throw new ServiceError('forbidden', `${action}: ${role} bots are standing bots managed by a human (the agent may only pause them)`);
+  }
+
+  /**
+   * Agent bots on the builtin strategy templates (consistency, resolution-rule; 5b): the strategy must be allowed by
+   * the mandate (`strategies.allow`), the config must match the template's configSchema, and the bot's market_ids
+   * must cover the market of every token in the config (resolved through the market cache; unknown ⇒ refused).
+   * `resolve` maps a token to its condition id (cached; create pre-fetches unknown tokens). Denials are audited.
+   * Does nothing for any other script.
+   */
+  private checkAgentStrategyBot(
+    script: ScriptRow | undefined,
+    config: Record<string, unknown> | undefined,
+    marketIds: string[] | null | undefined,
+    action: string,
+    target: string | null,
+    resolve: (tokenId: string) => string | null
+  ): void {
+    const role = builtinRoleOf(script);
+    if (!isStrategyRole(role) || !script) return;
+    const deny = (why: string): never => {
+      this.deps.audit?.record('agent', action, target, { role, marketIds: marketIds ?? null }, `denied: ${why}`);
+      throw new ServiceError('forbidden', `${action === 'bot.create' ? 'bots.create' : 'bots.update'}: ${why}`);
+    };
+    const mandate = this.deps.getMandate?.() ?? null;
+    if (this.deps.getMandate && !mandate) deny('mandate unavailable (config invalid)');
+    if (mandate && !mandate.strategies.allow.includes(STRATEGY_KEYS[role])) deny(`strategy ${STRATEGY_KEYS[role]} is not in mandate.strategies.allow`);
+    let schema: unknown = {};
+    try {
+      schema = JSON.parse(script.config_schema || '{}');
+    } catch {
+      schema = {};
+    }
+    const errors = validateConfigAgainstSchema(config, schema);
+    if (errors.length > 0) deny(`config does not match the ${role} template: ${errors.slice(0, 5).join('; ')}`);
+    const tokens = strategyConfigTokens(role, config);
+    if (tokens.length === 0) deny(`config names no token (${role === 'consistency' ? 'tokens' : 'token_id'})`);
+    if (!marketIds || marketIds.length === 0) deny(`${role} bots need marketIds covering every token in the config`);
+    for (const t of tokens) {
+      const market = resolve(t);
+      if (!market) deny(`token ${t} is unknown to the market cache (open it with get_market first)`);
+      if (!marketIds!.includes(market!)) deny(`token ${t} belongs to market ${market}, which is not in the bot's marketIds`);
+    }
   }
 
   list(filter?: { scriptId?: string; status?: string }): IpcBot[] {
@@ -484,6 +541,20 @@ export class BotService {
     if (who.kind === 'agent') {
       this.deps.guardAgentRun?.(who, 'bot.create');
       this.checkAgentCreate(data);
+      const script = scriptRepo.findById(data.scriptId);
+      const role = builtinRoleOf(script);
+      const markets = new Map<string, string | null>();
+      if (isStrategyRole(role)) {
+        // Resolve the config's tokens first (may refresh the market cache from Gamma), then check synchronously
+        for (const t of strategyConfigTokens(role, data.config).slice(0, 20)) {
+          try {
+            markets.set(t, this.deps.lookupTokenMarket ? await this.deps.lookupTokenMarket(t) : (this.deps.describeToken?.(t)?.marketId ?? null));
+          } catch {
+            markets.set(t, null);
+          }
+        }
+      }
+      this.checkAgentStrategyBot(script, data.config, data.marketIds, 'bot.create', null, (t) => markets.get(t) ?? null);
     }
     let walletId = data.walletId;
     // Live is never implied (3b, spec §15.2): a bot created without a mode is a paper bot
@@ -551,6 +622,10 @@ export class BotService {
     if (who.kind === 'agent') {
       this.refuseAgentOnRole(before, 'bot.update');
       this.requireAgentOwned(before, 'bot.update');
+      // A strategy bot's new config must still match its template and stay within its market_ids (cached markets)
+      if (data.config !== undefined) {
+        this.checkAgentStrategyBot(scriptRepo.findById(before.script_id), data.config, parseMarketIds(before.market_ids), 'bot.update', id, (t) => this.deps.describeToken?.(t)?.marketId ?? null);
+      }
     }
     if (data.walletId !== undefined && data.walletId !== before.wallet_id) {
       const blocked = walletChangeBlocker(id, tradeRepo, orderRepo);
@@ -652,6 +727,27 @@ export class BotService {
     botRepo.setPausedBy(id, null);
     audit?.record(actor, 'bot.stage', id, { from: row.stage, to: 'retired', reason: why });
     return this.get(id);
+  }
+
+  /**
+   * A bot retiring itself (ctx.requestRetire, 5b): only ever this bot, only towards `retired` (less risk), so no
+   * transport actor is involved — BotManager forwards the request of the running script, audited as `bot:<id>`.
+   * Not exposed on HTTP / MCP. Returns false when the bot is gone or already retired.
+   */
+  async retireByBot(id: string, reason: string): Promise<boolean> {
+    const { botRepo, audit } = this.deps;
+    const row = botRepo.findById(id);
+    if (!row || row.stage === 'retired') return false;
+    const why = `self: ${String(reason).trim().slice(0, 500) || 'no reason given'}`;
+    try {
+      if (row.status !== 'stopped') await this.manager().stopBot(id, `bot:${id}`);
+    } catch (err) {
+      logger.warning(`[BotService] Stopping bot ${id} for its retire request failed: ${err instanceof Error ? err.message : err}`);
+    }
+    botRepo.retire(id, why);
+    botRepo.setPausedBy(id, null);
+    audit?.record(`bot:${id}`, 'bot.stage', id, { from: row.stage, to: 'retired', reason: why });
+    return true;
   }
 
   /** Restart (starts a stopped bot too): the agent needs ownership exactly as for start (R134) */

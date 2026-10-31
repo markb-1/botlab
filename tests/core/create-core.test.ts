@@ -266,4 +266,17 @@ describe.skipIf(!sqliteAvailable)('createCore — actors (3a review)', () => {
     // A human may
     expect(c.services.bots.update(bot.id, { config: { take_profit_margin: 0.03 } }, HUMAN).config).toMatchObject({ take_profit_margin: 0.03 });
   }, 60_000);
+
+  it('a bot can retire only itself (ctx.requestRetire → BotService.retireByBot), audited as the bot (5b)', async () => {
+    const c = await started();
+    const cons = c.services.scripts.list().find((s) => s.name === 'Consistency')!;
+    expect(cons).toBeDefined();
+    const wallet = c.repos.walletRepo.create({ name: 'w', address: '0xabc', privateKeyEncrypted: 'x' });
+    const bot = c.repos.botRepo.create({ name: 'cons', scriptId: cons.id, walletId: wallet.id, mode: 'paper', createdBy: 'agent' });
+    expect(c.services.bots.get(bot.id).role).toBe('consistency');
+    expect(await c.services.bots.retireByBot(bot.id, 'markets resolved')).toBe(true);
+    expect(c.services.bots.get(bot.id)).toMatchObject({ stage: 'retired', retireReason: 'self: markets resolved' });
+    expect(lastAudit(c, 'bot.stage')).toMatchObject({ actor: `bot:${bot.id}` });
+    expect(await c.services.bots.retireByBot(bot.id, 'again')).toBe(false);
+  }, 60_000);
 });

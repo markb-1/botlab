@@ -10,7 +10,8 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, MarketDetail } from '../sdk/types';
+import type { MarketView } from '../ledger/MarketCacheService';
 import type { ForecastView } from '../ledger/LedgerService';
 import type { PaperTradingState } from './PaperTradingState';
 import {
@@ -100,6 +101,42 @@ export interface RpcHandlerDeps {
   role?: BuiltinRole | null;
   /** ctx.portfolio bound to this bot: given only to the builtin position manager; missing ⇒ portfolio calls fail */
   portfolio?: PortfolioAccess;
+  /** Market cache lookup by condition id or token id (ctx.polymarket.getMarket); missing ⇒ getMarket fails */
+  getMarket?: (idOrTokenId: string) => Promise<MarketView | null>;
+  /** The bot's market_ids now (null = not market-scoped), for MarketDetail.inScope */
+  marketScope?: () => string[] | null;
+  /** Open exit flags on this bot's positions in its mode (ctx.risk.getExitFlags) */
+  exitFlags?: () => BotExitFlag[];
+  /** Retire this bot (ctx.requestRetire): BotManager runs it after the reply, outside the RPC */
+  requestRetire?: (reason: string) => void;
+}
+
+/** A market cache row as a bot sees it (ctx.polymarket.getMarket). */
+export function toMarketDetail(m: MarketView, askedFor: string, scope: string[] | null): MarketDetail {
+  const tokens = m.tokens.map((t) => ({ tokenId: t.tokenId, outcome: t.outcome }));
+  const asked = tokens.find((t) => t.tokenId === askedFor) ?? null;
+  const other = asked && tokens.length === 2 ? (tokens.find((t) => t.tokenId !== asked.tokenId) ?? null) : null;
+  return {
+    marketId: m.marketId,
+    eventId: m.eventId,
+    question: m.question,
+    category: m.category,
+    endDate: m.endDate,
+    active: m.active,
+    closed: m.closed,
+    negRisk: m.negRisk,
+    tokens,
+    tokenId: asked?.tokenId ?? null,
+    outcome: asked?.outcome ?? null,
+    complementTokenId: other?.tokenId ?? null,
+    ambiguityScore: m.ambiguityScore,
+    rulesHash: m.rulesHash,
+    rulesChangedAt: m.rulesChangedAt,
+    disputed: m.disputed,
+    umaResolutionStatus: m.umaResolutionStatus,
+    inScope: scope === null || scope.includes(m.marketId),
+    updatedAt: m.updatedAt,
+  };
 }
 
 /** Legacy ctx.binance.buy/sell result from an OrderService result. */
@@ -251,6 +288,25 @@ export class RpcHandler {
 
       case 'risk:getBudget':
         return this.orders.getBudget();
+
+      case 'risk:getExitFlags':
+        return this.deps.exitFlags ? this.deps.exitFlags() : [];
+
+      case 'polymarket:getMarket': {
+        const id = args[0];
+        if (typeof id !== 'string' || !id.trim() || id.length > 100) throw new Error('getMarket: a condition id or token id is required');
+        if (!this.deps.getMarket) throw new Error('getMarket: market data unavailable');
+        const m = await this.deps.getMarket(id.trim());
+        return m ? toMarketDetail(m, id.trim(), this.deps.marketScope ? this.deps.marketScope() : null) : null;
+      }
+
+      case 'bot:requestRetire': {
+        const reason = typeof args[0] === 'string' ? args[0].trim().slice(0, 500) : '';
+        if (!reason) throw new Error('requestRetire: a reason is required');
+        if (!this.deps.requestRetire) return { accepted: false };
+        this.deps.requestRetire(reason);
+        return { accepted: true };
+      }
 
       case 'ledger:getActiveForecasts': {
         const filter = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as { category?: unknown; tradeableOnly?: unknown };

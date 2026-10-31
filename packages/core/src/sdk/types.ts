@@ -78,6 +78,14 @@ export interface BotContext {
 
   // === All bots' positions and risk exits: builtin Position Manager template only (others get an error) ===
   portfolio: PortfolioContext;
+
+  /**
+   * Ask the server to retire THIS bot (stage `retired`: stopped, never trades again; only a human can un-retire).
+   * For per-opportunity bots whose opportunity is over (markets resolved, gap closed for days). The server stops
+   * the bot shortly after answering, so return from the current tick afterwards. Positions stay (the Position
+   * Manager can still exit them). Audited as the bot.
+   */
+  requestRetire(reason: string): Promise<{ accepted: boolean }>;
 }
 
 /** ctx.fetch options (spec §5.1): GET or POST, string body, plain header object. */
@@ -231,6 +239,57 @@ export interface PolymarketContext {
   /** This bot's orders of any status from the last `days` (default 7, max 30), newest first, at most 500 */
   getOrderHistory(days?: number): Promise<OrderHistoryEntry[]>;
   getFee(tokenId: string): Promise<FeeRates>;
+  /**
+   * A market from the server's market cache (refreshed from Gamma when stale), by condition id (0x…) or by one of
+   * its token ids; null when unknown. Asked by token, `tokenId` / `outcome` / `complementTokenId` describe that
+   * token and the other token of a binary market (e.g. the NO token of a YES token: Polymarket has no shorting,
+   * "selling" an outcome you do not hold means buying its complement).
+   */
+  getMarket(idOrTokenId: string): Promise<MarketDetail | null>;
+}
+
+/** A market as the server's market cache knows it (ctx.polymarket.getMarket). */
+export interface MarketDetail {
+  /** Condition id */
+  marketId: string;
+  eventId: string;
+  question: string;
+  category: string;
+  /** ISO end date; null if unknown */
+  endDate: string | null;
+  active: boolean;
+  /** Closed for trading (resolved or about to be) */
+  closed: boolean;
+  negRisk: boolean;
+  /** All outcome tokens (a binary market has two: usually Yes / No) */
+  tokens: Array<{ tokenId: string; outcome: string }>;
+  /** The token asked about (null when asked by condition id) */
+  tokenId: string | null;
+  outcome: string | null;
+  /** The other token of a binary market (null if not asked by token or not binary) */
+  complementTokenId: string | null;
+  /** Ambiguity 0-3 after the server raise (rules change, dispute); null = not assessed (buys are refused) */
+  ambiguityScore: number | null;
+  /** Hash of the resolution rules text; changes when the rules change */
+  rulesHash: string | null;
+  rulesChangedAt: string | null;
+  /** A UMA dispute is recorded */
+  disputed: boolean;
+  umaResolutionStatus: string | null;
+  /** This bot may trade the market: it is in the bot's market_ids (or the bot is not market-scoped) */
+  inScope: boolean;
+  /** When the cache row was last refreshed */
+  updatedAt: string;
+}
+
+/** An open exit flag (agent / human flag_position_exit) on one of THIS bot's positions. */
+export interface BotExitFlag {
+  id: string;
+  tokenId: string;
+  marketId: string | null;
+  reason: string;
+  createdBy: string;
+  createdAt: string;
 }
 
 export interface RiskBudget {
@@ -241,6 +300,8 @@ export interface RiskBudget {
 
 export interface RiskContext {
   getBudget(): Promise<RiskBudget>;
+  /** Open exit flags on this bot's positions (same mode); the Position Manager acts on them, a bot may stop buying */
+  getExitFlags(): Promise<BotExitFlag[]>;
 }
 
 /** A ledger forecast (probability of `tokenId` resolving YES), read-only for bots. */
@@ -706,7 +767,10 @@ export type RpcMethod =
   | 'polymarket:getOpenOrders'
   | 'polymarket:getFee'
   | 'polymarket:getOrderHistory'
+  | 'polymarket:getMarket'
   | 'risk:getBudget'
+  | 'risk:getExitFlags'
+  | 'bot:requestRetire'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'
   | 'portfolio:getAllPositions'

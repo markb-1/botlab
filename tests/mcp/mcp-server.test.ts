@@ -131,6 +131,9 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
       vi.fn(async (input: string | URL | Request) => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         if (url.includes('gamma-api.polymarket.com/markets?')) {
+          if (url.includes('333') || url.includes('0xcafe02')) {
+            return new Response(JSON.stringify([gammaMarket({ conditionId: '0xcafe02', question: 'Will CPI exceed 4%?', clobTokenIds: '["333","444"]' })]), { status: 200 });
+          }
           return new Response(JSON.stringify(url.includes(YES) || url.includes(MARKET_ID) ? [gammaMarket()] : []), { status: 200 });
         }
         if (url.includes('gamma-api.polymarket.com/events/')) {
@@ -269,6 +272,43 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     const own = core.services.bots.list().find((x) => x.createdBy === 'agent' && x.stage !== 'retired')!;
     expect((await call('update_bot_config', { botId: own.id, config: {}, name: 'renamed' })).text).toMatch(/Unrecognized key/);
     expect((await call('update_bot_config', { botId: own.id, config: { symbol: 'ETHUSDT' } })).json.config).toEqual({ symbol: 'ETHUSDT' });
+  });
+
+  it('create_bot on the consistency / resolution-rule templates (5b): paper, config checked, marketIds must cover every token; standing roles refused', async () => {
+    const byName = (n: string) => core.services.scripts.templates().find((t) => t.name === n)!;
+    const cons = byName('Consistency');
+    const rr = byName('Resolution Rule');
+    for (const standing of ['Position Manager', 'Forecast Executor']) {
+      expect((await call('create_bot', { templateId: byName(standing).id, name: 'x' })).text).toMatch(/standing bot only a human can create/);
+    }
+    const consConfig = { constraint: 'implies', tokens: [YES, '333'], min_gap: 0.04 };
+    // A token's market missing from marketIds ⇒ refused (server-side, audited)
+    const partial = await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig, marketIds: [MARKET_ID] });
+    expect(partial.text).toMatch(/token 333 belongs to market 0xcafe02, which is not in the bot's marketIds/);
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig })).text).toMatch(/need marketIds covering every token/);
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, tokens: [YES, '999'] }, marketIds: [MARKET_ID] })).text).toMatch(
+      /token 999 is unknown to the market cache/
+    );
+    // The template's configSchema: enum, types, bounds
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, constraint: 'shorts' }, marketIds: [MARKET_ID, '0xcafe02'] })).text).toMatch(
+      /constraint must be one of/
+    );
+    expect((await call('create_bot', { templateId: cons.id, name: 'c1', config: { ...consConfig, min_gap: 0.001 }, marketIds: [MARKET_ID, '0xcafe02'] })).text).toMatch(/min_gap must be >= 0.01/);
+    expect(audit('bot.create').filter((r) => r.actor === 'agent' && String(r.result).startsWith('denied')).length).toBeGreaterThanOrEqual(5);
+
+    const ok = await call('create_bot', { templateId: cons.id, name: 'c1', config: consConfig, marketIds: [MARKET_ID, '0xcafe02'] });
+    expect(ok.isError).toBe(false);
+    expect(ok.json).toMatchObject({ mode: 'paper', stage: 'paper', createdBy: 'agent', role: 'consistency' });
+
+    const rrConfig = { token_id: YES, target_entry_price: 0.4, max_size_usd: 10, thesis: 'Rules resolve on the BLS first print only.' };
+    expect((await call('create_bot', { templateId: rr.id, name: 'r1', config: { ...rrConfig, thesis: '' }, marketIds: [MARKET_ID] })).text).toMatch(/thesis is required/);
+    expect((await call('create_bot', { templateId: rr.id, name: 'r1', config: { ...rrConfig, thesis: 'x'.repeat(2001) }, marketIds: [MARKET_ID] })).text).toMatch(/at most 2000/);
+    const r = await call('create_bot', { templateId: rr.id, name: 'r1', config: rrConfig, marketIds: [MARKET_ID] });
+    expect(r.json).toMatchObject({ mode: 'paper', stage: 'paper', role: 'resolution-rule' });
+    // Config updates stay within the bot's marketIds and the schema
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, token_id: '333' } })).text).toMatch(/not in the bot's marketIds/);
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 2 } })).text).toMatch(/target_entry_price must be <= 0.99/);
+    expect((await call('update_bot_config', { botId: r.json.id, config: { ...rrConfig, target_entry_price: 0.42 } })).json.config).toMatchObject({ target_entry_price: 0.42 });
   });
 
   it('assess_market can set or raise a score, never lower it, never override a human', async () => {

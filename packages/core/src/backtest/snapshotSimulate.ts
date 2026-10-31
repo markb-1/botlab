@@ -443,8 +443,10 @@ function buildCtx(market: SnapshotMarket, mem: InMemoryStorageRepo, input: Snaps
       cancelAll: async () => market.cancelAll(),
       getOpenOrders: async () => market.openOrders(),
       getFee: async (tokenId: string) => input.fees[tokenId] ?? input.defaultFees,
+      getMarket: disabled('getMarket'),
     },
-    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false }) },
+    risk: { getBudget: async () => ({ remainingAllocation: market.freeCash(), remainingMarket: {}, halted: false }), getExitFlags: async () => [] },
+    requestRetire: async () => ({ accepted: false }),
     ledger: { getActiveForecasts: async () => [], getForecast: async () => null },
   } as unknown as BotContext;
 }

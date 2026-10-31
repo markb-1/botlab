@@ -25,15 +25,35 @@ export interface ScriptRow {
   revision: number;
   trust: ScriptTrust;
   source_hash: string | null;
-  /** Standing builtin template role (5a), set only by the seed for origin builtin; null otherwise */
+  /** Builtin template role (5a standing roles, 5b strategy roles), set only by the seed for origin builtin; null otherwise */
   builtin_role?: BuiltinRole | null;
   created_at: string;
   updated_at: string;
 }
 
-/** Roles of the standing builtin templates (spec §9.1, §9.2). */
-export type BuiltinRole = 'forecast-executor' | 'position-manager';
-export const BUILTIN_ROLES: readonly BuiltinRole[] = ['forecast-executor', 'position-manager'];
+/**
+ * Roles of builtin templates, set by the seed from the template's `meta.role`. Two kinds:
+ * - standing (spec §9.1, §9.2): forecast executor, position manager — one running instance per mode, human-operated
+ *   (the agent may only pause them, R168);
+ * - per-opportunity strategies (spec §9.3, §9.4; 5b): consistency, resolution-rule — any number of bots, the agent
+ *   creates them (its bots' `market_ids` must cover every token in the config, checked by BotService).
+ */
+export type StandingRole = 'forecast-executor' | 'position-manager';
+export type StrategyRole = 'consistency' | 'resolution-rule';
+export type BuiltinRole = StandingRole | StrategyRole;
+export const STANDING_ROLES: readonly StandingRole[] = ['forecast-executor', 'position-manager'];
+export const STRATEGY_ROLES: readonly StrategyRole[] = ['consistency', 'resolution-rule'];
+export const BUILTIN_ROLES: readonly BuiltinRole[] = [...STANDING_ROLES, ...STRATEGY_ROLES];
+
+/** A standing (single-instance, human-operated) role */
+export function isStandingRole(role: BuiltinRole | null | undefined): role is StandingRole {
+  return !!role && (STANDING_ROLES as readonly string[]).includes(role);
+}
+
+/** A per-opportunity strategy role (consistency, resolution-rule) */
+export function isStrategyRole(role: BuiltinRole | null | undefined): role is StrategyRole {
+  return !!role && (STRATEGY_ROLES as readonly string[]).includes(role);
+}
 
 /** The script's standing role, only for builtin templates (a human or agent script can never claim one). */
 export function builtinRoleOf(row: Pick<ScriptRow, 'origin' | 'is_template' | 'builtin_role'> | null | undefined): BuiltinRole | null {

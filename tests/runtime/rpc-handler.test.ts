@@ -336,4 +336,53 @@ describe('RpcHandler', () => {
       expect(resp.error).toContain('Unknown RPC method: badMethod');
     });
   });
+
+  describe('5b: getMarket, getExitFlags, requestRetire', () => {
+    const view = (over: Record<string, unknown> = {}) =>
+      ({
+        marketId: '0xm1',
+        eventId: 'e1',
+        question: 'Q?',
+        category: 'economics',
+        endDate: null,
+        active: true,
+        closed: false,
+        negRisk: false,
+        tokens: [
+          { tokenId: 'yes', outcome: 'Yes' },
+          { tokenId: 'no', outcome: 'No' },
+        ],
+        ambiguityScore: 1,
+        rulesHash: 'h',
+        rulesChangedAt: null,
+        disputed: false,
+        umaResolutionStatus: null,
+        updatedAt: '2026-06-01T00:00:00Z',
+        ...over,
+      }) as any;
+
+    it('getMarket returns the complement token and whether the market is in the bot scope', async () => {
+      const getMarket = vi.fn().mockResolvedValue(view());
+      const h = new RpcHandler({ ...deps, getMarket, marketScope: () => ['0xother'] });
+      const r = (await h.handle(makeReq('polymarket:getMarket', ['yes']))).result;
+      expect(r).toMatchObject({ marketId: '0xm1', tokenId: 'yes', outcome: 'Yes', complementTokenId: 'no', inScope: false, ambiguityScore: 1 });
+      const unscoped = new RpcHandler({ ...deps, getMarket, marketScope: () => null });
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['no']))).result).toMatchObject({ complementTokenId: 'yes', inScope: true });
+      // By condition id: no token asked, no complement
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['0xm1']))).result).toMatchObject({ tokenId: null, complementTokenId: null });
+      expect((await unscoped.handle(makeReq('polymarket:getMarket', ['']))).error).toMatch(/required/);
+    });
+
+    it('getExitFlags is only what the server passes for this bot; requestRetire needs a reason and never throws inside the RPC', async () => {
+      const requestRetire = vi.fn();
+      const flags = [{ id: 'f1', tokenId: 'yes', marketId: '0xm1', reason: 'r', createdBy: 'agent', createdAt: '' }];
+      const h = new RpcHandler({ ...deps, requestRetire, exitFlags: () => flags });
+      expect((await h.handle(makeReq('risk:getExitFlags'))).result).toEqual(flags);
+      expect((await liveHandler.handle(makeReq('risk:getExitFlags'))).result).toEqual([]);
+      expect((await h.handle(makeReq('bot:requestRetire', ['  ']))).error).toMatch(/reason is required/);
+      expect((await h.handle(makeReq('bot:requestRetire', ['markets resolved']))).result).toEqual({ accepted: true });
+      expect(requestRetire).toHaveBeenCalledWith('markets resolved');
+      expect((await liveHandler.handle(makeReq('bot:requestRetire', ['x']))).result).toEqual({ accepted: false });
+    });
+  });
 });

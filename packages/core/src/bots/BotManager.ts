@@ -21,7 +21,7 @@ import type { BotStorageRepository } from '../db/repositories/BotStorageReposito
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import { ScriptBotRunner, DEFAULT_PAPER_BALANCE, type OrderServiceFactory } from '../runtime/ScriptBotRunner';
 import { PaperTradingState } from '../runtime/PaperTradingState';
-import { builtinRoleOf, type BuiltinRole } from '../db/repositories/ScriptRepository';
+import { builtinRoleOf, isStandingRole, type BuiltinRole } from '../db/repositories/ScriptRepository';
 import type { PositionExitFlagRepository } from '../db/repositories/AgentRepository';
 import { PortfolioService, type ExitOrderService } from '../orders/PortfolioService';
 import type { BotPushEventName } from '../sdk/types';
@@ -45,6 +45,33 @@ import type { LimitsConfig, AppConfig } from '../config';
 import type { OrderEventSink } from '../notify/events';
 import type { ConfigService } from '../config/ConfigService';
 import { getBalance } from '../exchange/polymarket/trading';
+import type { MarketView } from '../ledger/MarketCacheService';
+
+/** Emitted (with { botId, reason }) when a script calls ctx.requestRetire; the core retires the bot (5b) */
+export const BOT_RETIRE_REQUEST_EVENT = 'bot:retire-request';
+
+/** bots.market_ids JSON → list (null = unscoped; unreadable = no market) */
+export function parseMarketIdList(raw: string | null | undefined): string[] | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** ctx.polymarket.getMarket backend: a condition id (0x…) or a token id; a failed refresh falls back to the cache */
+function marketLookup(cache: MarketCacheService): (idOrTokenId: string) => Promise<MarketView | null> {
+  return async (id) => {
+    const byId = /^0x[0-9a-fA-F]+$/.test(id);
+    try {
+      return byId ? await cache.getMarket(id) : await cache.getMarketByToken(id);
+    } catch {
+      return byId ? cache.getCached(id) : cache.getCachedByToken(id);
+    }
+  };
+}
 import { getBinanceBalance, getBinanceOrderBook } from '../exchange/binance/client';
 import { decrypt } from '../security/crypto';
 import { keyManager } from '../security/keyManager';
@@ -639,7 +666,7 @@ export class BotManager extends EventEmitter {
     // Standing builtin templates (executor, position manager) run once per mode; the role comes from the
     // script row (origin builtin), never from the script itself
     const role = builtinRoleOf(script);
-    if (role) {
+    if (isStandingRole(role)) {
       for (const [otherId, r] of this.roles) {
         if (otherId !== botId && r.role === role && r.mode === mode && this.instances.has(otherId)) {
           throw new Error(`A ${role} bot is already running in ${mode} mode (${this.botRepo.findById(otherId)?.name ?? otherId}); it is a single-instance template`);
@@ -664,6 +691,20 @@ export class BotManager extends EventEmitter {
       ledger: this.orderDeps?.ledger,
       role,
       ...(role === 'position-manager' ? { createPortfolio: ({ botId: id, simulated }) => this.getPortfolio().forBot(id, simulated) } : {}),
+      ...(this.orderDeps?.marketCache ? { getMarket: marketLookup(this.orderDeps.marketCache) } : {}),
+      marketScope: () => parseMarketIdList(this.botRepo.findById(botId)?.market_ids),
+      ...(this.orderDeps?.exitFlags
+        ? {
+            exitFlags: (simulated: boolean) =>
+              this.orderDeps!.exitFlags!.list({ status: 'open', limit: 1000 })
+                .filter((f) => f.bot_id === botId && (f.simulated === 1) === simulated)
+                .map((f) => ({ id: f.id, tokenId: f.token_id, marketId: f.market_id, reason: f.reason, createdBy: f.created_by, createdAt: f.created_at })),
+          }
+        : {}),
+      // Retire runs after the RPC reply (it stops this very worker), via the core's BotService (audited as the bot)
+      requestRetire: (reason: string) => {
+        setImmediate(() => this.emit(BOT_RETIRE_REQUEST_EVENT, { botId, reason }));
+      },
     });
 
     // Forward events
