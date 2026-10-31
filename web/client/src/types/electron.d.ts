@@ -111,7 +111,7 @@ interface ElectronAPI {
   reconcile: {
     status: () => Promise<IpcResponse>;
     /** One-time: record a wallet's pre-existing exchange positions as adopted fills of a bot on that wallet */
-    adoptPositions: (walletId: string, botId: string) => Promise<IpcResponse>;
+    adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => Promise<IpcResponse>;
   };
   recorder: {
     watchlistList: () => Promise<IpcResponse>;

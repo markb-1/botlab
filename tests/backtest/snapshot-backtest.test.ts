@@ -102,7 +102,17 @@ describe('snapshot backtest', () => {
     expect(m.cash).toBeCloseTo(95.5 + 5.5);
   });
 
-  it('resting orders expire after their TTL', () => {
+  it('a resting fill uses up the recorded depth it filled against within the step', () => {
+    const m = new SnapshotMarket(100, () => FEES);
+    m.applyStep([snap('t1', 1000, [[0.4, 50]], [[0.5, 50]])]);
+    m.placeLimit('t1', 'buy', 0.45, 10);
+    m.applyStep([snap('t1', 2000, [[0.4, 50]], [[0.45, 10], [0.6, 50]])]);
+    expect(m.openOrders()).toHaveLength(0);
+    expect(m.marketable('t1', 'buy', 1, { maxPrice: 0.45 })).toMatchObject({ success: false }); // 0.45 level consumed
+    expect(m.orderBook('t1').asks).toEqual([{ price: '0.6', size: '50' }]);
+  });
+
+    it('resting orders expire after their TTL', () => {
     const m = new SnapshotMarket(100, () => FEES, 1);
     m.applyStep([snap('t1', 0, [[0.4, 50]], [[0.5, 50]])]);
     m.placeLimit('t1', 'buy', 0.45, 10, { ttlMinutes: 30 }); // capped at 1 minute

@@ -107,16 +107,16 @@ function feeRatesFor(tokenId: string): { takerRate: number; makerRate: number } 
   return fees.getRates(cat && (FEE_CATEGORIES as readonly string[]).includes(cat) ? (cat as FeeCategory) : null);
 }
 
-/** CLOB /time (seconds) → ms; falls back to Binance server time. */
-async function exchangeTimeMs(): Promise<number> {
+/** CLOB /time (seconds) → ms; falls back to Binance server time (ms). */
+async function exchangeTimeMs(): Promise<{ timeMs: number; resolutionMs: number }> {
   try {
     const resp = await fetch(`${settingsRepo.get().clob_http_url.replace(/\/+$/, '')}/time`, { signal: AbortSignal.timeout(10_000) });
     if (!resp.ok) throw new Error(`CLOB /time HTTP ${resp.status}`);
     const n = Number((await resp.text()).trim());
     if (!Number.isFinite(n) || n <= 0) throw new Error('CLOB /time: not a number');
-    return n < 1e12 ? n * 1000 : n;
+    return n < 1e12 ? { timeMs: n * 1000, resolutionMs: 1000 } : { timeMs: n, resolutionMs: 1 };
   } catch {
-    return getBinanceServerTime();
+    return { timeMs: await getBinanceServerTime(), resolutionMs: 1 };
   }
 }
 
@@ -532,7 +532,7 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
   });
 
   // 5. Register protected IPC handlers (bots + wallets need encryption key)
-  registerBotHandlers(botRepo, walletRepo, scriptRepo, tradeRepo, botManager, walletManager, storageRepo, settingsRepo, audit);
+  registerBotHandlers(botRepo, walletRepo, scriptRepo, tradeRepo, botManager, walletManager, storageRepo, settingsRepo, audit, orderRepo);
   registerWalletHandlers(walletRepo, walletManager, settingsRepo);
 
   console.log('[Main] Phase B complete — all services ready');

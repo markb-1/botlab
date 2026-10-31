@@ -23,13 +23,13 @@ export function registerReconcileHandlers(deps: {
   });
 
   /** One-time adoption of pre-existing exchange positions (R8) into a bot on the same wallet. */
-  ipcMain.handle('reconcile:adoptPositions', async (event, walletId: string, botId: string) => {
+  ipcMain.handle('reconcile:adoptPositions', async (event, walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => {
     if (!deps.isTrustedSender(event.sender)) return untrusted;
     const r = deps.getReconciler();
     if (!r) return locked;
     if (typeof walletId !== 'string' || !walletId || typeof botId !== 'string' || !botId) return { success: false, error: 'walletId and botId are required' };
     try {
-      return { success: true, data: await r.adoptPositions(walletId, botId, 'human') };
+      return { success: true, data: await r.adoptPositions(walletId, botId, 'human', { includePostFirstOrder: opts?.includePostFirstOrder === true }) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }

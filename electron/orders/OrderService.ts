@@ -36,7 +36,7 @@ import type { FeeCategory, FeeService } from './FeeService';
 import type { MarketDataService, MarketInfo, MarketQualityProvider } from './MarketDataService';
 import type { AuditService } from '../audit/AuditService';
 import type { OrderEventSink, OrderFillEvent } from '../notify/events';
-import { applyExchangeOrderState, recordOrderFill, type ExchangeOrderState } from './orderFills';
+import { applyExchangeOrderState, applyPlacementResult, recordOrderFill, type ExchangeOrderState, type PlacementResult } from './orderFills';
 import logger from '../../src/utils/logger';
 
 const MS_PER_MINUTE = 60_000;
@@ -189,7 +189,7 @@ export interface OrderServiceDeps {
 
 /** Local clock vs exchange server time. `skewed` ⇒ live orders are refused. */
 export interface ClockSkewGuard {
-  status(): { skewed: boolean; detail: string | null };
+  status(): { skewed: boolean; detail: string | null; reason?: 'clock_skew' | 'clock_unverified' };
 }
 
 export interface BotOrderContext {
@@ -673,7 +673,10 @@ export class OrderService {
       let decision = preCheck;
       if (!decision && !this.paper && this.deps.clock) {
         const clock = this.deps.clock.status();
-        if (clock.skewed) decision = preDecision('clock_skew', `Clock skew: ${clock.detail ?? 'local clock differs from exchange time'}`, this.now());
+        if (clock.skewed) {
+          const name = clock.reason ?? 'clock_skew';
+          decision = preDecision(name, `${name === 'clock_unverified' ? 'Clock unverified' : 'Clock skew'}: ${clock.detail ?? 'local clock differs from exchange time'}`, this.now());
+        }
       }
       if (!decision) {
         try {
@@ -743,19 +746,29 @@ export class OrderService {
    */
   private applyOutcome(row: OrderRow, outcome: PostOrderOutcome, feeRate: number, ctx: PolymarketContext): OrderRow {
     const side = row.side as OrderSide;
+    const apply = (r: PlacementResult): OrderRow => {
+      const res = applyPlacementResult(this.deps, row.id, r, {
+        owner: { botId: this.bot.botId, botName: this.bot.botName, scriptName: this.bot.scriptName, simulated: this.paper },
+        info: { question: ctx.info?.question ?? null, outcome: ctx.info?.outcome ?? null, category: ctx.category },
+      });
+      if (res.delta > 0) this.deps.provider.invalidateCash();
+      this.pendingFills = res.events;
+      this.emitPendingFills();
+      return res.row ?? row;
+    };
 
     if (outcome.kind === 'rejected') {
       logger.warning(`[OrderService] ${this.bot.botName}: order ${row.id} failed: ${outcome.error}`);
-      return this.deps.orderRepo.update(row.id, { status: 'failed' }) ?? row;
+      return apply({ status: 'failed' });
     }
     if (outcome.kind === 'unknown') {
-      // May be live on the exchange: keep counting it as open until it expires (a market order
-      // gets a short lifetime so it cannot hold exposure forever)
+      // May be live on the exchange: keep counting it as open until the Reconciler settles it (a market
+      // order gets a lifetime after which the Reconciler may close it once the exchange confirms no fill)
       logger.error(`[OrderService] ${this.bot.botName}: order ${row.id} outcome unknown, left as submitted: ${outcome.error}`);
-      if (row.order_type === 'market' && !row.expires_at) {
-        return this.deps.orderRepo.update(row.id, { expiresAt: new Date(this.now() + MARKET_ORDER_LIFETIME_MS).toISOString() }) ?? row;
-      }
-      return this.deps.orderRepo.findById(row.id) ?? row;
+      return apply({
+        status: 'submitted',
+        ...(row.order_type === 'market' && !row.expires_at ? { expiresAt: new Date(this.now() + MARKET_ORDER_LIFETIME_MS).toISOString() } : {}),
+      });
     }
 
     let fill: Fill | null = null;
@@ -790,25 +803,8 @@ export class OrderService {
         filled >= row.size - QTY_EPS ? 'filled' : filled > QTY_EPS ? 'partially_filled' : exStatus === 'live' ? 'open' : 'submitted';
     }
 
-    // Expected fee on what actually filled
-    const fee = fill ? feeRate * fill.notional : 0;
-    this.pendingFills = [];
-    const tx = this.deps.db.transaction(() => {
-      const updated = this.deps.orderRepo.update(row.id, {
-        status,
-        exchangeOrderId: outcome.exchangeOrderId,
-        filledSize: fill?.size ?? 0,
-        avgFillPrice: fill && fill.size > 0 ? fill.notional / fill.size : null,
-        feeUsd: fee,
-        ...(expiresAt !== undefined ? { expiresAt } : {}),
-      });
-      if (fill) this.recordFill(row, fill, fee, ctx.info, ctx.category);
-      return updated;
-    });
-    const updated = tx() ?? row;
-    if (fill) this.deps.provider.invalidateCash();
-    this.emitPendingFills();
-    return updated;
+    // Expected fee on what actually filled (only the part not already recorded, e.g. by the Reconciler)
+    return apply({ status, exchangeOrderId: outcome.exchangeOrderId, filled: fill, feeRate, ...(expiresAt !== undefined ? { expiresAt } : {}) });
   }
 
   /** Fills recorded in the running transaction; emitted to the notifier only after it commits. */
@@ -910,7 +906,7 @@ export class OrderService {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Thrown before any request (e.g. no credentials) ⇒ nothing was sent
-      const failed = this.deps.orderRepo.update(row.id, { status: 'failed' }) ?? row;
+      const failed = this.applyOutcome(row, { kind: 'rejected', error: msg }, 0, { info: null, market: null, book: null, feeCategory: null, category: null });
       return resultFromRow(failed, { error: msg });
     }
 
@@ -927,8 +923,8 @@ export class OrderService {
       outcome = { kind: res.outcomeUnknown ? 'unknown' : 'rejected', error: res.error || 'Binance order failed' };
     }
     if (outcome.kind === 'accepted' && !(res.executedQty > QTY_EPS)) {
-      const r = this.deps.orderRepo.update(row.id, { status: 'cancelled', exchangeOrderId: outcome.exchangeOrderId }) ?? row;
-      return resultFromRow(r, { ok: false, error: 'Order did not fill' });
+      const r = this.applyOutcome(row, { ...outcome, status: 'unmatched' }, 0, { info: null, market: null, book: null, feeCategory: null, category: null });
+      return resultFromRow(r, r.status === 'cancelled' ? { ok: false, error: 'Order did not fill' } : {});
     }
     // Binance fees are charged in the traded asset/BNB; not modelled here (fee_usd = 0)
     const updated = await this.cancelIfHaltedAfterSubmit(

@@ -59,6 +59,32 @@ function backfillScriptVersions(database: Database.Database): void {
 }
 
 /**
+ * One order row per exchange order (2b review): partial unique index on (exchange, exchange_order_id).
+ * Existing duplicates are never rewritten; if any exist the index is not created and the conflict is
+ * logged (the application-level check still refuses to link an id another row holds).
+ */
+function ensureUniqueExchangeOrderIds(database: Database.Database): void {
+  const dups = database
+    .prepare(
+      `SELECT exchange, exchange_order_id, COUNT(*) AS n FROM orders WHERE exchange_order_id IS NOT NULL
+       GROUP BY exchange, exchange_order_id HAVING COUNT(*) > 1`
+    )
+    .all() as Array<{ exchange: string; exchange_order_id: string; n: number }>;
+  if (dups.length > 0) {
+    console.error(
+      `[Database] ${dups.length} exchange order id(s) are shared by several order rows (${dups
+        .slice(0, 5)
+        .map((d) => `${d.exchange}:${d.exchange_order_id}×${d.n}`)
+        .join(', ')}); unique index not created — fix these rows by hand`
+    );
+    return;
+  }
+  database.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_exchange_order_unique ON orders(exchange, exchange_order_id) WHERE exchange_order_id IS NOT NULL'
+  );
+}
+
+/**
  * Schema SQL - inlined to avoid file path issues with compiled output.
  */
 const SCHEMA_SQL = `
@@ -488,10 +514,25 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       added_by TEXT NOT NULL,
       added_at TEXT NOT NULL
     )`,
+    // 2b review: the wallet an order / fill belongs to, fixed at creation (a bot can change wallets later).
+    // Pre-2b rows are backfilled below with their bot's current wallet.
+    'ALTER TABLE orders ADD COLUMN wallet_id TEXT',
+    'ALTER TABLE bot_trades ADD COLUMN wallet_id TEXT',
+    'CREATE INDEX IF NOT EXISTS idx_orders_wallet ON orders(wallet_id)',
+    // Recorder bookkeeping (last downsample cutoff)
+    `CREATE TABLE IF NOT EXISTS recorder_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
   }
+
+  // 2b review: wallet of pre-existing orders / fills = their bot's wallet (idempotent)
+  db.exec(`UPDATE orders SET wallet_id = (SELECT wallet_id FROM bots WHERE bots.id = orders.bot_id) WHERE wallet_id IS NULL`);
+  db.exec(`UPDATE bot_trades SET wallet_id = (SELECT wallet_id FROM bots WHERE bots.id = bot_trades.bot_id) WHERE wallet_id IS NULL`);
+  ensureUniqueExchangeOrderIds(db);
 
   // Built-in templates (pre-1c rows) are proven builtin templates; idempotent.
   db.exec("UPDATE scripts SET kind = 'template', origin = 'builtin', trust = 'proven' WHERE is_template = 1 AND origin <> 'builtin'");

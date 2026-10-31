@@ -50,12 +50,20 @@ import logger from '../../src/utils/logger';
 export const RECONCILE_INTERVAL_MS = 60_000;
 /** Spec §15: refuse live orders when exchange time differs by more than this */
 export const MAX_CLOCK_SKEW_MS = 5_000;
+/** Without a successful clock check for this long, live orders are refused (`clock_unverified`) */
+export const CLOCK_UNVERIFIED_MS = 3 * 60_000;
+/** Round trips longer than this give no slack (the midpoint is too uncertain to be generous) */
+const MAX_SLACK_RTT_MS = 2_000;
+/** Unknown-outcome orders younger than this may still be in flight (OrderService is waiting for the answer) */
+export const IN_FLIGHT_GRACE_MS = 2 * 60_000;
 /** Consecutive failed runs before a notification (no halt on reconciler outage alone) */
 export const RECONCILER_FAILURE_ALERT = 5;
 /** Consecutive runs a mismatch must persist before it can halt */
 export const MISMATCH_RUNS_TO_HALT = 2;
 export const DUST_QTY = 0.01;
 export const DUST_USD = 0.5;
+/** Polymarket local_excess tolerance (fee possibly taken in shares; unverified) — fraction of the local position */
+export const LOCAL_EXCESS_FEE_TOLERANCE = 0.01;
 export const DEFAULT_MAX_UNEXPLAINED_USD = 10;
 /** Unknown-outcome search window around the order's submit time */
 const SEARCH_BEFORE_MS = 60_000;
@@ -99,8 +107,11 @@ export interface ReconcilerDeps {
   getBinanceAdapter: () => BinanceAdapter | null;
   fetchPositions: (user: string) => Promise<DataApiPosition[]>;
   fetchTrades: (user: string, conditionId: string) => Promise<DataApiTrade[]>;
-  /** Exchange server time in ms (CLOB /time, else Binance /api/v3/time) */
-  getExchangeTime: () => Promise<number>;
+  /**
+   * Exchange server time in ms (CLOB /time, else Binance /api/v3/time); `resolutionMs` 1000 for sources that
+   * report whole seconds (adds 1 s tolerance)
+   */
+  getExchangeTime: () => Promise<number | { timeMs: number; resolutionMs: number }>;
   /** Binance spot price (USDT) for valuing a missing balance; optional */
   getBinancePrice?: (symbol: string) => Promise<number>;
   getLimits: () => LimitsConfig | null;
@@ -143,7 +154,7 @@ export interface ReconcileRunResult {
 }
 
 export interface AdoptResult {
-  adopted: Array<{ tokenId: string; marketId: string | null; quantity: number; price: number }>;
+  adopted: Array<{ tokenId: string; marketId: string | null; quantity: number; price: number; postFirstOrderQuantity?: number }>;
   skipped: Array<{ tokenId: string; reason: string }>;
 }
 
@@ -233,6 +244,9 @@ export class Reconciler implements ClockSkewGuard {
   private consecutiveFailures = 0;
   private outageAlerted = false;
   private skew: { skewed: boolean; detail: string | null; ms: number | null } = { skewed: false, detail: null, ms: null };
+  /** Last successful clock check (else construction time): no check for 3 min ⇒ clock_unverified */
+  private lastClockOkAt: number;
+  private unverifiedReported = false;
   /** mismatch key → consecutive runs seen */
   private mismatchRuns = new Map<string, number>();
   private lastReportedKeys = new Set<string>();
@@ -242,12 +256,18 @@ export class Reconciler implements ClockSkewGuard {
   constructor(deps: ReconcilerDeps) {
     this.deps = deps;
     this.now = deps.now ?? Date.now;
+    this.lastClockOkAt = this.now();
   }
 
   // ── ClockSkewGuard ──────────────────────────────────────────────
 
-  status(): { skewed: boolean; detail: string | null } {
-    return { skewed: this.skew.skewed, detail: this.skew.detail };
+  status(): { skewed: boolean; detail: string | null; reason?: 'clock_skew' | 'clock_unverified' } {
+    if (this.skew.skewed) return { skewed: true, detail: this.skew.detail, reason: 'clock_skew' };
+    const since = this.now() - this.lastClockOkAt;
+    if (since > CLOCK_UNVERIFIED_MS) {
+      return { skewed: true, detail: `no successful exchange clock check for ${Math.round(since / 1000)} s`, reason: 'clock_unverified' };
+    }
+    return { skewed: false, detail: null };
   }
 
   /** Last finished run (for IPC / health). */
@@ -359,22 +379,38 @@ export class Reconciler implements ClockSkewGuard {
 
   private async checkClock(result: ReconcileRunResult): Promise<void> {
     let skewMs: number;
+    let resolutionMs = 1;
     try {
       const t0 = this.now();
-      const server = await withTimeout(this.deps.getExchangeTime(), LOOKUP_TIMEOUT_MS, 'exchange time');
+      const answer = await withTimeout(this.deps.getExchangeTime(), LOOKUP_TIMEOUT_MS, 'exchange time');
       const t1 = this.now();
+      const server = typeof answer === 'number' ? answer : answer.timeMs;
+      resolutionMs = typeof answer === 'number' ? 1 : answer.resolutionMs;
       if (!Number.isFinite(server)) throw new Error('no server time');
-      // Round-trip midpoint; the uncertainty (half the round trip) is given to the local clock
+      // Round-trip midpoint; the uncertainty (half the round trip) is given to the local clock, unless the
+      // round trip is so long that the midpoint means little
       skewMs = server - (t0 + t1) / 2;
-      const slack = (t1 - t0) / 2;
-      skewMs = Math.sign(skewMs) * Math.max(0, Math.abs(skewMs) - slack);
+      const rtt = t1 - t0;
+      if (rtt <= MAX_SLACK_RTT_MS) skewMs = Math.sign(skewMs) * Math.max(0, Math.abs(skewMs) - rtt / 2);
     } catch (err) {
-      // Unknown: keep the previous state (a skew stays blocking until it is seen fixed)
+      // Unknown: keep the previous state (a skew stays blocking until it is seen fixed); after 3 min without
+      // a successful check live orders are refused (status(): clock_unverified)
       result.errors.push(`clock: ${errMsg(err)}`);
+      if (this.now() - this.lastClockOkAt > CLOCK_UNVERIFIED_MS && !this.unverifiedReported) {
+        this.unverifiedReported = true;
+        this.deps.audit.record('system', 'reconcile.clock_unverified', null, { error: errMsg(err) }, 'live orders blocked');
+        this.alert(`Exchange clock could not be checked for over ${CLOCK_UNVERIFIED_MS / 60_000} min (${errMsg(err)}); new live orders are refused until it can.`);
+      }
       return;
     }
+    this.lastClockOkAt = this.now();
+    if (this.unverifiedReported) {
+      this.unverifiedReported = false;
+      this.deps.audit.record('system', 'reconcile.clock_verified', null, { skewMs: Math.round(skewMs) });
+    }
     result.clockSkewMs = skewMs;
-    const skewed = Math.abs(skewMs) > MAX_CLOCK_SKEW_MS;
+    // Whole-second sources (CLOB /time) get 1 s more tolerance
+    const skewed = Math.abs(skewMs) > MAX_CLOCK_SKEW_MS + (resolutionMs >= 1000 ? 1000 : 0);
     const detail = `local clock ${skewMs > 0 ? 'behind' : 'ahead of'} exchange time by ${(Math.abs(skewMs) / 1000).toFixed(1)} s (max ${MAX_CLOCK_SKEW_MS / 1000} s); fix NTP`;
     if (skewed && !this.skew.skewed) {
       this.deps.audit.record('system', 'reconcile.clock_skew', null, { skewMs: Math.round(skewMs) }, 'live orders blocked');
@@ -401,8 +437,20 @@ export class Reconciler implements ClockSkewGuard {
     return w ? [w.proxy_address, w.address].filter((a): a is string => !!a && a.trim().length > 0) : [];
   }
 
-  private async syncOrders(result: ReconcileRunResult, failedWallets: Set<string>): Promise<void> {
-    const rows = this.deps.orderRepo.findOpen(undefined, false);
+  /** Wallet an order belongs to: stored on the row at creation, else its bot's current wallet. */
+  private walletOf(row: OrderRow): string | null {
+    return row.wallet_id ?? this.deps.botRepo.findById(row.bot_id)?.wallet_id ?? null;
+  }
+
+  /** Unknown-outcome order that OrderService may still be waiting on (do not race the placement). */
+  private inFlight(row: OrderRow): boolean {
+    return row.status === 'submitted' && !row.exchange_order_id && this.now() - Date.parse(row.created_at) < IN_FLIGHT_GRACE_MS;
+  }
+
+  private async syncOrders(result: ReconcileRunResult, failedWallets: Set<string>, onlyWallet?: string): Promise<void> {
+    const rows = this.deps.orderRepo
+      .findOpen(undefined, false)
+      .filter((r) => !onlyWallet || (r.exchange === 'polymarket' && this.walletOf(r) === onlyWallet));
     const adapters = new Map<string, Promise<PolymarketAdapter | null>>();
     const adapterFor = (walletId: string) => {
       let p = adapters.get(walletId);
@@ -414,20 +462,21 @@ export class Reconciler implements ClockSkewGuard {
     };
 
     for (const row of rows) {
+      if (this.inFlight(row)) continue;
       result.ordersChecked++;
-      const bot = this.deps.botRepo.findById(row.bot_id);
+      const walletId = this.walletOf(row);
       try {
         if (row.exchange === 'binance') {
           await this.syncBinanceOrder(row, result);
           continue;
         }
-        if (!bot) throw new Error(`bot ${row.bot_id} not found (wallet unknown)`);
-        const adapter = await adapterFor(bot.wallet_id);
+        if (!walletId) throw new Error(`bot ${row.bot_id} not found (wallet unknown)`);
+        const adapter = await adapterFor(walletId);
         if (!adapter) throw new Error('no exchange client for the wallet');
         if (row.exchange_order_id) await this.syncPolymarketOrder(row, adapter, result);
-        else await this.searchPolymarketOrder(row, adapter, bot.wallet_id, result);
+        else await this.searchPolymarketOrder(row, adapter, walletId, result);
       } catch (err) {
-        if (bot && row.exchange === 'polymarket') failedWallets.add(bot.wallet_id);
+        if (walletId && row.exchange === 'polymarket') failedWallets.add(walletId);
         if (row.exchange === 'binance') failedWallets.add('binance');
         result.errors.push(`order ${row.id}: ${errMsg(err)}`);
       }
@@ -696,22 +745,17 @@ export class Reconciler implements ClockSkewGuard {
 
   /** Live order-linked Polymarket positions of the bots on a wallet, per token. */
   private localPositions(walletId: string): Map<string, { qty: number; cost: number; marketId: string | null }> {
-    const botIds = new Set(this.deps.botRepo.findAll().filter((b) => b.wallet_id === walletId).map((b) => b.id));
     const out = new Map<string, { qty: number; cost: number; marketId: string | null }>();
-    for (const p of this.deps.tradeRepo.getRiskPositions({ simulated: false, exchange: 'polymarket' })) {
-      if (!botIds.has(p.bot_id)) continue;
-      const e = out.get(p.symbol) ?? { qty: 0, cost: 0, marketId: p.condition_id };
-      e.qty += p.net_quantity;
-      e.cost += p.cost_basis;
-      e.marketId = e.marketId ?? p.condition_id;
-      out.set(p.symbol, e);
+    for (const p of this.deps.tradeRepo.getLiveWalletPositions()) {
+      if (p.wallet_id !== walletId) continue;
+      out.set(p.symbol, { qty: p.net_quantity, cost: p.cost_basis, marketId: p.condition_id });
     }
     return out;
   }
 
-  /** Wallets used by at least one bot (paper wallets excluded). */
+  /** Wallets used by a bot or holding order-linked live positions (paper wallets excluded). */
   private liveWallets(): string[] {
-    const ids = new Set(this.deps.botRepo.findAll().map((b) => b.wallet_id));
+    const ids = new Set([...this.deps.botRepo.findAll().map((b) => b.wallet_id), ...this.deps.tradeRepo.getLiveWalletPositions().map((p) => p.wallet_id)]);
     return [...ids].filter((id) => {
       const w = this.deps.walletRepo.findById(id);
       return !!w && w.is_paper !== 1;
@@ -727,19 +771,24 @@ export class Reconciler implements ClockSkewGuard {
 
   /** Quantity of a token the wallet held before `beforeMs` (net of sells); 0 if unknown (fail closed). */
   private async heldBefore(user: string, marketId: string | null, tokenId: string, beforeMs: number): Promise<number> {
-    if (!marketId) return 0;
     try {
-      const trades = await withTimeout(this.deps.fetchTrades(user, marketId), LOOKUP_TIMEOUT_MS, 'Data API trades');
-      let qty = 0;
-      for (const t of trades) {
-        if (t.tokenId !== tokenId || t.timestampMs >= beforeMs) continue;
-        qty += t.side === 'BUY' ? t.size : -t.size;
-      }
-      return Math.max(0, qty);
+      return await this.heldBeforeStrict(user, marketId, tokenId, beforeMs);
     } catch (err) {
       logger.warning(`[Reconciler] Could not read trade history of ${tokenId}: ${errMsg(err)}; treated as not pre-existing`);
       return 0;
     }
+  }
+
+  /** Same, but a failed lookup throws (adoption refuses rather than guess). */
+  private async heldBeforeStrict(user: string, marketId: string | null, tokenId: string, beforeMs: number): Promise<number> {
+    if (!marketId) return 0;
+    const trades = await withTimeout(this.deps.fetchTrades(user, marketId), LOOKUP_TIMEOUT_MS, 'Data API trades');
+    let qty = 0;
+    for (const t of trades) {
+      if (t.tokenId !== tokenId || t.timestampMs >= beforeMs) continue;
+      qty += t.side === 'BUY' ? t.size : -t.size;
+    }
+    return Math.max(0, qty);
   }
 
   /** Exchange positions not explained by local fills, per token (shared with adoption). */
@@ -763,7 +812,9 @@ export class Reconciler implements ClockSkewGuard {
       const exchangeQty = ex?.size ?? 0;
       const localQty = loc?.qty ?? 0;
       const diff = exchangeQty - localQty;
-      if (Math.abs(diff) <= DUST_QTY) continue;
+      // Until verified whether the CLOB takes the taker fee in shares, local may exceed the exchange by up to 1 %
+      const tolerance = diff < 0 ? Math.max(DUST_QTY, LOCAL_EXCESS_FEE_TOLERANCE * localQty) : DUST_QTY;
+      if (Math.abs(diff) <= tolerance) continue;
       const markPrice = ex?.curPrice ?? (loc && loc.qty > 0 ? loc.cost / loc.qty : null);
       // Unknown price ⇒ valued at $1 per share (the most a share can be worth)
       const valueUsd = Math.abs(diff) * (markPrice ?? 1);
@@ -955,33 +1006,75 @@ export class Reconciler implements ClockSkewGuard {
    * Record a wallet's exchange positions that have no local fills (pre-v3, R8) as `adopted` fills of a bot
    * on that wallet, so they count as exposure, become sellable by the bot and stop triggering mismatches.
    * Priced at the Data API's current price (else its average price): the day's P&L starts from now.
+   *
+   * Safety (2b review): the wallet's orders are synced first; refused while the wallet has an open live order
+   * whose outcome is unknown (no exchange id, incl. ambiguous ones), for retired or halted bots, or when the
+   * trade history cannot be read. Per token only the quantity held before the wallet's first order is
+   * adopted; anything beyond needs `includePostFirstOrder: true` (audited).
    */
-  async adoptPositions(walletId: string, botId: string, actor: AuditActor): Promise<AdoptResult> {
-    if (actor !== 'human') {
-      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId }, 'denied: human only');
-      throw new Error('Only a human can adopt positions');
-    }
+  async adoptPositions(walletId: string, botId: string, actor: AuditActor, opts: { includePostFirstOrder?: boolean } = {}): Promise<AdoptResult> {
+    const includePost = opts.includePostFirstOrder === true;
+    const deny = (why: string): never => {
+      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost }, `denied: ${why}`);
+      throw new Error(why);
+    };
+    if (actor !== 'human') deny('Only a human can adopt positions');
     const bot = this.deps.botRepo.findById(botId);
-    if (!bot) throw new Error(`Bot ${botId} not found`);
-    if (bot.wallet_id !== walletId) throw new Error(`Bot ${botId} does not use wallet ${walletId}`);
+    if (!bot) deny(`Bot ${botId} not found`);
+    if (bot!.wallet_id !== walletId) deny(`Bot ${botId} does not use wallet ${walletId}`);
+    if (bot!.stage === 'retired') deny(`Bot ${botId} is retired`);
+    if (this.deps.riskStateRepo.isHalted(botId)) deny(`Bot ${botId} is halted`);
     const wallet = this.deps.walletRepo.findById(walletId);
-    if (!wallet || wallet.is_paper === 1) throw new Error('Wallet not found or a paper wallet');
+    if (!wallet || wallet.is_paper === 1) deny('Wallet not found or a paper wallet');
 
     // Not while a run compares positions
     while (this.running) await this.running;
     let release!: () => void;
     this.running = new Promise<ReconcileRunResult | null>((r) => (release = () => r(null)));
     try {
+      // 1. Bring the wallet's orders up to date (fills recorded locally are not "unexplained")
+      const sync = { errors: [], ordersChecked: 0, recovered: [], expired: [], ambiguous: [] } as unknown as ReconcileRunResult;
+      await this.syncOrders(sync, new Set<string>(), walletId);
+      if (sync.errors.length > 0) deny(`order sync failed: ${sync.errors.join('; ').slice(0, 300)}`);
+      const unknown = this.deps.orderRepo
+        .findOpen(undefined, false)
+        .filter((o) => o.exchange === 'polymarket' && !o.exchange_order_id && this.walletOf(o) === walletId);
+      if (unknown.length > 0) deny(`wallet has ${unknown.length} open order(s) with unknown outcome (${unknown.map((o) => o.id).join(', ')}); wait for the reconciler`);
+
+      // 2. Exchange excess, capped at what was held before the wallet's first order
       const diffs = (await this.polymarketDiffs(walletId)).filter((d) => d.direction === 'exchange_excess');
+      const first = this.deps.orderRepo.firstLiveOrderAtForWallet(walletId);
+      const firstMs = first ? Date.parse(first) : null;
+      const plan: Array<{ d: (typeof diffs)[number]; qty: number; post: number }> = [];
       const result: AdoptResult = { adopted: [], skipped: [] };
+      for (const d of diffs) {
+        const excess = d.exchangeQty - d.localQty;
+        let pre: number;
+        try {
+          pre = firstMs === null ? Infinity : await this.heldBeforeStrict(d.user, d.marketId, d.symbol, firstMs);
+        } catch (err) {
+          deny(`trade history of ${d.symbol} unavailable: ${errMsg(err)}`);
+          return result; // unreachable
+        }
+        // Pre-existing quantity not adopted yet (repeated adoptions cannot exceed it)
+        const capped = Math.max(0, Math.min(excess, pre - this.deps.tradeRepo.adoptedQuantity(walletId, d.symbol)));
+        const post = Math.max(0, excess - capped);
+        const qty = includePost ? excess : capped;
+        if (d.price === null || !(d.price >= 0)) {
+          result.skipped.push({ tokenId: d.symbol, reason: 'no price from the Data API' });
+          continue;
+        }
+        if (qty <= DUST_QTY) {
+          result.skipped.push({ tokenId: d.symbol, reason: `bought after the wallet's first order (${post.toFixed(2)}); pass includePostFirstOrder to adopt` });
+          continue;
+        }
+        if (!includePost && post > DUST_QTY) result.skipped.push({ tokenId: d.symbol, reason: `${post.toFixed(2)} bought after the wallet's first order not adopted` });
+        plan.push({ d, qty, post: includePost ? post : 0 });
+      }
+
       const owner = this.owner(botId);
       this.deps.db.transaction(() => {
-        for (const d of diffs) {
-          const qty = d.exchangeQty - d.localQty;
-          if (d.price === null || !(d.price >= 0)) {
-            result.skipped.push({ tokenId: d.symbol, reason: 'no price from the Data API' });
-            continue;
-          }
+        for (const { d, qty, post } of plan) {
           const view = this.deps.marketCache?.getCachedByToken(d.symbol) ?? null;
           this.deps.tradeRepo.create({
             botId,
@@ -993,23 +1086,24 @@ export class Reconciler implements ClockSkewGuard {
             conditionId: d.marketId ?? undefined,
             market: view?.question,
             outcome: view?.tokens.find((t) => t.tokenId === d.symbol)?.outcome,
-            price: d.price,
+            price: d.price!,
             quantity: qty,
-            quoteAmount: qty * d.price,
+            quoteAmount: qty * d.price!,
             simulated: 0,
             orderId: `adopt:${generateId()}`,
             feeUsd: 0,
             category: view?.category ?? null,
             fillSource: 'adopted',
+            walletId,
           });
-          result.adopted.push({ tokenId: d.symbol, marketId: d.marketId, quantity: qty, price: d.price });
+          result.adopted.push({ tokenId: d.symbol, marketId: d.marketId, quantity: qty, price: d.price!, ...(post > 0 ? { postFirstOrderQuantity: post } : {}) });
         }
       })();
       for (const a of result.adopted) {
         this.mismatchRuns.delete(`${walletId}:polymarket:${a.tokenId}:exchange_excess`);
         this.lastReportedKeys.delete(`${walletId}:polymarket:${a.tokenId}:exchange_excess`);
       }
-      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, ...result }, result.skipped.length ? 'partial' : 'ok');
+      this.deps.audit.record(actor, 'reconcile.adopt', botId, { walletId, includePostFirstOrder: includePost, ...result }, result.skipped.length ? 'partial' : 'ok');
       logger.info(`[Reconciler] Adopted ${result.adopted.length} position(s) of wallet ${walletId} into bot ${botId}`);
       return result;
     } finally {

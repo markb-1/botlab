@@ -68,7 +68,7 @@ describe.skipIf(!sqliteAvailable)('Recorder storage and retention', () => {
     expect(Buffer.isBuffer(blob.bids)).toBe(true);
   });
 
-  it('downsamples rows older than 180 days to the last snapshot per 15-minute bucket', () => {
+  it('downsamples rows older than 180 days to the last snapshot per 15-minute bucket', async () => {
     t = openTestDb();
     const repo = new OrderbookSnapshotRepository(t.db);
     const now = Date.UTC(2026, 9, 31);
@@ -89,7 +89,7 @@ describe.skipIf(!sqliteAvailable)('Recorder storage and retention', () => {
       fetchBook: async () => ({}),
       now: () => now,
     });
-    const deleted = rec.runRetentionIfDue(true);
+    const deleted = await rec.runRetentionIfDue(true);
     expect(deleted).toBe(2 * 28);
     const kept = repo.range(['t1'], 0, now).map((s) => s.ts);
     expect(kept).toEqual([
@@ -97,8 +97,62 @@ describe.skipIf(!sqliteAvailable)('Recorder storage and retention', () => {
       bucketStart + 29 * 60_000,
       ...Array.from({ length: 5 }, (_, i) => now - (4 - i) * 60_000),
     ]);
-    expect(rec.runRetentionIfDue(true)).toBe(0); // idempotent
+    expect(await rec.runRetentionIfDue(true)).toBe(0); // idempotent
   });
+
+  function recorderFor(repo: OrderbookSnapshotRepository, clock: { now: number }): Recorder {
+    return new Recorder({
+      repo,
+      getSettings: () => null,
+      heldTokens: () => [],
+      forecastTokens: () => [],
+      botMarketIds: () => [],
+      marketTokens: async () => null,
+      fetchBook: async () => ({}),
+      now: () => clock.now,
+    });
+  }
+
+  it('a year of rows for 3 tokens is downsampled in bounded time, in batches, and later runs only look at new rows', async () => {
+    t = openTestDb();
+    const repo = new OrderbookSnapshotRepository(t.db);
+    const now = Date.UTC(2026, 9, 31);
+    const step = 60_000;
+    const start = now - 365 * 86_400_000;
+    const blob = Buffer.from([1, 2, 3]);
+    const ins = t.db.prepare('INSERT INTO orderbook_snapshots (token_id, ts, best_bid, best_ask, mid, bids, asks) VALUES (?, ?, 0.4, 0.5, 0.45, ?, ?)');
+    t.db.transaction(() => {
+      for (const token of ['t1', 't2', 't3']) for (let ts = start; ts < now; ts += step) ins.run(token, ts, blob, blob);
+    })();
+    const rowsBefore = repo.count();
+    expect(rowsBefore).toBeGreaterThan(1_500_000);
+
+    const clock = { now };
+    const rec = recorderFor(repo, clock);
+    const spy = vi.spyOn(repo, 'downsampleBatch');
+    const t0 = Date.now();
+    const deleted = await rec.runRetentionIfDue(true);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(60_000); // generous: CI machines vary
+    expect(spy.mock.calls.length).toBeGreaterThan(100); // batched (5 000 rows per statement)
+
+    const cutoff = now - RETENTION_FULL_MS;
+    const oldPerBucket = t.db
+      .prepare('SELECT MAX(n) AS m, COUNT(*) AS buckets FROM (SELECT COUNT(*) AS n FROM orderbook_snapshots WHERE ts < ? GROUP BY token_id, ts / ?)')
+      .get(cutoff, DOWNSAMPLE_BUCKET_MS) as { m: number; buckets: number };
+    expect(oldPerBucket.m).toBe(1);
+    expect(deleted).toBe(rowsBefore - repo.count());
+    expect(repo.count('t1')).toBe(t.db.prepare('SELECT COUNT(*) AS n FROM orderbook_snapshots WHERE token_id = ? AND ts >= ?').pluck().get('t1', cutoff) as number + oldPerBucket.buckets / 3);
+
+    // An hour later only the newly expired hour (plus one bucket) is examined
+    clock.now += 3_600_000;
+    spy.mockClear();
+    const t1 = Date.now();
+    const more = await rec.runRetentionIfDue(true);
+    expect(Date.now() - t1).toBeLessThan(5_000);
+    expect(more).toBe(3 * (60 - 4)); // 4 buckets of 15 one-minute rows keep 1 each
+    expect(spy.mock.calls[0][0]).toBe(cutoff - DOWNSAMPLE_BUCKET_MS);
+  }, 180_000);
 
   it('records each watched token once per cycle with at most 4 requests in flight; failures do not throw', async () => {
     t = openTestDb();

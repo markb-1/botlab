@@ -162,7 +162,9 @@ export type RiskCheckName =
   | 'unsupported_symbol'
   | 'market_data_unavailable'
   // Local clock differs from exchange time by more than 5 s (spec §15; set by the Reconciler)
-  | 'clock_skew';
+  | 'clock_skew'
+  // No successful exchange clock check for 3 minutes (2b review)
+  | 'clock_unverified';
 
 export interface RiskCheckResult {
   /** Spec §4.1 step number (1–7); 0 = snapshot validation */

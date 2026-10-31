@@ -19,6 +19,9 @@ export const MAX_IN_FLIGHT = 4;
 export const RETENTION_FULL_MS = 180 * 86_400_000;
 export const DOWNSAMPLE_BUCKET_MS = 15 * 60_000;
 const RETENTION_EVERY_MS = 3_600_000;
+/** Rows deleted per statement; the event loop runs between batches */
+export const RETENTION_BATCH = 5_000;
+const CUTOFF_KEY = 'downsample_cutoff_ms';
 const BOOK_TIMEOUT_MS = 10_000;
 
 export interface RecorderSettings {
@@ -63,7 +66,7 @@ export function computeWatchSet(input: WatchSetInput): { tokens: string[]; dropp
 }
 
 export interface RecorderDeps {
-  repo: Pick<OrderbookSnapshotRepository, 'insert' | 'downsample' | 'watchlist'>;
+  repo: Pick<OrderbookSnapshotRepository, 'insert' | 'downsampleBatch' | 'getState' | 'setState' | 'watchlist'>;
   getSettings: () => RecorderSettings | null;
   heldTokens: () => string[];
   forecastTokens: () => string[];
@@ -199,22 +202,35 @@ export class Recorder {
       this.lastFailureLog = this.now();
       logger.warning(`[Recorder] ${failures.length}/${set.tokens.length} book(s) failed: ${failures.slice(0, 3).join('; ')}`);
     }
-    this.runRetentionIfDue();
+    await this.runRetentionIfDue();
     return { tokens: set.tokens.length, recorded, failed: failures.length, dropped: set.dropped };
   }
 
-  /** Downsample rows older than 180 days to one per 15 minutes (hourly). */
-  runRetentionIfDue(force = false): number {
+  /**
+   * Downsample rows older than 180 days to one per token per 15 minutes (hourly). Only rows newer than the
+   * previous cutoff minus one bucket are looked at (that bucket may have been split by the old cutoff); the
+   * cutoff is persisted. Deletes in batches of 5 000 rows, yielding to the event loop between batches.
+   */
+  async runRetentionIfDue(force = false): Promise<number> {
     const now = this.now();
     if (!force && now - this.lastRetention < RETENTION_EVERY_MS) return 0;
     this.lastRetention = now;
+    const cutoff = now - RETENTION_FULL_MS;
+    let total = 0;
     try {
-      const n = this.deps.repo.downsample(now - RETENTION_FULL_MS, DOWNSAMPLE_BUCKET_MS);
-      if (n > 0) logger.info(`[Recorder] Retention: downsampled ${n} snapshot(s) older than 180 days`);
-      return n;
+      const prev = Number(this.deps.repo.getState(CUTOFF_KEY));
+      const from = Number.isFinite(prev) && prev > 0 ? prev - DOWNSAMPLE_BUCKET_MS : 0;
+      for (;;) {
+        const n = this.deps.repo.downsampleBatch(from, cutoff, DOWNSAMPLE_BUCKET_MS, RETENTION_BATCH);
+        total += n;
+        if (n < RETENTION_BATCH) break;
+        await new Promise<void>((r) => setImmediate(r));
+      }
+      this.deps.repo.setState(CUTOFF_KEY, String(cutoff));
+      if (total > 0) logger.info(`[Recorder] Retention: downsampled ${total} snapshot(s) older than 180 days`);
     } catch (err) {
       logger.error(`[Recorder] Retention failed: ${err instanceof Error ? err.message : err}`);
-      return 0;
     }
+    return total;
   }
 }

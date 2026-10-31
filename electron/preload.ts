@@ -182,8 +182,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   reconcile: {
     status: () =>
       ipcRenderer.invoke('reconcile:status'),
-    adoptPositions: (walletId: string, botId: string) =>
-      ipcRenderer.invoke('reconcile:adoptPositions', walletId, botId),
+    adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) =>
+      ipcRenderer.invoke('reconcile:adoptPositions', walletId, botId, opts),
   },
   recorder: {
     watchlistList: () =>
@@ -324,7 +324,7 @@ declare global {
       };
       reconcile: {
         status: () => Promise<any>;
-        adoptPositions: (walletId: string, botId: string) => Promise<any>;
+        adoptPositions: (walletId: string, botId: string, opts?: { includePostFirstOrder?: boolean }) => Promise<any>;
       };
       recorder: {
         watchlistList: () => Promise<any>;

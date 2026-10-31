@@ -5,12 +5,15 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+vi.mock('electron', () => ({ ipcMain: { handle: vi.fn() } }));
 vi.mock('../../src/utils/logger', () => ({
   default: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }));
 
 import { sqliteAvailable } from '../orders/db';
-import { openRiskHarness, type RiskHarness } from '../risk/riskHarness';
+import { openRiskHarness, MARKET, type RiskHarness } from '../risk/riskHarness';
+import { applyPlacementResult } from '../../electron/orders/orderFills';
+import { walletChangeBlocker } from '../../electron/ipc/handlers/botHandlers';
 import { WalletRepository } from '../../electron/database/repositories/WalletRepository';
 import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
 import { Reconciler, RECONCILER_FAILURE_ALERT, type ReconcilerDeps } from '../../electron/reconcile/Reconciler';
@@ -384,5 +387,177 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
     expect(notify.reconcilerAlert.mock.calls[0][0]).toMatch(/failed 5 runs in a row/);
     expect(h.riskStateRepo.isHalted(GLOBAL_SCOPE)).toBe(false);
     expect(h.riskStateRepo.getGlobal()?.reconciled_at ?? null).toBeNull();
+  });
+  // ── 2b review fixes ──────────────────────────────────────────────
+
+  const ownFills = (botId: string) => h.db.prepare("SELECT * FROM bot_trades WHERE bot_id = ? AND fill_source IS NULL").all(botId) as Array<{ quantity: number; order_id: string; wallet_id: string }>;
+
+  it('C1: a reconciler run while a Binance order is in flight records the fill exactly once', async () => {
+    let answer!: (v: unknown) => void;
+    const binance = {
+      marketBuy: vi.fn(() => new Promise((r) => (answer = r))),
+      marketSell: vi.fn(),
+      getOrder: vi.fn(async () => ({ found: true as const, orderId: 7, status: 'FILLED', origQty: 0.0004, executedQty: 0.0004, cummulativeQuoteQty: 20 })),
+      getBalances: vi.fn(async () => [{ asset: 'BTC', free: 0.0004, locked: 0 }]),
+    };
+    const svc = h.orderService('b1', {
+      binance: binance as never,
+      deps: { getBinanceBook: async () => ({ bids: [{ price: '49990', quantity: '1' }], asks: [{ price: '50000', quantity: '1' }] }) },
+    });
+    const placing = svc.placeBinance({ symbol: 'BTCUSDT', side: 'buy', amount: 20 });
+    await vi.waitFor(() => expect(binance.marketBuy).toHaveBeenCalled());
+    const orderId = binance.marketBuy.mock.calls[0][2] as string;
+    const r = makeReconciler({ getBinanceAdapter: () => binance as never });
+
+    await r.runOnce(); // younger than 2 minutes: left to OrderService
+    expect(binance.getOrder).not.toHaveBeenCalled();
+    h.clock.now += 3 * 60_000;
+    const run = await r.runOnce();
+    expect(run.recovered).toEqual([orderId]);
+    expect(fillsOf(orderId)).toHaveLength(1);
+
+    answer({ success: true, orderId: 7, symbol: 'BTCUSDT', side: 'BUY', executedQty: 0.0004, cummulativeQuoteQty: 20, avgPrice: 50_000 });
+    const res = await placing;
+    expect(res).toMatchObject({ status: 'filled', filledSize: 0.0004 });
+    expect(fillsOf(orderId)).toHaveLength(1);
+    expect(h.orderRepo.findById(orderId)).toMatchObject({ status: 'filled', exchange_order_id: '7', filled_size: 0.0004 });
+  });
+
+  it('C1: a reconciler run while a Polymarket limit order is in flight records the fill exactly once', async () => {
+    let answer!: (v: unknown) => void;
+    h.poly.postLimitOrder.mockImplementation(() => new Promise((r) => (answer = r)));
+    const svc = h.orderService('b1', {
+      deps: { marketData: { getMarketInfo: async () => ({ ...MARKET, endDate: new Date(h.clock.now + 10 * 86_400_000).toISOString() }) } },
+    });
+    const placing = svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.4, size: 10 });
+    await vi.waitFor(() => expect(h.poly.postLimitOrder).toHaveBeenCalled());
+    const row = h.orderRepo.findOpen('b1')[0];
+    h.poly.getOpenOrders.mockResolvedValue([
+      { id: 'ex-lim', status: 'LIVE', assetId: 't1', side: 'buy', price: 0.4, originalSize: 10, sizeMatched: 4, createdAtMs: Date.parse(row.created_at) + 500 },
+    ]);
+    h.poly.getOrder.mockResolvedValue({ status: 'live', sizeMatched: 4, originalSize: 10, price: 0.4 });
+
+    h.clock.now += 3 * 60_000;
+    const r = makeReconciler();
+    expect((await r.runOnce()).recovered).toEqual([row.id]);
+    expect(fillsOf(row.id)).toHaveLength(1);
+
+    answer({ kind: 'accepted', exchangeOrderId: 'ex-lim', status: 'live', filledSize: 4, filledNotional: 1.6 });
+    const res = await placing;
+    expect(res).toMatchObject({ ok: true, status: 'partially_filled', filledSize: 4 });
+    await r.runOnce();
+    expect(fillsOf(row.id)).toHaveLength(1);
+    expect(fillsOf(row.id)[0].quantity).toBeCloseTo(4);
+  });
+
+  it('C1: an exchange id another row holds is never copied, and the database refuses duplicates', () => {
+    const a = h.addOpenOrder('b1', 'ex-dup');
+    const b = h.addOpenOrder('b1', null);
+    applyPlacementResult(h, b, { status: 'open', exchangeOrderId: 'ex-dup' }, { owner: { botId: 'b1', botName: 'b1', scriptName: '', simulated: false } });
+    expect(h.orderRepo.findById(b)!.exchange_order_id).toBeNull();
+    expect(h.orderRepo.findById(a)!.exchange_order_id).toBe('ex-dup');
+    expect(() => h.orderRepo.update(b, { exchangeOrderId: 'ex-dup' })).toThrow(/UNIQUE/);
+  });
+
+  it('S2: adoption refuses while the wallet has an unknown-outcome order, and for retired or halted bots', async () => {
+    positions = [position('old', 200, 0.5)];
+    const r = makeReconciler();
+    const id = unknownMarketBuy();
+    await expect(r.adoptPositions('w1', 'b1', 'human')).rejects.toThrow(/unknown outcome/);
+    h.orderRepo.update(id, { status: 'expired' });
+
+    h.addBot('gone', { stage: 'retired' });
+    await expect(r.adoptPositions('w1', 'gone', 'human')).rejects.toThrow(/retired/);
+    h.riskStateRepo.setHalted('b1', true, 'test');
+    await expect(r.adoptPositions('w1', 'b1', 'human')).rejects.toThrow(/halted/);
+    h.riskStateRepo.setHalted('b1', false);
+    // The expired order is now the wallet's first order: only what was held before it is adoptable
+    walletTrades = [{ tokenId: 'old', side: 'BUY', size: 200, price: 0.5, timestampMs: h.clock.now - 2 * 86_400_000 }];
+    expect((await r.adoptPositions('w1', 'b1', 'human')).adopted).toHaveLength(1);
+  });
+
+  it('S2: adoption syncs the wallet’s orders first', async () => {
+    const id = h.addOpenOrder('b1', 'ex-5'); // limit buy 10 @ 0.4, filled on the exchange but not recorded yet
+    h.poly.getOrder.mockResolvedValue({ status: 'matched', sizeMatched: 10, originalSize: 10, price: 0.4 });
+    positions = [position('t1', 10, 0.4)];
+    const res = await makeReconciler().adoptPositions('w1', 'b1', 'human');
+    expect(fillsOf(id)).toHaveLength(1);
+    expect(res).toEqual({ adopted: [], skipped: [] });
+  });
+
+  it('S2: adoption is capped at what was held before the first order; more only with includePostFirstOrder (audited)', async () => {
+    priorOrder();
+    positions = [position('mix', 150, 0.5)];
+    walletTrades = [
+      { tokenId: 'mix', side: 'BUY', size: 130, price: 0.5, timestampMs: h.clock.now - 2 * 86_400_000 },
+      { tokenId: 'mix', side: 'BUY', size: 20, price: 0.5, timestampMs: h.clock.now - 60_000 },
+    ];
+    const r = makeReconciler();
+    const first = await r.adoptPositions('w1', 'b1', 'human');
+    expect(first.adopted.map((a) => a.quantity)).toEqual([130]);
+    expect(first.skipped[0].reason).toMatch(/20\.00 bought after/);
+
+    const second = await r.adoptPositions('w1', 'b1', 'human');
+    expect(second.adopted).toEqual([]);
+    const third = await r.adoptPositions('w1', 'b1', 'human', { includePostFirstOrder: true });
+    expect(third.adopted).toEqual([expect.objectContaining({ quantity: 20, postFirstOrderQuantity: 20 })]);
+    const audits = h.auditRepo.list({ action: 'reconcile.adopt' }).map((a) => JSON.parse(a.payload ?? '{}'));
+    expect(audits.some((p) => p.includePostFirstOrder === true)).toBe(true);
+
+    walletTrades = [];
+    await expect(makeReconciler({ fetchTrades: async () => Promise.reject(new Error('down')) }).adoptPositions('w1', 'b1', 'human')).resolves.toBeDefined(); // nothing left to adopt
+  });
+
+  it('S3: orders and fills keep the wallet they were made on; a wallet change is refused while the bot holds anything', async () => {
+    h.db.prepare("INSERT INTO wallets (id, name, address, private_key_encrypted) VALUES ('w2', 'w2', '0xdef', 'x')").run();
+    const o = h.orderRepo.create({ botId: 'b1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'buy', orderType: 'limit', price: 0.4, size: 100, notionalUsd: 40, status: 'filled' });
+    expect(o.wallet_id).toBe('w1');
+    h.tradeRepo.create({ botId: 'b1', exchange: 'polymarket', side: 'BUY', symbol: 't1', conditionId: 'm1', price: 0.4, quantity: 100, quoteAmount: 40, orderId: o.id });
+    expect(ownFills('b1')[0].wallet_id).toBe('w1');
+
+    expect(walletChangeBlocker('b1', h.tradeRepo, h.orderRepo)).toMatch(/1 live position/);
+    expect(walletChangeBlocker('b1', h.tradeRepo, undefined)).toMatch(/unavailable/);
+    h.addBot('fresh');
+    expect(walletChangeBlocker('fresh', h.tradeRepo, h.orderRepo)).toBeNull();
+
+    // Even if the bot is moved anyway (e.g. directly in the DB), its position stays on w1
+    h.db.prepare("UPDATE bots SET wallet_id = 'w2' WHERE id = 'b1'").run();
+    const byUser: Record<string, DataApiPosition[]> = { '0xabc': [position('t1', 100, 0.4)], '0xdef': [] };
+    const res = await makeReconciler({ fetchPositions: async (u) => byUser[u] ?? [] }).runOnce();
+    expect(res.mismatches).toEqual([]);
+  });
+
+  it('N1: no successful clock check for 3 minutes blocks live orders (clock_unverified); second-resolution sources get 1 s more', async () => {
+    exchangeTime = async () => Promise.reject(new Error('time down'));
+    const r = makeReconciler();
+    await r.runOnce();
+    expect(r.status().skewed).toBe(false);
+    h.clock.now += 4 * 60_000;
+    await r.runOnce();
+    expect(r.status()).toMatchObject({ skewed: true, reason: 'clock_unverified' });
+    expect(notify.reconcilerAlert).toHaveBeenCalledTimes(1);
+    const svc = h.orderService('b1', { deps: { clock: r } });
+    expect(await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.3, size: 10 })).toMatchObject({ failedCheck: 'clock_unverified' });
+
+    exchangeTime = async () => ({ timeMs: h.clock.now - 5_500, resolutionMs: 1000 }) as never;
+    await r.runOnce();
+    expect(r.status().skewed).toBe(false);
+    exchangeTime = async () => ({ timeMs: h.clock.now - 5_500, resolutionMs: 1 }) as never;
+    await r.runOnce();
+    expect(r.status()).toMatchObject({ skewed: true, reason: 'clock_skew' });
+  });
+
+  it('N2: failed orders do not count as the wallet’s first order', () => {
+    const o = h.orderRepo.create({ botId: 'b1', exchange: 'polymarket', marketId: 'm1', tokenId: 't1', side: 'buy', orderType: 'limit', price: 0.4, size: 1, notionalUsd: 0.4, status: 'failed' });
+    expect(o.status).toBe('failed');
+    expect(h.orderRepo.firstLiveOrderAtForWallet('w1')).toBeNull();
+  });
+
+  it('a local excess within 1 % of the position (fee possibly taken in shares) is not a mismatch', async () => {
+    h.addFill('b1', 't1', 'BUY', 100, 0.4, h.clock.now - 60_000);
+    positions = [position('t1', 99.2, 0.4)];
+    expect((await makeReconciler().runOnce()).mismatches).toEqual([]);
+    positions = [position('t1', 97, 0.4)];
+    expect((await makeReconciler().runOnce()).mismatches).toHaveLength(1);
   });
 });

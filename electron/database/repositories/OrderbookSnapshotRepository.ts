@@ -64,22 +64,35 @@ export class OrderbookSnapshotRepository {
   }
 
   /**
-   * Retention: rows older than `cutoffMs` keep only the last snapshot per token per `bucketMs` bucket.
-   * Returns the number of rows deleted.
+   * Retention, one batch: among rows with `fromMs` ≤ ts < `cutoffMs`, delete up to `limit` rows that are not
+   * the last snapshot of their token in their `bucketMs` bucket. The "is there a later row" check is bounded
+   * to the same bucket (and below the cutoff), so it is one primary-key range probe per row. Returns the
+   * number deleted (< limit ⇒ done).
    */
-  downsample(cutoffMs: number, bucketMs: number): number {
+  downsampleBatch(fromMs: number, cutoffMs: number, bucketMs: number, limit: number): number {
     const r = this.db
       .prepare(
-        `DELETE FROM orderbook_snapshots
-         WHERE ts < @cutoff AND EXISTS (
-           SELECT 1 FROM orderbook_snapshots t
-           WHERE t.token_id = orderbook_snapshots.token_id AND t.ts < @cutoff
-             AND CAST(t.ts / @bucket AS INTEGER) = CAST(orderbook_snapshots.ts / @bucket AS INTEGER)
-             AND t.ts > orderbook_snapshots.ts
+        `DELETE FROM orderbook_snapshots WHERE rowid IN (
+           SELECT s.rowid FROM orderbook_snapshots s
+           WHERE s.ts >= @from AND s.ts < @cutoff AND EXISTS (
+             SELECT 1 FROM orderbook_snapshots t
+             WHERE t.token_id = s.token_id AND t.ts > s.ts
+               AND t.ts < MIN(@cutoff, (CAST(s.ts / @bucket AS INTEGER) + 1) * @bucket)
+           )
+           LIMIT @limit
          )`
       )
-      .run({ cutoff: Math.floor(cutoffMs), bucket: Math.floor(bucketMs) });
+      .run({ from: Math.floor(fromMs), cutoff: Math.floor(cutoffMs), bucket: Math.floor(bucketMs), limit: Math.floor(limit) });
     return r.changes;
+  }
+
+  getState(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM recorder_state WHERE key = ?').get(key) as { value: string | null } | undefined;
+    return row?.value ?? null;
+  }
+
+  setState(key: string, value: string): void {
+    this.db.prepare('INSERT INTO recorder_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
   }
 
   // ── Watchlist ──

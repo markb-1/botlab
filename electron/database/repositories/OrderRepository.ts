@@ -36,6 +36,8 @@ export interface OrderRow {
   forecast_id: string | null;
   /** 1 = paper order (never sent to an exchange) */
   simulated: number;
+  /** Wallet of the bot when the order was created (2b review) */
+  wallet_id?: string | null;
   created_at: string; // ISO
   updated_at: string; // ISO
 }
@@ -86,12 +88,12 @@ export class OrderRepository {
       .all(sim) as OrderRow[];
   }
 
-  /** Earliest live order (any status) of bots using this wallet; null if none (reconciler, R8). */
+  /** Earliest live order on this wallet that may have reached the exchange (not rejected / failed); null if none (R67). */
   firstLiveOrderAtForWallet(walletId: string): string | null {
     const row = this.db
       .prepare(
-        `SELECT MIN(o.created_at) AS first FROM orders o JOIN bots b ON b.id = o.bot_id
-         WHERE b.wallet_id = ? AND o.simulated = 0 AND o.status <> 'rejected_risk'`
+        `SELECT MIN(o.created_at) AS first FROM orders o LEFT JOIN bots b ON b.id = o.bot_id
+         WHERE COALESCE(o.wallet_id, b.wallet_id) = ? AND o.simulated = 0 AND o.status NOT IN ('rejected_risk', 'failed')`
       )
       .get(walletId) as { first: string | null };
     return row.first;
@@ -122,6 +124,8 @@ export class OrderRepository {
     reason?: string | null;
     forecastId?: string | null;
     simulated?: boolean;
+    /** Default: the bot's current wallet */
+    walletId?: string | null;
   }): OrderRow {
     const id = data.id || generateId();
     const now = new Date().toISOString();
@@ -130,8 +134,8 @@ export class OrderRepository {
       .prepare(
         `INSERT INTO orders (id, bot_id, exchange, market_id, token_id, side, order_type, price, size,
            notional_usd, expires_at, status, risk_decision, exchange_order_id, reason, forecast_id,
-           simulated, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           simulated, created_at, updated_at, wallet_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT wallet_id FROM bots WHERE id = ?)))`
       )
       .run(
         id,
@@ -152,7 +156,9 @@ export class OrderRepository {
         data.forecastId ?? null,
         data.simulated ? 1 : 0,
         now,
-        now
+        now,
+        data.walletId ?? null,
+        data.botId
       );
 
     return this.findById(id)!;

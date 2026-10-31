@@ -142,7 +142,7 @@ export function applyExchangeOrderState(
     } else return { delta: 0, status: row.status, events: [] }; // unknown status: leave as is
 
     const events: OrderFillEvent[] = [];
-    if (opts.exchangeOrderId && !row.exchange_order_id) {
+    if (opts.exchangeOrderId && !row.exchange_order_id && !claimedByOther(deps.orderRepo, row.id, opts.exchangeOrderId)) {
       deps.orderRepo.update(row.id, { exchangeOrderId: opts.exchangeOrderId });
     }
     if (delta > QTY_EPS) {
@@ -164,5 +164,74 @@ export function applyExchangeOrderState(
     }
     if (status !== row.status) deps.orderRepo.update(row.id, { status });
     return { delta: delta > QTY_EPS ? delta : 0, status, events };
+  })();
+}
+
+/** Another order row already holds this exchange id (ids are unique per row; see the partial unique index). */
+export function claimedByOther(orderRepo: Pick<OrderRepository, 'findByExchangeOrderId'>, rowId: string, exchangeOrderId: string): boolean {
+  const other = orderRepo.findByExchangeOrderId(exchangeOrderId);
+  return !!other && other.id !== rowId;
+}
+
+const STATUS_RANK: Partial<Record<OrderStatus, number>> = { submitted: 0, open: 1, partially_filled: 2 };
+
+/** What the exchange answered when the order was posted (OrderService.applyOutcome). */
+export interface PlacementResult {
+  /** Status the answer implies (open or terminal) */
+  status: OrderStatus;
+  exchangeOrderId?: string | null;
+  /** Total filled so far according to the answer */
+  filled?: { size: number; notional: number } | null;
+  feeRate?: number;
+  expiresAt?: string | null;
+}
+
+/**
+ * Apply the answer to a placement, atomically, through the same fresh-row/delta rule as
+ * `applyExchangeOrderState`: the row is re-read inside the transaction; a row that is already terminal
+ * (e.g. the Reconciler settled it while the request was in flight) is left untouched; only the fill
+ * beyond what is already recorded is added; the status never moves backwards; an exchange id held by
+ * another row is never copied.
+ */
+export function applyPlacementResult(
+  deps: { db: Database.Database; orderRepo: OrderRepository; tradeRepo: BotTradeRepository },
+  orderId: string,
+  r: PlacementResult,
+  opts: { owner: FillOwner; info?: FillInfo | null }
+): { row: OrderRow | undefined; delta: number; events: OrderFillEvent[] } {
+  return deps.db.transaction(() => {
+    const row = deps.orderRepo.findById(orderId);
+    if (!row || !OPEN_ORDER_STATUSES.includes(row.status)) return { row, delta: 0, events: [] as OrderFillEvent[] };
+
+    const events: OrderFillEvent[] = [];
+    const update: Parameters<OrderRepository['update']>[1] = {};
+    if (r.exchangeOrderId && !row.exchange_order_id && !claimedByOther(deps.orderRepo, row.id, r.exchangeOrderId)) {
+      update.exchangeOrderId = r.exchangeOrderId;
+    }
+    if (r.expiresAt !== undefined) update.expiresAt = r.expiresAt;
+
+    let filledSize = row.filled_size;
+    const total = r.filled?.size ?? 0;
+    const delta = total - row.filled_size;
+    if (r.filled && delta > QTY_EPS) {
+      const prevNotional = row.filled_size * (row.avg_fill_price ?? row.price);
+      const addNotional = Math.max(r.filled.notional - prevNotional, 0);
+      const fee = (r.feeRate ?? 0) * addNotional;
+      const e = recordOrderFill(deps.tradeRepo, opts.owner, row, { size: delta, notional: addNotional }, fee, opts.info ?? null);
+      if (e) events.push(e);
+      filledSize = total;
+      update.filledSize = total;
+      update.avgFillPrice = (prevNotional + addNotional) / total;
+      update.feeUsd = row.fee_usd + fee;
+    }
+
+    let status = r.status;
+    const terminal = !OPEN_ORDER_STATUSES.includes(status);
+    if (filledSize > QTY_EPS && status === 'cancelled' && filledSize >= row.size - QTY_EPS) status = 'filled';
+    if (!terminal && (STATUS_RANK[row.status] ?? 0) > (STATUS_RANK[status] ?? 0)) status = row.status; // never backwards
+    if (!terminal && filledSize > QTY_EPS && status !== 'partially_filled') status = filledSize >= row.size - QTY_EPS ? 'filled' : 'partially_filled';
+    if (status !== row.status) update.status = status;
+    const updated = deps.orderRepo.update(row.id, update);
+    return { row: updated, delta: delta > QTY_EPS ? delta : 0, events };
   })();
 }

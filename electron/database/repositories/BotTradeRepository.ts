@@ -111,6 +111,8 @@ export class BotTradeRepository {
     feeUsd?: number;
     category?: string | null;
     fillSource?: FillSource | null;
+    /** Default: the order's wallet, else the bot's current wallet */
+    walletId?: string | null;
   }): BotTradeRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -124,8 +126,9 @@ export class BotTradeRepository {
           trader_win_rate, trader_sample_size, kelly_fraction, kelly_edge, kelly_percentage,
           sizing_reason, current_position_value, max_position_size,
           executed_at, trader_trade_timestamp, metadata, created_at,
-          exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, category, fill_source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, category, fill_source, wallet_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          COALESCE(?, (SELECT wallet_id FROM orders WHERE id = ?), (SELECT wallet_id FROM bots WHERE id = ?)))`
       )
       .run(
         id,
@@ -162,7 +165,10 @@ export class BotTradeRepository {
         data.orderId ?? null,
         data.feeUsd ?? null,
         data.category ?? null,
-        data.fillSource ?? null
+        data.fillSource ?? null,
+        data.walletId ?? null,
+        data.orderId ?? null,
+        data.botId
       );
 
     return this.db.prepare('SELECT * FROM bot_trades WHERE id = ?').get(id) as BotTradeRow;
@@ -252,6 +258,36 @@ export class BotTradeRepository {
       )
       WHERE net_quantity > 1e-9
     `).all(...values) as RiskPositionRow[];
+  }
+
+  /**
+   * Live order-linked Polymarket positions per wallet and token (Reconciler, 2b review): fills are attributed
+   * to the wallet stored on the fill (else the bot's current wallet), so a bot changing wallets or being
+   * deleted does not move its holdings.
+   */
+  getLiveWalletPositions(): Array<{ wallet_id: string; symbol: string; condition_id: string | null; net_quantity: number; cost_basis: number }> {
+    return this.db.prepare(`
+      SELECT wallet_id, symbol, condition_id, net_quantity,
+        CASE WHEN buy_qty > 0 THEN net_quantity * buy_cost / buy_qty ELSE 0 END AS cost_basis
+      FROM (
+        SELECT COALESCE(t.wallet_id, b.wallet_id) AS wallet_id, t.symbol, MAX(t.condition_id) AS condition_id,
+          SUM(CASE WHEN t.side = 'BUY' THEN t.quantity ELSE -t.quantity END) AS net_quantity,
+          SUM(CASE WHEN t.side = 'BUY' THEN t.quantity ELSE 0 END) AS buy_qty,
+          SUM(CASE WHEN t.side = 'BUY' THEN t.quote_amount ELSE 0 END) AS buy_cost
+        FROM bot_trades t LEFT JOIN bots b ON b.id = t.bot_id
+        WHERE t.order_id IS NOT NULL AND COALESCE(t.simulated, 0) = 0 AND t.exchange = 'polymarket'
+        GROUP BY COALESCE(t.wallet_id, b.wallet_id), t.symbol
+      )
+      WHERE wallet_id IS NOT NULL AND net_quantity > 1e-9
+    `).all() as Array<{ wallet_id: string; symbol: string; condition_id: string | null; net_quantity: number; cost_basis: number }>;
+  }
+
+  /** Quantity of a token already adopted on a wallet (reconcile:adoptPositions cap). */
+  adoptedQuantity(walletId: string, symbol: string): number {
+    const row = this.db
+      .prepare("SELECT COALESCE(SUM(quantity), 0) AS q FROM bot_trades WHERE fill_source = 'adopted' AND wallet_id = ? AND symbol = ? AND side = 'BUY'")
+      .get(walletId, symbol) as { q: number };
+    return row.q;
   }
 
   /** All OrderService fills (live and paper) for daily P&L and the ramp; oldest first. */

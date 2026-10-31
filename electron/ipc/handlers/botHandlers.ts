@@ -2,6 +2,7 @@ import { ipcMain } from 'electron';
 import type { BotRepository } from '../../database/repositories/BotRepository';
 import type { WalletRepository } from '../../database/repositories/WalletRepository';
 import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
+import type { OrderRepository } from '../../database/repositories/OrderRepository';
 import type { BotTradeRepository } from '../../database/repositories/BotTradeRepository';
 import type { BotStorageRepository } from '../../database/repositories/BotStorageRepository';
 import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
@@ -186,6 +187,22 @@ function tradeRowToIpc(row: any): IpcBotTrade {
   };
 }
 
+/**
+ * A bot may not change wallets while it has open live orders or live positions (2b review): its orders and
+ * fills stay attributed to the wallet they were made on, and the reconciler compares per wallet.
+ */
+export function walletChangeBlocker(
+  botId: string,
+  tradeRepo: Pick<BotTradeRepository, 'getRiskPositions'>,
+  orderRepo?: Pick<OrderRepository, 'findOpen'>
+): string | null {
+  if (!orderRepo) return 'Cannot change the wallet: order store unavailable';
+  const open = orderRepo.findOpen(botId, false).length;
+  const positions = tradeRepo.getRiskPositions({ simulated: false, botId }).filter((p) => p.net_quantity > 1e-9).length;
+  if (open === 0 && positions === 0) return null;
+  return `Cannot change the wallet of a bot with ${open} open live order(s) and ${positions} live position(s); cancel the orders and close the positions first`;
+}
+
 export function registerBotHandlers(
   botRepo: BotRepository,
   walletRepo: WalletRepository,
@@ -195,7 +212,8 @@ export function registerBotHandlers(
   walletManager: WalletManager,
   storageRepo: BotStorageRepository,
   settingsRepo: SettingsRepository,
-  audit?: AuditService
+  audit?: AuditService,
+  orderRepo?: Pick<OrderRepository, 'findOpen'>
 ): void {
   // List all bots
   ipcMain.handle('bots:list', async (_event, filter?: { scriptId?: string; status?: string }) => {
@@ -290,6 +308,13 @@ export function registerBotHandlers(
     try {
       const before = botRepo.findById(id);
       if (!before) return { success: false, error: 'Bot not found' };
+      if (data.walletId !== undefined && data.walletId !== before.wallet_id) {
+        const blocked = walletChangeBlocker(id, tradeRepo, orderRepo);
+        if (blocked) {
+          audit?.record('human', 'bot.update', id, { walletId: { from: before.wallet_id, to: data.walletId } }, `denied: ${blocked}`);
+          return { success: false, error: blocked };
+        }
+      }
       const row = botRepo.update(id, data);
       if (!row) return { success: false, error: 'Bot not found' };
       audit?.record('human', 'bot.update', id, {

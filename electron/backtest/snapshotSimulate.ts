@@ -126,6 +126,9 @@ export class SnapshotMarket {
       const through = o.side === 'buy' ? s.bestAsk !== null && s.bestAsk <= o.price + EPS : s.bestBid !== null && s.bestBid >= o.price - EPS;
       if (!through) continue;
       const qty = o.size - o.filled;
+      // The order fills in full at its price; the recorded liquidity at or through it is used up for this
+      // step, so a marketable order in the same step cannot take it again
+      this.take(o.tokenId, o.side, o.price, { qty }, true);
       this.fill(o.tokenId, o.side, qty, qty * o.price, this.fees(o.tokenId).makerRate, s.ts);
       o.filled = o.size;
       o.status = 'filled';

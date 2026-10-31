@@ -15,12 +15,12 @@ import { RiskMonitor } from '../../electron/risk/RiskMonitor';
 import { RiskEngine } from '../../electron/risk/RiskEngine';
 import { FeeService } from '../../electron/orders/FeeService';
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
+import { OrderService, type ClobBook, type OrderServiceDeps } from '../../electron/orders/OrderService';
 import type { MarketInfo, MarketQualityProvider } from '../../electron/orders/MarketDataService';
 
 /** Market assessed as unambiguous economics (the market cache is tested separately) */
 const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economics', ambiguityScore: 0, rulesChangedAt: null }) };
-import type { PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import type { BinanceAdapter, PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
 
 export type FakePolymarket = PolymarketAdapter & Record<'cancelOrders' | 'getOrder' | 'postMarketOrder' | 'postLimitOrder', ReturnType<typeof vi.fn>>;
 
@@ -49,7 +49,7 @@ export interface RiskHarness extends TestDb {
   clock: { now: number };
   addFill(botId: string, symbol: string, side: 'BUY' | 'SELL', qty: number, price: number, atMs: number, simulated?: boolean): void;
   addOpenOrder(botId: string, exchangeOrderId: string | null, opts?: { simulated?: boolean; tokenId?: string }): string;
-  orderService(botId: string): OrderService;
+  orderService(botId: string, over?: { deps?: Partial<OrderServiceDeps>; binance?: BinanceAdapter | null }): OrderService;
 }
 
 export const MARKET: MarketInfo = {
@@ -155,7 +155,7 @@ export function openRiskHarness(startMs: number): RiskHarness {
       });
       return row.id;
     },
-    orderService(botId) {
+    orderService(botId, over = {}) {
       const provider = new DbRiskStateProvider({
         botRepo: t.botRepo,
         orderRepo: t.orderRepo,
@@ -180,8 +180,9 @@ export function openRiskHarness(startMs: number): RiskHarness {
           getBinanceBook: async () => ({ bids: [], asks: [] }),
           audit,
           now: () => clock.now,
+          ...over.deps,
         },
-        { botId, botName: botId, scriptName: 'script', mode: 'live', polymarket: poly, binance: null, paperState: null }
+        { botId, botName: botId, scriptName: 'script', mode: 'live', polymarket: poly, binance: over.binance ?? null, paperState: null }
       );
     },
   };
