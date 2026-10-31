@@ -9,7 +9,7 @@
 import { DEFAULT_MAX_EVENTS, DEFAULT_MAX_LOG_LINES, type BotActivityLog, type BotCustomEvent, type BotLogLine } from '../bots/BotActivityLog';
 import type { BotRepository } from '../db/repositories/BotRepository';
 import type { WalletRepository } from '../db/repositories/WalletRepository';
-import type { ScriptRepository } from '../db/repositories/ScriptRepository';
+import { builtinRoleOf, type ScriptRepository } from '../db/repositories/ScriptRepository';
 import type { OrderRepository, OrderRow } from '../db/repositories/OrderRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
@@ -186,6 +186,7 @@ function botRowToIpc(
     templateVersion: row.template_version ?? null,
     scriptRevision: script?.revision ?? null,
     scriptTrust: script?.trust ?? null,
+    role: builtinRoleOf(script),
     stageChangedAt: row.stage_changed_at ?? null,
     lastStartedAt: row.last_started_at,
     lastStoppedAt: row.last_stopped_at,

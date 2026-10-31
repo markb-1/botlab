@@ -349,7 +349,10 @@ function ExitFlags() {
   if (data.length === 0) return <Empty>No exit flags.</Empty>;
   return (
     <div className="space-y-3">
-      <Notice tone="blue">Exit requests for the position manager (Phase 5). Until it runs, act on open flags by hand.</Notice>
+      <Notice tone="blue">
+        Exit requests for the position manager (builtin template). A running position manager in the flag&apos;s mode (paper / live) exits the
+        position as a risk exit and marks the flag handled once the position is closed; without one, act on open flags by hand.
+      </Notice>
       <div className="overflow-x-auto">
         <table className="w-full">
           <thead>
@@ -373,7 +376,15 @@ function ExitFlags() {
                 </td>
                 <td className={`${tdCls} font-mono text-xs break-all`}>{f.tokenId}</td>
                 <td className={tdCls}>
-                  <Badge tone={f.status === 'open' ? 'yellow' : 'gray'}>{f.status}</Badge>
+                  <Badge tone={f.status === 'open' ? 'yellow' : f.status === 'done' ? 'green' : 'gray'}>
+                    {f.status === 'done' ? 'handled' : f.status}
+                  </Badge>
+                  {f.handledAt && <span className="block text-xs text-gray-500">{dateTime(f.handledAt)}</span>}
+                  {f.handledNote && (
+                    <span className="block text-xs text-gray-500 max-w-[16rem] break-words" title={f.handledNote}>
+                      {f.handledNote}
+                    </span>
+                  )}
                 </td>
                 <td className={`${tdCls} break-words`}>{f.reason}</td>
               </tr>

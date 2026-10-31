@@ -6,6 +6,13 @@ import { useOverview } from '../hooks/useRisk';
 import { Badge, ErrorBox, StageBadge } from '../components/ui';
 import { usd } from '../lib/format';
 
+/** Standing builtin roles (spec §9.1, §9.2): one running instance per mode */
+const ROLE_LABELS: Record<string, string> = { 'forecast-executor': 'executor', 'position-manager': 'position manager' };
+const ROLE_TITLES: Record<string, string> = {
+  'forecast-executor': 'Standing forecast executor: bids on tradeable ledger forecasts (one per mode)',
+  'position-manager': "Standing position manager: exits every bot's positions as risk exits (one per mode)",
+};
+
 function StatusBadge({ status }: { status: Bot['status'] }) {
   const colors = {
     running: 'bg-green-500/10 text-green-400',
@@ -164,6 +171,13 @@ export function Bots() {
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
                     {bot.scriptName || bot.scriptId}
+                    {bot.role && (
+                      <span className="block mt-1">
+                        <Badge tone="blue" title={ROLE_TITLES[bot.role] ?? 'Standing builtin bot'}>
+                          {ROLE_LABELS[bot.role] ?? bot.role}
+                        </Badge>
+                      </span>
+                    )}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <span className="inline-flex items-center gap-1.5">

@@ -645,7 +645,7 @@ export class AgentService {
     return { deleted };
   }
 
-  // ── Exit flags (position manager acts on them in Phase 5) ────────
+  // ── Exit flags (the builtin position manager acts on them and closes them, 5a) ─────
 
   private flagView(f: PositionExitFlagRow): PositionExitFlagView {
     return {

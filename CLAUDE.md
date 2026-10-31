@@ -87,7 +87,8 @@ packages/core/src/
     BotContextProxy.ts     # Builds the `ctx` object scripts interact with
     PaperTradingState.ts   # Simulated balances for paper trading mode
     worker-bootstrap.ts    # Worker thread entry point (resolved with workerPath.ts)
-  orders/                  # OrderService (the order choke point), ExchangeAdapter, fees, risk state
+  orders/                  # OrderService (the order choke point), ExchangeAdapter, fees, risk state,
+                           # PortfolioService (ctx.portfolio: position-manager exits placed as the owning bot)
   exchange/polymarket/     # orders.ts (only CLOB order calls), trading.ts (read-only helpers)
   exchange/binance/        # client.ts (Binance REST client, HMAC-SHA256)
   risk/                    # RiskEngine, halts, kill switch, RiskMonitor, ramp, startup recovery
@@ -195,6 +196,11 @@ scripts/service.mjs        # Windows service (NSSM) / launchd / systemd helper
 - **Route scopes**: new routes must declare `allow` (readonly gets GETs by default — anything returning secrets is `['admin']`), `recentAuth` for §4.6 / credential actions, and `domainErrors` if their plain domain errors are user-facing (otherwise a generic 500 with an error id). Agent restrictions that matter for safety go in the service (e.g. `BotService` agent rules), not only the route
 - **First run**: until an admin password exists the server logs a one-time setup code; `/api/auth/setup` needs it unless the request is local to a loopback-bound server
 - **Agent (MCP)**: `/mcp` accepts only agent-scope bearer tokens; actor `asAgent('token:<id>')`. Agent bots are paper only, from templates (`scripts.kind = 'template'`; `is_template` marks builtin ones only), capped by `limits.yaml agent.*`; the agent may start / restart / reconfigure / retire / delete only bots it created, edit or delete only scripts it wrote (origin agent, and they must typecheck), withdraw only its own forecasts. Tool calls (MCP and agent `/api` requests) are reserved synchronously against per-run and per-hour caps; cost is recorded only by a system actor (`AgentService.recordRunUsage`). Tool output is wrapped as untrusted by default (`trustedOutput` opts out). Its ambiguity (forecast or `assess_market`) can only set or raise a non-human score
+- **Standing templates (5a)**: `templates/forecast-executor.ts` and `templates/position-manager.ts` carry
+  `meta.role` / `meta.trust: 'new'`; the seed stores the role in `scripts.builtin_role` (origin builtin only,
+  `builtinRoleOf`). Only a bot on the builtin position-manager script gets `ctx.portfolio` (server-side, never from
+  the script) and it cannot buy; its exits are risk-exit sells through the owner's OrderService (`orders.placed_by`).
+  One running bot per role and mode. Paper resting orders fill on a later sync when the book crosses them
 - **SDK types**: after changing `packages/core/src/sdk/types.ts`, run `npm run gen:sdk` (the d.ts for MCP and the typecheck is a committed generated file)
 - **Shutdown**: an unclean stop (crash, kill, second Ctrl+C after 2 s) ⇒ next start is globally halted (spec §4.3); clear via `POST /api/risk/clear-halt` (human, recent password check)
 

@@ -399,6 +399,8 @@ export interface PortfolioContext {
 export interface OrderBook {
   bids: OrderBookEntry[];
   asks: OrderBookEntry[];
+  /** Polymarket tick size, e.g. "0.01" (prices must be multiples of it); absent when unknown */
+  tick_size?: string;
 }
 
 export interface OrderBookEntry {

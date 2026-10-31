@@ -388,6 +388,16 @@ At least one of `onStart` or `onTick` must be exported. Both can coexist — `on
 | `ctx.getMarketPrice(tokenId)` | Get bid/ask/mid/spread |
 | `ctx.getEvent(eventSlug)` | Get event with all its markets |
 
+**Orders v2, ledger, risk, events** (full types: `botlab://sdk/types.d.ts`)
+| Method | Description |
+|--------|-------------|
+| `ctx.polymarket.placeLimit(tokenId, side, price, size, opts?)` | Post-only GTD limit order (`ttlMinutes` ≥ 3, `forecastId`, `reason`) |
+| `ctx.polymarket.cancel / cancelAll / getOpenOrders / getFee` | This bot's orders; fee rates |
+| `ctx.ledger.getActiveForecasts(filter?)` / `getForecast(tokenId)` | Read the forecast ledger |
+| `ctx.risk.getBudget()` | Remaining allocation, per-market room, halted |
+| `ctx.events.on('forecast_changed' \| 'rules_changed' \| 'halt', fn)` | Server push events (hints to re-check) |
+| `ctx.portfolio.*` | Position Manager template only |
+
 **Binance Spot**
 | Method | Description |
 |--------|-------------|
@@ -429,10 +439,62 @@ The `meta.configSchema` object is a JSON Schema that generates the configuration
 
 | Template | Description |
 |----------|-------------|
+| **Forecast Executor** | Standing bot (one per mode): trades the forecast ledger with post-only, Kelly-sized bids. See Strategies. |
+| **Position Manager** | Standing bot (one per mode): exits every bot's positions as risk exits. See Strategies. |
 | **Copy Trading** | Monitor Polymarket traders and copy their trades. Configurable multipliers, Kelly criterion sizing, position limits, daily volume caps, and auto-redeem. |
 | **Binance Spot** | Monitor Binance spot prices and trade based on price thresholds. |
 
 You can **fork** any template to create your own version, or **import/export** scripts as files.
+
+## Strategies
+
+The core strategy is: the agent (or you) writes **forecasts** in the ledger, the **Forecast Executor** buys where
+the market is cheaper than the forecast, and the **Position Manager** takes the profit when the price converges
+(spec §3.4: edge is usually realised before settlement) or gets out when something changes. Run one bot of each
+(Bots → New bot → pick the template; any wallet; a second running copy in the same mode is refused). Both
+templates are seeded with trust `new`: their bots start in **paper** and go through the ramp (paper → probation →
+full) like any new template. Paper bots fill resting orders when a later book check crosses them (no fees for
+makers).
+
+**Forecast Executor** (`templates/forecast-executor.ts`, spec §9.1) — for every *tradeable* active forecast
+(bucket `trading`, category allowed) it looks at the forecast's token (fair value p) and the other token of the
+binary market (fair value 1 − p). Where the ask leaves `min_edge` after the taker fee it rests a post-only GTD bid
+at min(best bid + tick, fair − `min_edge`). Size = `kelly_fraction` × Kelly (p − c)/(1 − c) × the bucket's
+allocation, capped by `max_per_market_usd` and `ctx.risk.getBudget()`; when the budget does not cover everything
+the best **edge per day** (edge / days to settlement) wins, at most `max_markets` markets. Re-quotes every
+`requote_minutes` and immediately on forecast / rules / halt events; cancels its bids when the forecast is
+superseded, withdrawn, no longer tradeable or the edge is gone. It never sells.
+
+| config | default | |
+|---|---|---|
+| `min_edge` | 0.05 | edge after fees, never below 0.03 (the risk engine checks it too) |
+| `kelly_fraction` | 0.25 | fraction of full Kelly |
+| `requote_minutes` | 10 | |
+| `max_per_market_usd` | 25 | this bot's cost + open bids per market |
+| `max_markets` | 10 | |
+
+**Position Manager** (`templates/position-manager.ts`, spec §9.2) — the only bot that can see other bots'
+positions (`ctx.portfolio`, granted by the server to this builtin template only; forks do not get it). It exits a
+position **as the bot that holds it**: a risk-exit sell through that bot's own order path and the risk engine, so
+it can never buy, never sell more than the bot holds net of its open sells, and every exit is in the audit log
+(`position.exit`, actor the manager) with the order attributed to the owning bot (`placed_by` the manager).
+
+| trigger | when |
+|---|---|
+| take-profit (default) | best bid ≥ fair − `take_profit_margin` (0.02); the fair value is per token, so NO positions mirror |
+| forecast withdrawn / flipped | no active forecast prices the token, or it values it below the entry price |
+| low edge per day | (fair − bid) / days to end < `min_hold_edge_per_day` (0.001; 0 = off) |
+| rules changed | the market's rules changed after the position was opened |
+| ambiguity | score ≥ 2 (after the server raise) or a UMA dispute |
+| exit flag | an open `flag_position_exit` (agent or human); marked handled when the position is closed |
+| stop | bid ≤ entry − `stop_loss_move` (0.15) and the forecast was not renewed |
+| market end | ambiguity ≥ 1 and less than `exit_before_end_minutes` (180) to the end |
+
+Positions bought without a forecast (copy trading, your own scripts) only get the risk triggers (rules,
+ambiguity, flag, end); `ignore_bot_ids` leaves bots alone. Exits rest post-only first and become marketable
+(best bid − `escalate_slippage`) after `escalate_after_minutes` (30). Risk exits are exempt from hold time, order
+size, rate and spread limits and pass from any bot stage (a retired bot's positions can still be exited), but not
+from halts: during a halt or kill switch nothing is sold (spec §4.3).
 
 ---
 

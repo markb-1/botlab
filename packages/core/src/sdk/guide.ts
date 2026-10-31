@@ -63,7 +63,32 @@ caps, category rights and the monthly budget; every tool call is in the audit lo
 - Ramp: bots on a template with trust \`new\` stay in paper; changing a template's source sends every bot on it back
   to paper. Promotion to live capital is the human's decision.
 - \`flag_position_exit(botId, tokenId, reason)\` asks the position manager to exit a position (risk exit); it does
-  not place an order itself.
+  not place an order itself. A running Position Manager in the position's mode exits it and marks the flag handled
+  once the position is closed.
+
+### The standing strategy templates (spec §9.1, §9.2)
+
+Two builtin templates run as **one bot each per mode** (a second running copy in the same mode is refused). They
+are seeded with trust \`new\`, so their bots start in paper and go through the ramp like any new template.
+
+- **Forecast Executor** turns your tradeable forecasts into orders. You do not size or place anything: write good
+  forecasts (with ambiguity) and it rests post-only bids on the forecast's token at fair value p, and on the other
+  token of a binary market at 1 − p, wherever the ask leaves \`min_edge\` (≥ 0.03) after fees. Bid =
+  min(best bid + tick, fair − min_edge); size = \`kelly_fraction\` × Kelly × the bucket's allocation, capped by
+  \`max_per_market_usd\` and the risk budget; ranked by edge per day (a short market beats a long one with the same
+  edge); at most \`max_markets\`. It re-quotes every \`requote_minutes\` and at once when a forecast changes, and
+  cancels its bids when the forecast is superseded, withdrawn or no longer tradeable, or the edge is gone. So:
+  **withdraw a forecast you no longer believe** — that is how you pull the executor's bids. Config: \`min_edge\`,
+  \`kelly_fraction\` (0.25), \`requote_minutes\`, \`max_per_market_usd\`, \`max_markets\`.
+- **Position Manager** watches every bot's positions in its mode and exits them as the owning bot (risk-exit sells
+  through the risk engine; it can never buy or sell more than a bot holds). Triggers: convergence take-profit (bid ≥
+  fair − \`take_profit_margin\`, the default way edge is realised), forecast withdrawn or flipped below the entry
+  price, remaining edge per day below \`min_hold_edge_per_day\`, rules changed after entry, ambiguity ≥ 2 or a
+  dispute, an exit flag, a stop (\`stop_loss_move\` against with no renewed forecast) and \`exit_before_end_minutes\`
+  for ambiguous markets. Exits rest post-only first and go marketable after \`escalate_after_minutes\`. Positions
+  bought without a forecast (e.g. copy trading) only get the risk triggers; \`ignore_bot_ids\` leaves bots alone.
+  Only this builtin template gets \`ctx.portfolio\`: a copy or fork of it does not (the server checks the script
+  record), so do not try to write your own position manager.
 - \`kill_switch(reason)\` halts everything (all bots stopped, open orders cancelled). Only a human can clear it —
   use it for genuine emergencies only.
 
@@ -125,8 +150,11 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
     \`getFee(tokenId)\` → \`{ takerRate, makerRate, formula, source }\`.
 - Market data: \`ctx.getOrderBook\`, \`ctx.getMarketPrice\`, \`ctx.getMarkets\`, \`ctx.getEvent\`, \`ctx.getPositions\`,
   \`ctx.getBalance\` (USDC).
-- Ledger (read only): \`ctx.ledger.getActiveForecasts({ category?, tradeableOnly? })\`, \`ctx.ledger.getForecast(tokenId)\`.
-  Pass \`forecastId\` on orders that act on a forecast (edge check against it).
+- Ledger (read only): \`ctx.ledger.getActiveForecasts({ category?, tradeableOnly? })\`, \`ctx.ledger.getForecast(tokenId)\`
+  (each forecast carries \`complementTokenId\`, \`endDate\` and \`bucketAllocationUsd\`). Pass \`forecastId\` on
+  orders that act on a forecast (edge check against it; on the complement token the server uses 1 − p).
+- Events: \`ctx.events.on('forecast_changed' | 'rules_changed' | 'halt', handler)\` — pushed by the server as hints to
+  re-check now; always re-read the current state (they are not replayed after a restart).
 - Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted.
 - Binance spot (USDT pairs only in paper): \`ctx.binance.buy(symbol, usdt)\`, \`sell(symbol, qty)\`, \`getPrice\`,
   \`getOrderBook\`, \`getBalance\`, \`getPositions\`.
@@ -145,8 +173,9 @@ unassessed or too ambiguous markets (buys), a rules change in the last 7 days, t
 hold time before selling (risk exits are exempt), and an edge check net of fees for ledger orders. Exposure limits (e.g. \`totalLimitUsd\` in
 \`get_overview\`) apply to live trading and are 0 when there is no live equity; paper bots are limited by their stage
 allocation instead. Polymarket taker
-fee per share = rate × p × (1 − p); makers pay nothing. Paper mode: resting (non-marketable) orders are not
-simulated yet; paper balances do not deduct fees.
+fee per share = rate × p × (1 − p); makers pay nothing. Paper mode: a resting (non-marketable) order fills at its own
+price when a later book check (any order call or \`getOpenOrders()\`) shows the opposite side at or through it, up
+to the size shown, as a maker (no fee); it expires at its TTL; paper balances do not deduct fees.
 
 ### Sandbox restrictions
 

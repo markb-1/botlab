@@ -152,7 +152,7 @@ export function topOf(book: OrderBook): Top {
     const p = parseFloat(l.price);
     if (Number.isFinite(p) && parseFloat(l.size) > 0 && (bestAsk === null || p < bestAsk)) bestAsk = p;
   }
-  const t = parseFloat(String((book as OrderBook & { tick_size?: string }).tick_size ?? ''));
+  const t = parseFloat(String(book.tick_size ?? ''));
   return { bestBid, bestAsk, tick: Number.isFinite(t) && t > 0 && t < 1 ? t : 0.01 };
 }
 
