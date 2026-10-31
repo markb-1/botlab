@@ -36,11 +36,16 @@ import type { FeeCategory, FeeService } from './FeeService';
 import type { MarketDataService, MarketInfo, MarketQualityProvider } from './MarketDataService';
 import type { AuditService } from '../audit/AuditService';
 import type { OrderEventSink, OrderFillEvent } from '../notify/events';
+import { applyExchangeOrderState, recordOrderFill, type ExchangeOrderState } from './orderFills';
 import logger from '../../src/utils/logger';
 
 const MS_PER_MINUTE = 60_000;
 const QTY_EPS = 1e-9;
-/** A market order with no confirmed result is treated as dead this long after submission */
+/**
+ * A market order with no confirmed result: with an exchange id it is expired this long after submission
+ * (after a final lookup); without one (outcome unknown) the Reconciler may close it only after this and
+ * only once the exchange confirms there is no matching fill.
+ */
 const MARKET_ORDER_LIFETIME_MS = 5 * MS_PER_MINUTE;
 /** After expires_at, wait this long (the exchange's GTD security buffer) before declaring a resting order expired */
 const EXPIRY_GRACE_MS = 60_000;
@@ -174,7 +179,17 @@ export interface OrderServiceDeps {
   audit?: AuditService;
   /** Fill / rejection notifications. Called after commit; failures are swallowed. */
   events?: OrderEventSink;
+  /**
+   * Clock skew guard (spec §15, set by the Reconciler): while it reports a problem, new live orders are
+   * rejected (`clock_skew`). Paper orders are unaffected.
+   */
+  clock?: ClockSkewGuard;
   now?: () => number;
+}
+
+/** Local clock vs exchange server time. `skewed` ⇒ live orders are refused. */
+export interface ClockSkewGuard {
+  status(): { skewed: boolean; detail: string | null };
 }
 
 export interface BotOrderContext {
@@ -656,6 +671,10 @@ export class OrderService {
   ): Promise<OrderRow> {
     return withPlacementLock(async () => {
       let decision = preCheck;
+      if (!decision && !this.paper && this.deps.clock) {
+        const clock = this.deps.clock.status();
+        if (clock.skewed) decision = preDecision('clock_skew', `Clock skew: ${clock.detail ?? 'local clock differs from exchange time'}`, this.now());
+      }
       if (!decision) {
         try {
           decision = this.deps.riskEngine.check(order, await this.deps.provider.getSnapshot(order));
@@ -809,39 +828,15 @@ export class OrderService {
   }
 
   private recordFill(row: OrderRow, fill: Fill, feeUsd: number, info: MarketInfo | null, category: string | null): void {
-    if (!this.paper) {
-      this.pendingFills.push({
-        botId: this.bot.botId,
-        botName: this.bot.botName,
-        exchange: row.exchange,
-        side: row.side === 'buy' ? 'BUY' : 'SELL',
-        symbol: row.token_id,
-        market: info?.question || undefined,
-        outcome: info?.outcome || undefined,
-        quantity: fill.size,
-        price: fill.size > 0 ? fill.notional / fill.size : row.price,
-        notionalUsd: fill.notional,
-        simulated: false,
-      });
-    }
-    this.deps.tradeRepo.create({
-      botId: this.bot.botId,
-      botName: this.bot.botName,
-      scriptName: this.bot.scriptName,
-      exchange: row.exchange as Exchange,
-      side: row.side === 'buy' ? 'BUY' : 'SELL',
-      symbol: row.token_id,
-      conditionId: row.exchange === 'polymarket' ? row.market_id : undefined,
-      market: info?.question || undefined,
-      outcome: info?.outcome || undefined,
-      price: fill.size > 0 ? fill.notional / fill.size : row.price,
-      quantity: fill.size,
-      quoteAmount: fill.notional,
-      simulated: this.paper ? 1 : 0,
-      orderId: row.id,
+    const e = recordOrderFill(
+      this.deps.tradeRepo,
+      { botId: this.bot.botId, botName: this.bot.botName, scriptName: this.bot.scriptName, simulated: this.paper },
+      row,
+      fill,
       feeUsd,
-      category,
-    });
+      { question: info?.question ?? null, outcome: info?.outcome ?? null, category }
+    );
+    if (e) this.pendingFills.push(e);
   }
 
   // ── Binance ─────────────────────────────────────────────────────────
@@ -947,7 +942,8 @@ export class OrderService {
   /**
    * Refresh this bot's open orders: pull fills/cancels from the exchange and expire orders
    * that can no longer fill. Serialised per bot. Lookup errors leave rows open (fail closed).
-   * TODO(chunk 2b): the reconciler takes this over for all bots.
+   * The Reconciler (every 60 s) does the same for every bot, running or not, and alone closes
+   * unknown-outcome orders.
    */
   syncOpenOrders(): Promise<void> {
     return this.botLock(() => this.syncUnlocked());
@@ -958,12 +954,15 @@ export class OrderService {
     for (const row of this.deps.orderRepo.findOpen(this.bot.botId, this.paper)) {
       const exp = row.expires_at ? Date.parse(row.expires_at) : null;
 
-      // Paper orders and orders with no exchange id (outcome unknown) cannot be looked up:
-      // they count as open until their expiry, then they are dead
-      if (this.paper || !row.exchange_order_id) {
+      // Paper orders cannot be looked up: they count as open until their expiry, then they are dead
+      if (this.paper) {
         if (exp !== null && now >= exp) this.expire(row.id, 'expired with no fill seen');
         continue;
       }
+      // Live order with no exchange id (outcome unknown): it may have filled. Only the Reconciler may
+      // close it, after searching the exchange (wallet trades/orders, Binance by client order id);
+      // until then it keeps counting as exposure (R11, amended in 2b).
+      if (!row.exchange_order_id) continue;
       if (row.exchange !== 'polymarket' || !this.bot.polymarket) continue;
 
       let ex: Awaited<ReturnType<PolymarketAdapter['getOrder']>>;
@@ -992,38 +991,16 @@ export class OrderService {
   }
 
   /**
-   * Apply the exchange's view of an order. The row is re-read inside the transaction so a
-   * fill is recorded exactly once even if two syncs saw the same exchange state.
+   * Apply the exchange's view of an order (shared with the Reconciler: the row is re-read inside the
+   * transaction so a fill is recorded exactly once even if two syncs saw the same exchange state).
    */
-  private applyExchangeState(orderId: string, ex: { status: string; sizeMatched: number; originalSize: number; price: number }): void {
-    this.pendingFills = [];
-    const filled = this.deps.db.transaction((): boolean => {
-      const row = this.deps.orderRepo.findById(orderId);
-      if (!row || !OPEN_STATUSES.includes(row.status)) return false;
-
-      const matched = Math.min(ex.sizeMatched, row.size);
-      const delta = matched - row.filled_size;
-      const s = ex.status.toLowerCase();
-      let status: OrderStatus;
-      if (matched >= row.size - QTY_EPS || s === 'matched') status = 'filled';
-      else if (s === 'live') status = matched > QTY_EPS ? 'partially_filled' : 'open';
-      else if (s === 'unmatched') status = 'cancelled';
-      else if (s.startsWith('cancel')) {
-        const expired = row.expires_at !== null && Date.parse(row.expires_at) <= this.now();
-        status = expired ? 'expired' : 'cancelled';
-      } else return false; // unknown status: leave as is
-
-      if (delta > QTY_EPS) {
-        // Resting fills happen at the order's price
-        const prevNotional = row.filled_size * (row.avg_fill_price ?? row.price);
-        const addNotional = delta * row.price;
-        this.recordFill(row, { size: delta, notional: addNotional }, 0, null, null);
-        this.deps.orderRepo.update(row.id, { filledSize: matched, avgFillPrice: (prevNotional + addNotional) / matched });
-      }
-      if (status !== row.status) this.deps.orderRepo.update(row.id, { status });
-      return delta > QTY_EPS;
-    })();
-    if (filled) this.deps.provider.invalidateCash();
+  private applyExchangeState(orderId: string, ex: ExchangeOrderState): void {
+    const r = applyExchangeOrderState(this.deps, orderId, ex, {
+      now: this.now(),
+      owner: { botId: this.bot.botId, botName: this.bot.botName, scriptName: this.bot.scriptName, simulated: this.paper },
+    });
+    if (r.delta > 0) this.deps.provider.invalidateCash();
+    this.pendingFills = r.events;
     this.emitPendingFills();
   }
 

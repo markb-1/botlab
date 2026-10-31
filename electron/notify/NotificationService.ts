@@ -8,7 +8,7 @@
  * - OrderService via `OrderEventSink` (live fills batched per 5 min, rejection storms)
  * - ConfigService (risk-raising edits, rejected edits)
  * - Ledger / market cache audit records (category-rights changes, rules changed or UMA dispute on a held market)
- * - `reconciliationMismatch()` hook (reconciler arrives in chunk 2b)
+ * - Reconciler (chunk 2b): `reconciliationMismatch()` and `reconcilerAlert()` (clock skew, outage)
  * - a daily digest at `digest_time` in `timezone` (server.yaml)
  *
  * Nothing here throws into callers: every entry point catches and logs.
@@ -172,7 +172,12 @@ export class NotificationService implements OrderEventSink {
 
   /** Reconciler hook (chunk 2b): a mismatch between our records and the exchange. */
   reconciliationMismatch(summary: string): void {
-    this.guard(() => this.send(`[RECONCILIATION] Mismatch: ${short(summary, 500)}`, { priority: 'high' }));
+    this.guard(() => this.send(`[RECONCILIATION] Mismatch: ${short(summary, 1500)}`, { priority: 'high' }));
+  }
+
+  /** Reconciler state changes: clock skew (blocks live orders), outage after 5 failed runs, recovery. */
+  reconcilerAlert(text: string): void {
+    this.guard(() => this.send(`[RECONCILER] ${short(text, 800)}`, { priority: 'high' }));
   }
 
   private onConfigChanged(e: ConfigChangedEvent): void {

@@ -35,7 +35,7 @@ import {
   eventVotes,
   expectedThresholdDate,
   mandateListing,
-  parseResolution,
+  checkResolution,
   requiredEvents,
   scoreForecast,
   seedFrom,
@@ -55,7 +55,7 @@ export const MIN_SUPERSEDE_INTERVAL_MS = 6 * 3_600_000;
 /** Forecasts need a tight book: the mid is the skill baseline */
 export const MAX_FORECAST_SPREAD = 0.1;
 /** Without a settled UMA status, a final price must be seen on two runs this far apart before scoring */
-export const RESOLUTION_CONFIRM_MS = 24 * 3_600_000;
+export { RESOLUTION_CONFIRM_MS } from './scoring';
 const DAY_MS = 86_400_000;
 const LOOKUP_TIMEOUT_MS = 10_000;
 const BUCKET_ORDER: HorizonBucket[] = ['short', 'medium', 'long'];
@@ -555,29 +555,21 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     for (const marketId of marketIds) {
       const market = this.deps.marketCache.getCached(marketId);
       if (!market) continue;
-      const res = parseResolution(market);
-      if (res.kind === 'unresolved') {
-        if (market.resolutionSeen !== null) this.deps.marketCache.setResolutionSeen(marketId, null, null);
+      const check = checkResolution(market, this.now());
+      if (check.status === 'unresolved') {
+        if (check.clearSeen) this.deps.marketCache.setResolutionSeen(marketId, null, null);
         continue;
       }
       // Confirmation (R54): a settled UMA status scores at once; otherwise the same final result must be
       // seen on runs at least 24 h apart (the UMA field names are unverified)
-      const signature = JSON.stringify(res);
-      const umaSettled = /resolved|settled/i.test(market.umaResolutionStatus ?? '');
-      if (!umaSettled) {
-        const seenAt = parseTime(market.resolutionSeenAt);
-        if (market.resolutionSeen !== signature || Number.isNaN(seenAt)) {
-          this.deps.marketCache.setResolutionSeen(marketId, signature, nowIso);
-          result.pendingConfirmation++;
-          continue;
-        }
-        if (this.now() - seenAt < RESOLUTION_CONFIRM_MS) {
-          result.pendingConfirmation++;
-          continue;
-        }
+      if (check.status === 'pending') {
+        if (check.setSeen) this.deps.marketCache.setResolutionSeen(marketId, check.setSeen.signature, check.setSeen.at);
+        result.pendingConfirmation++;
+        continue;
       }
+      const res = check.resolution;
       // Resolution time = when the final result was first seen
-      const resolvedIso = umaSettled || !market.resolutionSeenAt ? nowIso : market.resolutionSeenAt;
+      const resolvedIso = check.resolvedAt;
       const resolvedMs = parseTime(resolvedIso);
       const forecasts = this.deps.forecastRepo.unscoredForMarket(marketId);
       if (res.kind === 'void') {

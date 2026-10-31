@@ -26,6 +26,16 @@ export const ServerSchema = z.strictObject({
     .string()
     .regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'must be HH:MM (24 h)')
     .default('08:00'),
+  /** Order-book recorder (spec §10) */
+  recorder: z
+    .strictObject({
+      enabled: z.boolean().default(true),
+      /** Seconds between snapshots of every watched token */
+      interval_seconds: z.number().int().min(10).max(3600).default(60),
+      /** Cap on tokens snapshotted per cycle (disk use, §10) */
+      max_tokens: z.number().int().min(1).max(2000).default(200),
+    })
+    .prefault({}),
   notify: z
     .strictObject({
       telegram: z
@@ -50,6 +60,10 @@ export const DEFAULT_SERVER_YAML = `# BotLab server settings (spec §3, §11). H
 # Copy to server.yaml (or start the app once and it is created with these defaults).
 timezone: Europe/Dublin              # time zone of the daily digest
 digest_time: "08:00"                 # local time (HH:MM) of the daily digest
+recorder:                            # order-book snapshots for backtests (top 10 levels)
+  enabled: true
+  interval_seconds: 60
+  max_tokens: 200                    # tokens per cycle: bot scopes, active forecasts, held, watchlist
 notify:
   telegram:
     enabled: false

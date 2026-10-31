@@ -374,8 +374,9 @@ export class RiskMonitor {
         const dd = state.ramp_max_drawdown_usd;
         drawdownPct = allocation > 0 ? dd / allocation : dd > 0 ? Infinity : 0;
       }
+      // Adopted positions and resolution payouts are not fills the bot made
       const liveFills = fillRows.filter(
-        (f) => f.bot_id === bot.id && f.simulated !== 1 && parseDbTime(f.executed_at) >= stageSince
+        (f) => f.bot_id === bot.id && f.simulated !== 1 && !f.fill_source && parseDbTime(f.executed_at) >= stageSince
       ).length;
       const runDays = this.deps.botRepo.countRunDays(bot.id, new Date(utcDayStart(stageSince)).toISOString().slice(0, 10));
 

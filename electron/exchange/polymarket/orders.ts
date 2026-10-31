@@ -157,3 +157,87 @@ export async function fetchOrder(
   if (sizeMatched === null || originalSize === null || price === null) return null;
   return { status: o.status, sizeMatched, originalSize, price };
 }
+
+// ─── Reads used by the Reconciler (spec §13) ─────────────────────────────
+
+/** One of the wallet's open orders on the CLOB. */
+export interface ClobOpenOrder {
+  id: string;
+  status: string;
+  assetId: string;
+  side: 'buy' | 'sell';
+  price: number;
+  originalSize: number;
+  sizeMatched: number;
+  /** ms; NaN when the exchange did not say */
+  createdAtMs: number;
+}
+
+/** One of the wallet's trades on the CLOB (as taker or maker). */
+export interface ClobTrade {
+  id: string;
+  assetId: string;
+  status: string;
+  /** ms */
+  matchTimeMs: number;
+  traderSide: 'TAKER' | 'MAKER' | string;
+  takerOrderId: string;
+  side: 'buy' | 'sell';
+  size: number;
+  price: number;
+  makerOrders: Array<{ orderId: string; makerAddress: string; matchedAmount: number; price: number; side: 'buy' | 'sell'; assetId: string }>;
+}
+
+const lowerSide = (v: unknown): 'buy' | 'sell' => (String(v).toLowerCase() === 'sell' ? 'sell' : 'buy');
+const toMs = (v: unknown): number => {
+  const n = parseNum(v);
+  if (n === null) return NaN;
+  return n < 1e12 ? n * 1000 : n; // the CLOB reports seconds
+};
+
+/** The wallet's open orders in one token. Throws on an API error (never returns a partial answer as "none"). */
+export async function fetchOpenOrders(clob: ClobClient, tokenId: string): Promise<ClobOpenOrder[]> {
+  const resp = (await clob.getOpenOrders({ asset_id: tokenId })) as unknown;
+  if (!Array.isArray(resp)) throw new Error(`open orders lookup failed: ${JSON.stringify(resp).slice(0, 200)}`);
+  return resp
+    .filter((o): o is Record<string, unknown> => !!o && typeof o === 'object' && typeof (o as Record<string, unknown>).id === 'string')
+    .map((o) => ({
+      id: String(o.id),
+      status: String(o.status ?? ''),
+      assetId: String(o.asset_id ?? ''),
+      side: lowerSide(o.side),
+      price: parseNum(o.price) ?? NaN,
+      originalSize: parseNum(o.original_size) ?? NaN,
+      sizeMatched: parseNum(o.size_matched) ?? 0,
+      createdAtMs: toMs(o.created_at),
+    }));
+}
+
+/** The wallet's trades in one token since `afterSec` (unix seconds). Throws on an API error. */
+export async function fetchTrades(clob: ClobClient, tokenId: string, afterSec: number): Promise<ClobTrade[]> {
+  const resp = (await clob.getTrades({ asset_id: tokenId, after: String(Math.max(0, Math.floor(afterSec))) })) as unknown;
+  if (!Array.isArray(resp)) throw new Error(`trades lookup failed: ${JSON.stringify(resp).slice(0, 200)}`);
+  return resp
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+    .map((t) => ({
+      id: String(t.id ?? ''),
+      assetId: String(t.asset_id ?? ''),
+      status: String(t.status ?? ''),
+      matchTimeMs: toMs(t.match_time),
+      traderSide: String(t.trader_side ?? ''),
+      takerOrderId: String(t.taker_order_id ?? ''),
+      side: lowerSide(t.side),
+      size: parseNum(t.size) ?? 0,
+      price: parseNum(t.price) ?? NaN,
+      makerOrders: (Array.isArray(t.maker_orders) ? t.maker_orders : [])
+        .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object')
+        .map((m) => ({
+          orderId: String(m.order_id ?? ''),
+          makerAddress: String(m.maker_address ?? ''),
+          matchedAmount: parseNum(m.matched_amount) ?? 0,
+          price: parseNum(m.price) ?? NaN,
+          side: lowerSide(m.side),
+          assetId: String(m.asset_id ?? ''),
+        })),
+    }));
+}

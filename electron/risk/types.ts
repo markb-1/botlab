@@ -160,7 +160,9 @@ export type RiskCheckName =
   | 'forecast_unavailable'
   | 'post_only'
   | 'unsupported_symbol'
-  | 'market_data_unavailable';
+  | 'market_data_unavailable'
+  // Local clock differs from exchange time by more than 5 s (spec §15; set by the Reconciler)
+  | 'clock_skew';
 
 export interface RiskCheckResult {
   /** Spec §4.1 step number (1–7); 0 = snapshot validation */

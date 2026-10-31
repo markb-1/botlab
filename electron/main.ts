@@ -15,6 +15,7 @@ import {
   MarketCacheRepository,
   ForecastRepository,
   CategoryRightsRepository,
+  OrderbookSnapshotRepository,
 } from './database/repositories/index';
 import type { Database } from './database/index';
 import { keyManager } from './security/keyManager';
@@ -48,7 +49,13 @@ import { registerConfigHandlers } from './ipc/handlers/configHandlers';
 import { TelegramNotifier, telegramSettingsFrom } from './notify/TelegramNotifier';
 import { NotificationService } from './notify/NotificationService';
 import { unfilledNotional } from './orders/DbRiskStateProvider';
-import { getBinanceOrderBook } from './sdk/binance';
+import { getBinanceOrderBook, getBinancePrice, getBinanceServerTime } from './sdk/binance';
+import { FEE_CATEGORIES, type FeeCategory } from './orders/FeeService';
+import type { ClockSkewGuard } from './orders/OrderService';
+import { Reconciler } from './reconcile/Reconciler';
+import { fetchDataApiPositions, fetchDataApiTrades } from './reconcile/dataApi';
+import { Recorder } from './recorder/Recorder';
+import { registerReconcileHandlers } from './ipc/handlers/reconcileHandlers';
 
 // Load environment variables
 import dotenv from 'dotenv';
@@ -85,6 +92,33 @@ let notifications: NotificationService;
 // Market cache and forecast ledger (no wallet keys needed: created before unlock)
 let marketCache: MarketCacheService | null = null;
 let ledger: LedgerService | null = null;
+
+// Order-book recorder (before unlock) and reconciler (after unlock: needs wallet keys)
+let recorder: Recorder | null = null;
+let reconciler: Reconciler | null = null;
+let snapshotRepo: OrderbookSnapshotRepository;
+/** OrderService asks this before every live order; the reconciler sets it (spec §15) */
+const clockGuard: ClockSkewGuard = { status: () => reconciler?.status() ?? { skewed: false, detail: null } };
+
+/** Fee rates for a token from the live fee table and the market cache's fee category. */
+function feeRatesFor(tokenId: string): { takerRate: number; makerRate: number } {
+  const fees = new FeeService(configService.getConfig()?.fees);
+  const cat = marketCache?.getCachedByToken(tokenId)?.feeCategory ?? null;
+  return fees.getRates(cat && (FEE_CATEGORIES as readonly string[]).includes(cat) ? (cat as FeeCategory) : null);
+}
+
+/** CLOB /time (seconds) → ms; falls back to Binance server time. */
+async function exchangeTimeMs(): Promise<number> {
+  try {
+    const resp = await fetch(`${settingsRepo.get().clob_http_url.replace(/\/+$/, '')}/time`, { signal: AbortSignal.timeout(10_000) });
+    if (!resp.ok) throw new Error(`CLOB /time HTTP ${resp.status}`);
+    const n = Number((await resp.text()).trim());
+    if (!Number.isFinite(n) || n <= 0) throw new Error('CLOB /time: not a number');
+    return n < 1e12 ? n * 1000 : n;
+  } catch {
+    return getBinanceServerTime();
+  }
+}
 
 const isDev = !app.isPackaged;
 
@@ -282,6 +316,48 @@ async function initializePhaseA(): Promise<void> {
   marketCache.start();
   ledger.start();
 
+  // Order-book recorder (spec §10): bot scopes, active forecasts, held tokens, watchlist; never affects trading
+  snapshotRepo = new OrderbookSnapshotRepository(db);
+  recorder = new Recorder({
+    repo: snapshotRepo,
+    getSettings: () => configService.getConfig()?.server.recorder ?? null,
+    heldTokens: () =>
+      [false, true].flatMap((simulated) =>
+        tradeRepo
+          .getRiskPositions({ simulated, exchange: 'polymarket' })
+          .filter((p) => p.net_quantity > qty)
+          .map((p) => p.symbol)
+      ),
+    forecastTokens: () => forecastRepo.activeTokenIds(),
+    botMarketIds: () =>
+      botRepo
+        .findAll()
+        .filter((b) => b.stage !== 'retired' && b.enabled === 1 && b.market_ids)
+        .flatMap((b) => {
+          try {
+            const ids = JSON.parse(b.market_ids as string) as unknown;
+            return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : [];
+          } catch {
+            return [];
+          }
+        }),
+    marketTokens: async (marketId) => (await cache.getMarket(marketId))?.tokens.map((t) => t.tokenId) ?? null,
+    fetchBook: async (tokenId) => {
+      const resp = await fetch(`${settingsRepo.get().clob_http_url.replace(/\/+$/, '')}/book?token_id=${encodeURIComponent(tokenId)}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!resp.ok) throw new Error(`CLOB book HTTP ${resp.status}`);
+      return (await resp.json()) as { bids?: Array<{ price: string; size: string }>; asks?: Array<{ price: string; size: string }>; last_trade_price?: string };
+    },
+  });
+  recorder.start();
+  registerReconcileHandlers({
+    getReconciler: () => reconciler,
+    snapshotRepo,
+    audit,
+    isTrustedSender: (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id,
+  });
+
   // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
   const startHaltedAfterCrash: boolean | null = configService.getConfig()?.limits.server.start_halted_after_crash ?? null;
   shutdownMarker = new ShutdownMarker(getDataDir());
@@ -309,7 +385,11 @@ async function initializePhaseA(): Promise<void> {
   registerAiHandlers(settingsRepo);
 
   // 8. Register backtest handlers (no encryption key needed)
-  registerBacktestHandlers(db, scriptRepo, backtestRepo);
+  registerBacktestHandlers(db, scriptRepo, backtestRepo, {
+    snapshotRepo,
+    getFeeRates: feeRatesFor,
+    getMaxTtlMinutes: () => configService.getConfig()?.limits.orders.resting_order_ttl_minutes,
+  });
 
   // 9. Risk handlers (halts, kill switch) — available before unlock
   registerRiskHandlers(halts, killSwitch, botRepo, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
@@ -359,7 +439,17 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     scriptRepo,
     storageRepo,
     tradeRepo,
-    { db: database, orderRepo, riskStateRepo, audit, config: configService, events: notifications, marketCache: marketCache ?? undefined, ledger: ledger ?? undefined }
+    {
+      db: database,
+      orderRepo,
+      riskStateRepo,
+      audit,
+      config: configService,
+      events: notifications,
+      marketCache: marketCache ?? undefined,
+      ledger: ledger ?? undefined,
+      clock: clockGuard,
+    }
   );
   await botManager.initialize();
   console.log('[Main] BotManager initialized');
@@ -394,6 +484,35 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     },
   });
   riskMonitor.start();
+
+  // Reconciler every 60 s (spec §13, §15): orders, fills, positions, resolutions, clock skew
+  const mc = marketCache;
+  reconciler = new Reconciler({
+    db: database,
+    orderRepo,
+    tradeRepo,
+    botRepo,
+    scriptRepo,
+    walletRepo,
+    riskStateRepo,
+    audit,
+    killSwitch,
+    canceller,
+    notify: notifications,
+    events: notifications,
+    marketCache: mc ?? undefined,
+    getFeeRates: feeRatesFor,
+    // Running with a live OrderService (a bot now running paper does not own its old live orders)
+    isBotRunning: (id) => manager.getRunningOrderService(id, false) !== null,
+    getPolymarketAdapter: (walletId) => manager.getPolymarketAdapterForWallet(walletId),
+    getBinanceAdapter: () => manager.getBinanceAdapter(),
+    fetchPositions: (user) => fetchDataApiPositions(user),
+    fetchTrades: (user, conditionId) => fetchDataApiTrades(user, conditionId),
+    getExchangeTime: exchangeTimeMs,
+    getBinancePrice: async (symbol) => (await getBinancePrice(symbol)).price,
+    getLimits: () => configService.getConfig()?.limits ?? null,
+  });
+  reconciler.start();
 
   // 4. Forward bot events to renderer
   botManager.on('bot:event', (event) => {
@@ -485,9 +604,11 @@ async function gracefulShutdown(): Promise<void> {
   if (riskMonitor) {
     await riskMonitor.stop().catch((error) => console.error('[Main] Error stopping risk monitor:', error));
   }
+  await reconciler?.stop().catch((error) => console.error('[Main] Error stopping reconciler:', error));
   if (botManager) {
     await botManager.shutdown();
   }
+  await recorder?.stop().catch((error) => console.error('[Main] Error stopping recorder:', error));
   await ledger?.stop().catch((error) => console.error('[Main] Error stopping ledger scorer:', error));
   await marketCache?.stop().catch((error) => console.error('[Main] Error stopping market cache:', error));
   if (shutdownTimedOut) return;

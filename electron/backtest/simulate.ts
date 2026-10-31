@@ -43,7 +43,7 @@ export interface SimulationOutput {
 // InMemoryStorageRepo — implements BotStorageRepository interface without DB
 // ============================================================================
 
-class InMemoryStorageRepo {
+export class InMemoryStorageRepo {
   private store = new Map<string, Map<string, unknown>>();
 
   get(botId: string, key: string): unknown | null {

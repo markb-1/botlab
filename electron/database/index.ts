@@ -462,6 +462,32 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     'ALTER TABLE forecasts ADD COLUMN active_until TEXT',
     'ALTER TABLE market_cache ADD COLUMN resolution_seen_at TEXT',
     'ALTER TABLE market_cache ADD COLUMN resolution_seen TEXT',
+    // Chunk 2b: reconciler freshness (/healthz later) and non-order fills. fill_source: NULL = an OrderService
+    // fill; 'adopted' = pre-existing exchange position adopted by a human (reconcile:adoptPositions);
+    // 'resolution' = position closed at the payout of a resolved market. Both carry a synthetic order_id
+    // ('adopt:…' / 'resolve:…') so they count as order-linked positions (R8).
+    'ALTER TABLE risk_state ADD COLUMN reconciled_at TEXT',
+    'ALTER TABLE bot_trades ADD COLUMN fill_source TEXT',
+    // Order-book recorder (spec §2.2, §10). ts = ms since epoch; bids/asks = zlib-deflated JSON [[price, size], …] (top 10)
+    `CREATE TABLE IF NOT EXISTS orderbook_snapshots (
+      token_id TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      best_bid REAL,
+      best_ask REAL,
+      mid REAL,
+      bids BLOB NOT NULL,
+      asks BLOB NOT NULL,
+      last_trade_price REAL,
+      PRIMARY KEY (token_id, ts)
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_orderbook_snapshots_ts ON orderbook_snapshots(ts)',
+    `CREATE TABLE IF NOT EXISTS recorder_watchlist (
+      token_id TEXT PRIMARY KEY,
+      market_id TEXT,
+      note TEXT,
+      added_by TEXT NOT NULL,
+      added_at TEXT NOT NULL
+    )`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

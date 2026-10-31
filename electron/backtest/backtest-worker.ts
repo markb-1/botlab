@@ -7,6 +7,7 @@
 import { parentPort as maybeParentPort, workerData } from 'worker_threads';
 import { hardenWorkerRealm } from '../runtime/sandbox';
 import { runBacktestSimulation, type SimulationInput } from './simulate';
+import { runSnapshotSimulation, type SnapshotSimulationInput } from './snapshotSimulate';
 
 if (!maybeParentPort) {
   throw new Error('backtest-worker must run inside a worker thread');
@@ -15,6 +16,9 @@ const parentPort = maybeParentPort;
 
 hardenWorkerRealm();
 
-runBacktestSimulation(workerData as SimulationInput)
+const input = workerData as SimulationInput | SnapshotSimulationInput;
+const run = 'source' in input && input.source === 'polymarket-snapshots' ? runSnapshotSimulation(input) : runBacktestSimulation(input as SimulationInput);
+
+run
   .then((output) => parentPort.postMessage({ type: 'result', output }))
   .catch((err: unknown) => parentPort.postMessage({ type: 'error', error: err instanceof Error ? err.message : String(err) }));

@@ -2,6 +2,10 @@
 # Copy to server.yaml (or start the app once and it is created with these defaults).
 timezone: Europe/Dublin              # time zone of the daily digest
 digest_time: "08:00"                 # local time (HH:MM) of the daily digest
+recorder:                            # order-book snapshots for backtests (top 10 levels)
+  enabled: true
+  interval_seconds: 60
+  max_tokens: 200                    # tokens per cycle: bot scopes, active forecasts, held, watchlist
 notify:
   telegram:
     enabled: false

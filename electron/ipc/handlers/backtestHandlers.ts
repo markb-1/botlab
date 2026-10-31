@@ -7,12 +7,22 @@ import { ipcMain } from 'electron';
 import type Database from 'better-sqlite3';
 import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
 import { BacktestRepository } from '../../database/repositories/BacktestRepository';
-import { BacktestEngine } from '../../backtest/BacktestEngine';
+import { BacktestEngine, type BacktestSource } from '../../backtest/BacktestEngine';
+import type { FeeRatesInput } from '../../backtest/snapshotSimulate';
+import type { OrderbookSnapshotRepository } from '../../database/repositories/OrderbookSnapshotRepository';
+
+/** Polymarket snapshot backtests (spec §10) */
+export interface SnapshotBacktestDeps {
+  snapshotRepo: Pick<OrderbookSnapshotRepository, 'range'>;
+  getFeeRates: (tokenId: string) => FeeRatesInput;
+  getMaxTtlMinutes: () => number | undefined;
+}
 
 export function registerBacktestHandlers(
   db: Database.Database,
   scriptRepo: ScriptRepository,
-  backtestRepo: BacktestRepository
+  backtestRepo: BacktestRepository,
+  snapshots?: SnapshotBacktestDeps
 ): void {
   /**
    * Run a backtest for a given script + symbol + time range.
@@ -29,12 +39,25 @@ export function registerBacktestHandlers(
         endTime: number;
         initialBalance: number;
         config?: Record<string, unknown>;
+        /** Default 'binance-klines' (unchanged); 'polymarket-snapshots' replays recorded order books */
+        source?: BacktestSource;
+        /** polymarket-snapshots: tokens to replay */
+        tokenIds?: string[];
       }
     ) => {
       try {
         // Validate inputs
+        const source: BacktestSource = data.source ?? 'binance-klines';
+        if (source !== 'binance-klines' && source !== 'polymarket-snapshots') return { success: false, error: `unknown source ${String(source)}` };
         if (!data.scriptId) return { success: false, error: 'scriptId is required' };
-        if (!data.symbol) return { success: false, error: 'symbol is required' };
+        if (source === 'binance-klines' && !data.symbol) return { success: false, error: 'symbol is required' };
+        if (source === 'polymarket-snapshots') {
+          if (!snapshots) return { success: false, error: 'Snapshot backtests are not available' };
+          if (!Array.isArray(data.tokenIds) || data.tokenIds.length === 0 || data.tokenIds.some((t) => typeof t !== 'string' || !t)) {
+            return { success: false, error: 'tokenIds (non-empty array of token ids) is required' };
+          }
+          if (data.tokenIds.length > 50) return { success: false, error: 'at most 50 tokens per backtest' };
+        }
         if (!data.startTime || !data.endTime) return { success: false, error: 'startTime and endTime are required' };
         if (data.startTime >= data.endTime) return { success: false, error: 'startTime must be before endTime' };
         if (!data.initialBalance || data.initialBalance <= 0) return { success: false, error: 'initialBalance must be positive' };
@@ -49,7 +72,7 @@ export function registerBacktestHandlers(
           db,
           backtestRepo,
           compiledScript: script.compiled,
-          symbol: data.symbol,
+          symbol: data.symbol ?? '',
           interval: data.interval || '1h',
           startTime: data.startTime,
           endTime: data.endTime,
@@ -57,6 +80,15 @@ export function registerBacktestHandlers(
           config: data.config || {},
           scriptId: data.scriptId,
           scriptName: script.name,
+          source,
+          ...(source === 'polymarket-snapshots' && snapshots
+            ? {
+                tokenIds: data.tokenIds,
+                loadSnapshots: (tokens: string[], from: number, to: number) => snapshots.snapshotRepo.range(tokens, from, to),
+                getFeeRates: snapshots.getFeeRates,
+                maxTtlMinutes: snapshots.getMaxTtlMinutes(),
+              }
+            : {}),
         });
 
         const result = await engine.run();

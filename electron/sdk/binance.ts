@@ -309,6 +309,56 @@ export async function getBinancePositions(creds: BinanceCredentials): Promise<Bi
   }));
 }
 
+/** Result of looking up an order by client order id. */
+export type BinanceOrderQuery =
+  | { found: false }
+  | {
+      found: true;
+      orderId: number;
+      /** NEW, PARTIALLY_FILLED, FILLED, CANCELED, PENDING_CANCEL, REJECTED, EXPIRED, EXPIRED_IN_MATCH */
+      status: string;
+      origQty: number;
+      executedQty: number;
+      cummulativeQuoteQty: number;
+    };
+
+/**
+ * Look up an order by our client order id (orders.id, sent as newClientOrderId). Used by the
+ * Reconciler to settle orders whose outcome was unknown. `found: false` only for Binance's definite
+ * "Order does not exist" (code -2013); every other failure throws (the caller keeps the order open).
+ */
+export async function queryBinanceOrder(creds: BinanceCredentials, symbol: string, clientOrderId: string): Promise<BinanceOrderQuery> {
+  const query = buildSignedQuery({ symbol: symbol.toUpperCase(), origClientOrderId: clientOrderId }, creds.apiSecret);
+  const resp = await fetch(`${BASE_URL}/api/v3/order?${query}`, { headers: { 'X-MBX-APIKEY': creds.apiKey } });
+  const text = await resp.text();
+  if (!resp.ok) {
+    let code: number | undefined;
+    try {
+      code = (JSON.parse(text) as { code?: number }).code;
+    } catch {
+      code = undefined;
+    }
+    if (resp.status === 400 && code === -2013) return { found: false };
+    throw new BinanceHttpError(`Binance order query: HTTP ${resp.status} - ${text.slice(0, 200)}`, resp.status);
+  }
+  const d = JSON.parse(text) as { orderId: number; status: string; origQty: string; executedQty: string; cummulativeQuoteQty: string };
+  return {
+    found: true,
+    orderId: d.orderId,
+    status: String(d.status),
+    origQty: parseFloat(d.origQty),
+    executedQty: parseFloat(d.executedQty),
+    cummulativeQuoteQty: parseFloat(d.cummulativeQuoteQty),
+  };
+}
+
+/** Binance server time in ms (clock skew guard, spec §15). */
+export async function getBinanceServerTime(): Promise<number> {
+  const d = await publicGet<{ serverTime: number }>('/api/v3/time');
+  if (typeof d.serverTime !== 'number' || !Number.isFinite(d.serverTime)) throw new Error('Binance /time: no serverTime');
+  return d.serverTime;
+}
+
 /**
  * Execute a market buy order (spend quoteAmount of USDT).
  * Only electron/orders/ExchangeAdapter.ts may call this (OrderService choke point).

@@ -86,6 +86,17 @@ export class OrderRepository {
       .all(sim) as OrderRow[];
   }
 
+  /** Earliest live order (any status) of bots using this wallet; null if none (reconciler, R8). */
+  firstLiveOrderAtForWallet(walletId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT MIN(o.created_at) AS first FROM orders o JOIN bots b ON b.id = o.bot_id
+         WHERE b.wallet_id = ? AND o.simulated = 0 AND o.status <> 'rejected_risk'`
+      )
+      .get(walletId) as { first: string | null };
+    return row.first;
+  }
+
   /** Bots with orders that may still fill (live or paper). */
   findBotIdsWithOpenOrders(): string[] {
     return (this.db.prepare(`SELECT DISTINCT bot_id FROM orders WHERE status IN ${OPEN_IN}`).all() as Array<{ bot_id: string }>).map(

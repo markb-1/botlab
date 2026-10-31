@@ -368,7 +368,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       expect(t.orderRepo.sumOpenBuyNotional({})).toBe(0);
     });
 
-    it('unknown-outcome FOK: counted for 5 minutes, reported (not failed) by cancelAll, then dead', async () => {
+    it('unknown-outcome FOK: reported (not failed) by cancelAll, counted until the reconciler confirms it (R11, 2b)', async () => {
       const svc = makeService('bot-1');
       poly.postMarketOrder.mockRejectedValueOnce(new Error('socket hang up'));
       const r = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 10 });
@@ -377,13 +377,25 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
       expect(await svc.cancelAll()).toEqual({ cancelled: 0, failed: 0, unknownOutcome: 1 });
       expect(t.orderRepo.sumOpenBuyNotional({})).toBeCloseTo(10);
 
-      clock = NOW + 4 * 60_000;
+      // Past its 5-minute lifetime the bot's own sync no longer expires it: only the Reconciler,
+      // after searching the exchange, may (tests/reconcile)
+      clock = NOW + 60 * 60_000;
       await svc.syncOpenOrders();
+      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('submitted');
       expect(t.orderRepo.sumOpenBuyNotional({})).toBeCloseTo(10);
-      clock = NOW + 5 * 60_000;
-      await svc.syncOpenOrders();
-      expect(t.orderRepo.findById(r.orderId!)!.status).toBe('expired');
-      expect(t.orderRepo.sumOpenBuyNotional({})).toBe(0);
+    });
+
+    it('clock skew blocks live orders (clock_skew), not paper', async () => {
+      const skew = { skewed: true, detail: 'local clock ahead of exchange time by 9.0 s' };
+      const svc = makeService('bot-1');
+      (svc as unknown as { deps: { clock: unknown } }).deps.clock = { status: () => skew };
+      const r = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 10 });
+      expect(r).toMatchObject({ ok: false, status: 'rejected_risk', failedCheck: 'clock_skew' });
+      expect(poly.postMarketOrder).not.toHaveBeenCalled();
+
+      skew.skewed = false;
+      const ok = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 10 });
+      expect(ok).toMatchObject({ ok: true, status: 'filled' });
     });
   });
 

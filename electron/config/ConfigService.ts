@@ -70,7 +70,8 @@ const DEFAULT_TEXT: Record<ConfigFileName, string> = {
 /** Sections that must be present in a reloaded file (a truncated file must not fall back to defaults). */
 const shapeKeys = (schema: unknown): string[] => Object.keys((schema as { shape: Record<string, unknown> }).shape);
 const REQUIRED_SECTIONS: Record<ConfigFileName, readonly string[]> = {
-  limits: shapeKeys(LimitsSchema),
+  // `reconcile` (2b) is optional so limits files written before it still reload (its default applies)
+  limits: shapeKeys(LimitsSchema).filter((k) => k !== 'reconcile'),
   mandate: shapeKeys(MandateSchema).filter((k) => k !== 'notes'),
   fees: shapeKeys(FeesSchema),
   server: [],

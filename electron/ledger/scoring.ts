@@ -37,6 +37,36 @@ export function parseResolution(m: { closed: boolean; outcomePrices: string[] | 
   return { kind: 'unresolved' };
 }
 
+/** Same final result must be seen on runs this far apart before it counts (R54) */
+export const RESOLUTION_CONFIRM_MS = 24 * 3_600_000;
+
+export type ResolutionCheck =
+  | { status: 'unresolved'; /** a stored sighting must be cleared */ clearSeen: boolean }
+  | { status: 'pending'; /** store this sighting (new or changed result) */ setSeen: { signature: string; at: string } | null }
+  | { status: 'confirmed'; resolution: Exclude<Resolution, { kind: 'unresolved' }>; /** first sighting (or now when UMA says settled) */ resolvedAt: string };
+
+/**
+ * Confirmation before a resolution is acted on (R54): a settled UMA status confirms at once; otherwise
+ * the same final result must be seen on runs at least 24 h apart (`resolutionSeen[At]` in market_cache).
+ * Pure: the caller stores `setSeen` / clears on `clearSeen`. Used by the ledger scorer and the Reconciler.
+ */
+export function checkResolution(
+  m: { closed: boolean; outcomePrices: string[] | null; umaResolutionStatus: string | null; resolutionSeen: string | null; resolutionSeenAt: string | null },
+  now: number
+): ResolutionCheck {
+  const res = parseResolution(m);
+  if (res.kind === 'unresolved') return { status: 'unresolved', clearSeen: m.resolutionSeen !== null };
+  const nowIso = new Date(now).toISOString();
+  const signature = JSON.stringify(res);
+  const umaSettled = /resolved|settled/i.test(m.umaResolutionStatus ?? '');
+  if (!umaSettled) {
+    const seenAt = m.resolutionSeenAt ? Date.parse(m.resolutionSeenAt) : NaN;
+    if (m.resolutionSeen !== signature || Number.isNaN(seenAt)) return { status: 'pending', setSeen: { signature, at: nowIso } };
+    if (now - seenAt < RESOLUTION_CONFIRM_MS) return { status: 'pending', setSeen: null };
+  }
+  return { status: 'confirmed', resolution: res, resolvedAt: umaSettled || !m.resolutionSeenAt ? nowIso : m.resolutionSeenAt };
+}
+
 // ─── Per-forecast scores ─────────────────────────────────────────────
 
 /** brier_agent = (p − o)², brier_market = (m − o)², skill = brier_market − brier_agent (positive = agent better). */

@@ -29,6 +29,8 @@ export interface RiskStateRow {
   day_paper_pnl: number | null;
   /** JSON LossBaseline: P&L at the moment a human cleared a halt; the loss limit counts from there */
   loss_baseline: string | null;
+  /** Global row: last successful reconciler run (ISO; /healthz freshness) */
+  reconciled_at?: string | null;
 }
 
 export interface LossBaseline {
@@ -119,6 +121,12 @@ export class RiskStateRepository {
     } catch {
       return null;
     }
+  }
+
+  /** Global row: the reconciler finished a run (all exchanges answered). */
+  setReconciledAt(iso: string): void {
+    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope, updated_at) VALUES (?, ?)').run(GLOBAL_SCOPE, iso);
+    this.db.prepare('UPDATE risk_state SET reconciled_at = ? WHERE scope = ?').run(iso, GLOBAL_SCOPE);
   }
 
   /** Bot rows: probation drawdown tracking. */

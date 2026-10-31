@@ -36,3 +36,6 @@ export type { ForecastRow, ForecastStatus, ForecastInsert, ForecastFilter } from
 
 export { CategoryRightsRepository } from './CategoryRightsRepository';
 export type { CategoryRightsRow } from './CategoryRightsRepository';
+
+export { OrderbookSnapshotRepository, rowToSnapshot } from './OrderbookSnapshotRepository';
+export type { OrderbookSnapshotRow, WatchlistRow } from './OrderbookSnapshotRepository';

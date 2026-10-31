@@ -102,6 +102,12 @@ export const LimitsSchema = z.strictObject({
       allocation_usd: usd.default(100),
     })
     .prefault({}),
+  reconcile: z
+    .strictObject({
+      // Reconciler (spec §13): exchange vs local position difference (USD value) that halts trading globally
+      max_unexplained_usd: usd.default(10),
+    })
+    .prefault({}),
   server: z
     .strictObject({
       // Spec §4.3 puts this in server.yaml; kept here until that file exists

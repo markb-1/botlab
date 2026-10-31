@@ -126,7 +126,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // === Backtesting ===
   backtest: {
-    run: (data: { scriptId: string; symbol: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown> }) =>
+    run: (data: { scriptId: string; symbol?: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown>; source?: 'binance-klines' | 'polymarket-snapshots'; tokenIds?: string[] }) =>
       ipcRenderer.invoke('backtest:run', data),
     list: (scriptId?: string) =>
       ipcRenderer.invoke('backtest:list', scriptId),
@@ -176,6 +176,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('markets:get', marketId),
     setAmbiguity: (marketId: string, score: number, note?: string) =>
       ipcRenderer.invoke('markets:setAmbiguity', marketId, score, note),
+  },
+
+  // === Reconciler and order-book recorder (spec §10, §13) ===
+  reconcile: {
+    status: () =>
+      ipcRenderer.invoke('reconcile:status'),
+    adoptPositions: (walletId: string, botId: string) =>
+      ipcRenderer.invoke('reconcile:adoptPositions', walletId, botId),
+  },
+  recorder: {
+    watchlistList: () =>
+      ipcRenderer.invoke('recorder:watchlistList'),
+    watchlistAdd: (tokenId: string, marketId?: string, note?: string) =>
+      ipcRenderer.invoke('recorder:watchlistAdd', tokenId, marketId, note),
+    watchlistRemove: (tokenId: string) =>
+      ipcRenderer.invoke('recorder:watchlistRemove', tokenId),
   },
 
   onMarketRulesChanged: (callback: (event: any) => void) => {
@@ -279,7 +295,7 @@ declare global {
         import: () => Promise<any>;
       };
       backtest: {
-        run: (data: { scriptId: string; symbol: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown> }) => Promise<any>;
+        run: (data: { scriptId: string; symbol?: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown>; source?: 'binance-klines' | 'polymarket-snapshots'; tokenIds?: string[] }) => Promise<any>;
         list: (scriptId?: string) => Promise<any>;
         get: (runId: string) => Promise<any>;
         delete: (runId: string) => Promise<any>;
@@ -305,6 +321,15 @@ declare global {
       markets: {
         get: (marketId: string) => Promise<any>;
         setAmbiguity: (marketId: string, score: number, note?: string) => Promise<any>;
+      };
+      reconcile: {
+        status: () => Promise<any>;
+        adoptPositions: (walletId: string, botId: string) => Promise<any>;
+      };
+      recorder: {
+        watchlistList: () => Promise<any>;
+        watchlistAdd: (tokenId: string, marketId?: string, note?: string) => Promise<any>;
+        watchlistRemove: (tokenId: string) => Promise<any>;
       };
       onMarketRulesChanged: (callback: (event: any) => void) => () => void;
       onConfigChanged: (callback: (event: any) => void) => () => void;

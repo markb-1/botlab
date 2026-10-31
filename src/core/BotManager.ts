@@ -29,9 +29,9 @@ import { defaultCategories } from '../../electron/config/categoriesSchema';
 import type { MarketCacheService } from '../../electron/ledger/MarketCacheService';
 import type { LedgerService } from '../../electron/ledger/LedgerService';
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
-import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
+import { OrderService, type ClobBook, type ClockSkewGuard } from '../../electron/orders/OrderService';
 import { createBinanceAdapter, createPolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
-import type { PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import type { BinanceAdapter, PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
 import type { AuditActor, AuditService } from '../../electron/audit/AuditService';
 import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
 import type { LimitsConfig, AppConfig } from '../../electron/config';
@@ -57,6 +57,8 @@ export interface BotManagerOrderDeps {
   marketCache?: MarketCacheService;
   /** Forecast ledger: forecasts and category rights for ledger-driven orders, ctx.ledger reads */
   ledger?: LedgerService;
+  /** Clock skew guard (Reconciler): live orders are refused while the clock is off (spec §15) */
+  clock?: ClockSkewGuard;
 }
 
 /**
@@ -236,6 +238,7 @@ export class BotManager extends EventEmitter {
         forecasts: this.orderDeps.ledger,
         getBook: (tokenId) => args.clobClient.getOrderBook(tokenId) as Promise<ClobBook>,
         getBinanceBook: (symbol) => getBinanceOrderBook(symbol),
+        clock: this.orderDeps.clock,
       },
       {
         botId: args.botId,
@@ -295,6 +298,18 @@ export class BotManager extends EventEmitter {
     if (!row) return null;
     const creds = await this.walletManager.getWallet(row.wallet_id);
     return createPolymarketAdapter(await this.getClobClient(creds, false));
+  }
+
+  /** Authenticated Polymarket adapter for a wallet (Reconciler: orders/trades lookups, any bot). */
+  async getPolymarketAdapterForWallet(walletId: string): Promise<PolymarketAdapter | null> {
+    const creds = await this.walletManager.getWallet(walletId);
+    return createPolymarketAdapter(await this.getClobClient(creds, false));
+  }
+
+  /** Binance adapter with the configured credentials; null when none are set. */
+  getBinanceAdapter(): BinanceAdapter | null {
+    const s = this.getSettings();
+    return s.binanceApiKey && s.binanceApiSecret ? createBinanceAdapter({ apiKey: s.binanceApiKey, apiSecret: s.binanceApiSecret }) : null;
   }
 
   /** CLOB client per wallet; paper clients are unauthenticated and cached separately. */

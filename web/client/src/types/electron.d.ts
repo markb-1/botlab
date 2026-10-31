@@ -73,7 +73,7 @@ interface ElectronAPI {
     edit: (data: { prompt: string; currentSource: string }) => Promise<IpcResponse>;
   };
   backtest: {
-    run: (data: { scriptId: string; symbol: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown> }) => Promise<IpcResponse>;
+    run: (data: { scriptId: string; symbol?: string; interval?: string; startTime: number; endTime: number; initialBalance: number; config?: Record<string, unknown>; source?: 'binance-klines' | 'polymarket-snapshots'; tokenIds?: string[] }) => Promise<IpcResponse>;
     list: (scriptId?: string) => Promise<IpcResponse>;
     get: (runId: string) => Promise<IpcResponse>;
     delete: (runId: string) => Promise<IpcResponse>;
@@ -107,6 +107,16 @@ interface ElectronAPI {
   markets: {
     get: (marketId: string) => Promise<IpcResponse>;
     setAmbiguity: (marketId: string, score: number, note?: string) => Promise<IpcResponse>;
+  };
+  reconcile: {
+    status: () => Promise<IpcResponse>;
+    /** One-time: record a wallet's pre-existing exchange positions as adopted fills of a bot on that wallet */
+    adoptPositions: (walletId: string, botId: string) => Promise<IpcResponse>;
+  };
+  recorder: {
+    watchlistList: () => Promise<IpcResponse>;
+    watchlistAdd: (tokenId: string, marketId?: string, note?: string) => Promise<IpcResponse>;
+    watchlistRemove: (tokenId: string) => Promise<IpcResponse>;
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onMarketRulesChanged: (callback: (event: any) => void) => () => void;

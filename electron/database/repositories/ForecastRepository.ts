@@ -145,6 +145,13 @@ export class ForecastRepository {
     );
   }
 
+  /** Tokens with an active forecast (order-book recorder). */
+  activeTokenIds(): string[] {
+    return (this.db.prepare("SELECT DISTINCT token_id FROM forecasts WHERE status = 'active'").all() as Array<{ token_id: string }>).map(
+      (r) => r.token_id
+    );
+  }
+
   unscoredForMarket(marketId: string): ForecastRow[] {
     return this.db
       .prepare("SELECT * FROM forecasts WHERE market_id = ? AND outcome IS NULL AND status <> 'void'")

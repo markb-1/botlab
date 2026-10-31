@@ -16,9 +16,15 @@ import { BacktestRepository } from '../database/repositories/BacktestRepository'
 import { fetchKlines } from './klineCache';
 import { SCRIPT_WORKER_RESOURCE_LIMITS } from '../runtime/sandbox';
 import type { SimulationInput, SimulationOutput } from './simulate';
+import type { FeeRatesInput, SnapshotSimulationInput, SnapshotSimulationOutput } from './snapshotSimulate';
+import type { BookSnapshot } from '../recorder/snapshotCodec';
 
 /** A backtest (script load + simulation) is terminated after this (spec §5.1). */
 export const BACKTEST_TIMEOUT_MS = 120_000;
+/** Snapshots copied to the worker in one run (memory); narrow the range or tokens beyond this */
+export const MAX_BACKTEST_SNAPSHOTS = 300_000;
+
+export type BacktestSource = 'binance-klines' | 'polymarket-snapshots';
 
 // ============================================================================
 // Types
@@ -36,6 +42,16 @@ export interface BacktestParams {
   config: Record<string, unknown>;
   scriptId: string;
   scriptName: string;
+  /** Data source (default binance-klines: the original path, unchanged) */
+  source?: BacktestSource;
+  /** polymarket-snapshots: tokens to replay (symbol/interval are ignored) */
+  tokenIds?: string[];
+  /** polymarket-snapshots: recorded snapshots of the tokens in [from, to], oldest first */
+  loadSnapshots?: (tokenIds: string[], fromMs: number, toMs: number) => BookSnapshot[];
+  /** polymarket-snapshots: fee rates per token (FeeService; unknown ⇒ highest taker rate) */
+  getFeeRates?: (tokenId: string) => FeeRatesInput;
+  /** polymarket-snapshots: resting order TTL cap (limits.orders.resting_order_ttl_minutes) */
+  maxTtlMinutes?: number;
   /** Overall timeout for the worker (default BACKTEST_TIMEOUT_MS) */
   timeoutMs?: number;
   /** Compiled worker entry (default: backtest-worker.js next to this file; tests pass a bundle) */
@@ -130,12 +146,15 @@ export class BacktestEngine {
       initialBalance, config, scriptId, scriptName,
     } = this.params;
 
+    const snapshots = this.params.source === 'polymarket-snapshots';
+    const tokenIds = [...new Set((this.params.tokenIds ?? []).filter((t) => typeof t === 'string' && t.length > 0))];
+
     // 1. Create run record
     const run = backtestRepo.createRun({
       scriptId,
       scriptName,
-      symbol: symbol.toUpperCase(),
-      interval,
+      symbol: snapshots ? `polymarket:${tokenIds.join(',')}`.slice(0, 500) : symbol.toUpperCase(),
+      interval: snapshots ? 'snapshots' : interval,
       startTime,
       endTime,
       initialBalance,
@@ -143,23 +162,55 @@ export class BacktestEngine {
     });
 
     try {
-      // 2. Fetch klines (from cache or API) at the user-selected interval
-      const klines = await fetchKlines(db, symbol, startTime, endTime, interval);
+      let sim: SimulationOutput;
+      let processed: number;
+      let intervalMs: number;
+      const timeoutMs = this.params.timeoutMs ?? BACKTEST_TIMEOUT_MS;
+      const workerPath = this.params.workerPath ?? path.join(__dirname, 'backtest-worker.js');
+      if (snapshots) {
+        // 2b. Recorded Polymarket order books (spec §10)
+        if (tokenIds.length === 0) throw new Error('tokenIds are required for a polymarket-snapshots backtest');
+        if (!this.params.loadSnapshots) throw new Error('Order-book snapshots are not available');
+        const snaps = this.params.loadSnapshots(tokenIds, startTime, endTime);
+        if (snaps.length === 0) throw new Error('No recorded order-book snapshots for these tokens in the time range');
+        if (snaps.length > MAX_BACKTEST_SNAPSHOTS) {
+          throw new Error(`${snaps.length} snapshots in range (max ${MAX_BACKTEST_SNAPSHOTS}); narrow the time range or tokens`);
+        }
+        const fees: Record<string, FeeRatesInput> = {};
+        for (const t of tokenIds) fees[t] = this.params.getFeeRates ? this.params.getFeeRates(t) : { takerRate: 0, makerRate: 0 };
+        const input: SnapshotSimulationInput = {
+          source: 'polymarket-snapshots',
+          compiledScript,
+          snapshots: snaps,
+          tokenIds,
+          initialBalance,
+          config,
+          runId: run.id,
+          fees,
+          defaultFees: fees[tokenIds[0]],
+          maxTtlMinutes: this.params.maxTtlMinutes,
+        };
+        const out = (await runSimulationInWorker(input, timeoutMs, workerPath)) as SnapshotSimulationOutput;
+        sim = out;
+        processed = out.steps;
+        intervalMs = out.stepIntervalMs > 0 ? out.stepIntervalMs : 60_000;
+      } else {
+        // 2. Fetch klines (from cache or API) at the user-selected interval
+        const klines = await fetchKlines(db, symbol, startTime, endTime, interval);
 
-      if (klines.length === 0) {
-        throw new Error(`No kline data available for ${symbol} in the specified time range`);
+        if (klines.length === 0) {
+          throw new Error(`No kline data available for ${symbol} in the specified time range`);
+        }
+
+        // 3. Run the script against the klines in a sandboxed worker (timeout ⇒ terminated)
+        sim = await runSimulationInWorker({ compiledScript, klines, symbol, initialBalance, config, runId: run.id }, timeoutMs, workerPath);
+        processed = klines.length;
+        intervalMs = getIntervalMs(interval);
       }
-
-      // 3. Run the script against the klines in a sandboxed worker (timeout ⇒ terminated)
-      const sim = await runSimulationInWorker(
-        { compiledScript, klines, symbol, initialBalance, config, runId: run.id },
-        this.params.timeoutMs ?? BACKTEST_TIMEOUT_MS,
-        this.params.workerPath ?? path.join(__dirname, 'backtest-worker.js')
-      );
       const { equityCurve, tradeReturns, tickErrors, firstTickError } = sim;
       let { winCount, loseCount } = sim;
       let tradeCount = 0;
-      console.log(`[Backtest] Simulation complete: ${klines.length} klines, ${tickErrors} tick errors`);
+      console.log(`[Backtest] Simulation complete: ${processed} ${snapshots ? 'snapshot steps' : 'klines'}, ${tickErrors} tick errors`);
 
       // 4. Store the simulated trades
       db.transaction(() => {
@@ -191,7 +242,7 @@ export class BacktestEngine {
       const finalEquity = equityCurve[equityCurve.length - 1];
       const totalPnl = finalEquity - initialBalance;
       const maxDrawdown = computeMaxDrawdown(equityCurve);
-      const sharpeRatio = computeSharpeRatio(tradeReturns, getIntervalMs(interval));
+      const sharpeRatio = computeSharpeRatio(tradeReturns, intervalMs);
       const durationMs = Date.now() - startMs;
 
       // 7. Update run record
@@ -222,7 +273,7 @@ export class BacktestEngine {
           maxDrawdown,
           sharpeRatio,
           durationMs,
-          klinesProcessed: klines.length,
+          klinesProcessed: processed,
           tickErrors,
           firstTickError,
         },
@@ -262,7 +313,7 @@ export class BacktestEngine {
 }
 
 /** Run the simulation in a worker; terminate it after `timeoutMs`. */
-export function runSimulationInWorker(input: SimulationInput, timeoutMs: number, workerPath: string): Promise<SimulationOutput> {
+export function runSimulationInWorker(input: SimulationInput | SnapshotSimulationInput, timeoutMs: number, workerPath: string): Promise<SimulationOutput> {
   return new Promise<SimulationOutput>((resolve, reject) => {
     const worker = new Worker(workerPath, {
       workerData: input,

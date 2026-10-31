@@ -38,7 +38,11 @@ export interface BotTradeRow {
   order_id: string | null;
   fee_usd: number | null;
   category: string | null;
+  /** NULL = OrderService fill; 'adopted' / 'resolution' = reconciler fills (see migrations, 2b) */
+  fill_source?: string | null;
 }
+
+export type FillSource = 'adopted' | 'resolution';
 
 /** Open position of one bot in one symbol, computed from OrderService fills. */
 export interface RiskPositionRow {
@@ -62,6 +66,8 @@ export interface PnlFillRow {
   fee_usd: number | null;
   executed_at: string;
   simulated: number;
+  /** NULL = OrderService fill; 'adopted' / 'resolution' (not counted as ramp fills) */
+  fill_source: string | null;
 }
 
 export class BotTradeRepository {
@@ -104,6 +110,7 @@ export class BotTradeRepository {
     orderId?: string;
     feeUsd?: number;
     category?: string | null;
+    fillSource?: FillSource | null;
   }): BotTradeRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -117,8 +124,8 @@ export class BotTradeRepository {
           trader_win_rate, trader_sample_size, kelly_fraction, kelly_edge, kelly_percentage,
           sizing_reason, current_position_value, max_position_size,
           executed_at, trader_trade_timestamp, metadata, created_at,
-          exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, category
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, category, fill_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -154,7 +161,8 @@ export class BotTradeRepository {
         data.simulated ?? 0,
         data.orderId ?? null,
         data.feeUsd ?? null,
-        data.category ?? null
+        data.category ?? null,
+        data.fillSource ?? null
       );
 
     return this.db.prepare('SELECT * FROM bot_trades WHERE id = ?').get(id) as BotTradeRow;
@@ -249,7 +257,7 @@ export class BotTradeRepository {
   /** All OrderService fills (live and paper) for daily P&L and the ramp; oldest first. */
   findPnlFills(): PnlFillRow[] {
     return this.db.prepare(`
-      SELECT bot_id, exchange, symbol, side, quantity, quote_amount, fee_usd, executed_at, COALESCE(simulated, 0) AS simulated
+      SELECT bot_id, exchange, symbol, side, quantity, quote_amount, fee_usd, executed_at, COALESCE(simulated, 0) AS simulated, fill_source
       FROM bot_trades
       WHERE order_id IS NOT NULL AND exchange IS NOT NULL AND symbol IS NOT NULL AND side IN ('BUY', 'SELL')
       ORDER BY executed_at, created_at

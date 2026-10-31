@@ -134,6 +134,7 @@ const LIMIT_RULES: Record<string, Rule> = {
   'binance.enabled': 'enable',
   'binance.max_order_usd': 'up',
   'binance.allocation_usd': 'up',
+  'reconcile.max_unexplained_usd': 'up',
   'server.start_halted_after_crash': 'disable',
   'server.script_fetch_allowlist': 'set-grows',
 };

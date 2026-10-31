@@ -45,6 +45,8 @@ binance:
   enabled: true
   max_order_usd: 25
   allocation_usd: 100
+reconcile:
+  max_unexplained_usd: 10            # exchange position not matched by local fills (2 runs in a row) above this ⇒ global halt
 server:
   start_halted_after_crash: true     # after an unclean shutdown, start with a global halt (clear it by hand)
   script_fetch_allowlist:            # hosts bot scripts may reach via ctx.fetch (https, GET/POST only)
