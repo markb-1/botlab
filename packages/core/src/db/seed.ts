@@ -5,7 +5,7 @@
  * Templates are compiled with esbuild at seed time so they're ready to use.
  */
 
-import type { ScriptRepository } from './repositories/ScriptRepository';
+import { BUILTIN_ROLES, type BuiltinRole, type ScriptRepository } from './repositories/ScriptRepository';
 import { compileScript } from '../runtime/compileScript';
 
 /**
@@ -43,6 +43,8 @@ function parseMetaFromSource(source: string): {
   version?: string;
   author?: string;
   configSchema?: Record<string, unknown>;
+  role?: BuiltinRole;
+  trust?: 'new' | 'proven';
 } {
   try {
     // Extract the meta object using regex
@@ -62,6 +64,9 @@ function parseMetaFromSource(source: string): {
       version: meta.version,
       author: meta.author,
       configSchema: meta.configSchema,
+      // Standing role (5a) and initial trust; read only from our own template files
+      role: BUILTIN_ROLES.includes(meta.role) ? meta.role : undefined,
+      trust: meta.trust === 'new' || meta.trust === 'proven' ? meta.trust : undefined,
     };
   } catch {
     return {};
@@ -96,13 +101,14 @@ export async function seedTemplates(
           console.log(`[Seed] Updated template: ${name} v${version}${sourceChanged ? ' (source changed)' : ' (compiled)'}`);
         }
       }
+      if ((existing.builtin_role ?? null) !== (meta.role ?? null)) scriptRepo.setBuiltinRole(existing.id, meta.role ?? null);
       continue;
     }
 
     // Compile the template source
     const compiled = await compileSource(source);
 
-    scriptRepo.create({
+    const created = scriptRepo.create({
       name,
       description: meta.description || '',
       version,
@@ -111,8 +117,12 @@ export async function seedTemplates(
       compiled: compiled || undefined,
       configSchema: meta.configSchema || {},
       isTemplate: true,
-      origin: 'builtin', // seeded as trust=proven (spec §4.5)
+      // Builtin templates are seeded proven (spec §4.5) unless their meta says `trust: 'new'`: the 5a strategy
+      // templates must prove themselves (paper first, then the ramp; R162)
+      origin: 'builtin',
+      ...(meta.trust ? { trust: meta.trust } : {}),
     });
+    if (meta.role) scriptRepo.setBuiltinRole(created.id, meta.role);
 
     seeded++;
     console.log(`[Seed] Created template: ${name} v${version}${compiled ? ' (compiled)' : ' (compile failed)'}`);

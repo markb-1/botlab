@@ -10,6 +10,7 @@ import type {
   WorkerToMainMessage,
   MainToWorkerMessage,
   RpcRequest,
+  BotPushEventName,
 } from '../sdk/types';
 import { RpcHandler } from './RpcHandler';
 import type { RpcHandlerDeps } from './RpcHandler';
@@ -251,6 +252,13 @@ export class ScriptRunner extends EventEmitter {
   requestHeartbeat(): void {
     if (this.worker && this.running) {
       this.sendToWorker({ type: 'heartbeat' });
+    }
+  }
+
+  /** Push a ctx.events event to the script (dropped when the worker is not running). */
+  pushEvent(name: BotPushEventName, data: Record<string, unknown>): void {
+    if (this.worker && this.running && !this.stopRequested) {
+      this.sendToWorker({ type: 'bot-event', name, data });
     }
   }
 

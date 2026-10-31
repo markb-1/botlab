@@ -317,11 +317,13 @@ export function createCore(options: CoreOptions): Core {
     stateFile: path.join(dataDir, 'notify-state.json'),
   });
 
+  const exitFlagRepo = new PositionExitFlagRepository(db);
+
   // ── Agent runs, notes, budget (spec §7); created early: the services below ask it about event runs ──
   const agentService: AgentService = new AgentService({
     runRepo: new AgentRunRepository(db),
     noteRepo: new AgentNoteRepository(db),
-    flagRepo: new PositionExitFlagRepository(db),
+    flagRepo: exitFlagRepo,
     botRepo,
     tradeRepo,
     audit,
@@ -400,6 +402,13 @@ export function createCore(options: CoreOptions): Core {
     ],
   });
   marketCache.on(MARKET_RULES_CHANGED_EVENT, (payload) => events.emit(MARKET_RULES_CHANGED_EVENT, payload));
+  // ctx.events (spec §5.2): rules changes and halts are pushed to running bots as hints to re-check
+  marketCache.on(MARKET_RULES_CHANGED_EVENT, (e: { marketId: string; question: string; changedAt: string }) =>
+    botManager?.broadcastScriptEvent('rules_changed', { marketId: e.marketId, question: e.question, changedAt: e.changedAt })
+  );
+  halts.on(RISK_HALT_EVENT, (e: { kind: string; scope: string; reason: string }) =>
+    botManager?.broadcastScriptEvent('halt', { kind: e.kind, scope: e.scope, reason: e.reason })
+  );
   const ledger = new LedgerService({
     forecastRepo,
     rightsRepo: new CategoryRightsRepository(db),
@@ -410,6 +419,9 @@ export function createCore(options: CoreOptions): Core {
     getMandate: () => configService.getConfig()?.mandate ?? null,
     getLimits: () => configService.getConfig()?.limits ?? null,
     guardAgentRun,
+    // ctx.events forecast_changed (spec §5.2): new, superseded or withdrawn forecasts
+    onForecastChanged: (f) =>
+      botManager?.broadcastScriptEvent('forecast_changed', { forecastId: f.id, tokenId: f.tokenId, marketId: f.marketId, status: f.status, supersededBy: f.supersededBy }),
   });
 
   // ── Order-book recorder (spec §10): never affects trading ─────────
@@ -696,6 +708,7 @@ export function createCore(options: CoreOptions): Core {
       marketCache,
       ledger,
       clock: clockGuard,
+      exitFlags: exitFlagRepo,
     });
     botManager = manager;
     // No bot may start until startup recovery below has finished (set before initialize so there is no gap)

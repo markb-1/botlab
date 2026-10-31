@@ -72,6 +72,12 @@ export interface BotContext {
 
   // === Forecast ledger (read-only, spec §5.2) ===
   ledger: LedgerContext;
+
+  // === Push events from the server (spec §5.2): forecast_changed, rules_changed, halt ===
+  events: EventsContext;
+
+  // === All bots' positions and risk exits: builtin Position Manager template only (others get an error) ===
+  portfolio: PortfolioContext;
 }
 
 /** ctx.fetch options (spec §5.1): GET or POST, string body, plain header object. */
@@ -175,6 +181,10 @@ export interface OpenOrder {
   status: string;
   expiresAt: string | null;
   createdAt: string;
+  /** Ledger forecast the order was tagged with (null if none) */
+  forecastId: string | null;
+  /** Another bot placed it on this bot's behalf (the position manager's exits); null = this bot */
+  placedBy: string | null;
 }
 
 export interface FeeRates {
@@ -242,6 +252,12 @@ export interface BotForecast {
   rationale: string;
   sources: string[];
   createdAt: string;
+  /** The other token of the forecast's binary market (its fair value is 1 − probability); null if unknown / not binary */
+  complementTokenId: string | null;
+  /** Market end date (ISO) from the market cache; null if unknown */
+  endDate: string | null;
+  /** Current max allocation (USD) of the forecast's (category, horizon) bucket; null if the bucket is unknown */
+  bucketAllocationUsd: number | null;
 }
 
 export interface LedgerContext {
@@ -249,6 +265,135 @@ export interface LedgerContext {
   getActiveForecasts(filter?: { category?: string; tradeableOnly?: boolean }): Promise<BotForecast[]>;
   /** The active forecast on a token, or null */
   getForecast(tokenId: string): Promise<BotForecast | null>;
+}
+
+// ============================================================================
+// Push events (spec §5.2)
+// ============================================================================
+
+/**
+ * Events pushed from the server to running bots. They are hints to re-check now: a bot must still read the
+ * current state (ledger, positions, budget), and events are not replayed after a restart.
+ * - forecast_changed: { forecastId, tokenId, marketId, status } (new, superseded or withdrawn forecast)
+ * - rules_changed: { marketId, question, changedAt } (the market's resolution rules text changed)
+ * - halt: { kind: 'global' | 'bot', scope, reason } (a halt was set; orders are refused until a human clears it)
+ */
+export type BotPushEventName = 'forecast_changed' | 'rules_changed' | 'halt';
+
+export type BotPushEventHandler = (data: Record<string, unknown>) => void | Promise<void>;
+
+export interface EventsContext {
+  on(name: BotPushEventName, handler: BotPushEventHandler): void;
+  off(name: BotPushEventName, handler: BotPushEventHandler): void;
+}
+
+// ============================================================================
+// Portfolio (position manager only, spec §9.2)
+// ============================================================================
+
+/** An open order on a position (sells only: exits). */
+export interface PortfolioExitOrder {
+  orderId: string;
+  orderType: 'limit' | 'market';
+  price: number;
+  size: number;
+  filledSize: number;
+  status: string;
+  /** Placed by this position manager (else by the owning bot itself) */
+  placedByMe: boolean;
+  createdAt: string;
+  expiresAt: string | null;
+}
+
+/** One bot's Polymarket position (same mode as the position manager: paper sees paper, live sees live). */
+export interface PortfolioPosition {
+  botId: string;
+  botName: string | null;
+  tokenId: string;
+  /** Condition id */
+  marketId: string | null;
+  /** Shares held (order-linked fills) */
+  size: number;
+  /** Shares already committed to open sells of the owning bot */
+  openSellSize: number;
+  /** size − openSellSize: the most an exit may sell now */
+  available: number;
+  avgPrice: number;
+  costBasis: number;
+  /** When the position was opened (first buy after it was last flat); null if unknown */
+  openedAt: string | null;
+  /** Forecast of the last ledger-driven buy into the position; null if none */
+  entryForecastId: string | null;
+  /** That forecast's status now: active / superseded / withdrawn / resolved / void ... */
+  entryForecastStatus: string | null;
+  /** The active forecast pricing this token now (its own, or the other token's as 1 − p) */
+  forecast: {
+    id: string;
+    /** Probability of THIS token resolving YES */
+    probability: number;
+    onComplement: boolean;
+    tradeable: boolean;
+    createdAt: string;
+  } | null;
+  /** Market state from the market cache; null if unknown */
+  market: {
+    question: string | null;
+    outcome: string | null;
+    category: string | null;
+    endDate: string | null;
+    /** After the server raise (rules change, dispute); null = not assessed */
+    ambiguityScore: number | null;
+    rulesChangedAt: string | null;
+    disputed: boolean;
+    closed: boolean;
+  } | null;
+  /** Open sells on this position */
+  exitOrders: PortfolioExitOrder[];
+  /** Open exit flag (flag_position_exit) on this position, if any */
+  exitFlag: PortfolioExitFlag | null;
+}
+
+export interface PortfolioExitFlag {
+  id: string;
+  botId: string;
+  tokenId: string;
+  marketId: string | null;
+  reason: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+export interface ExitRequest {
+  /** The bot that holds the position; the sell is placed as that bot (its order, its fills) */
+  botId: string;
+  tokenId: string;
+  /** Shares to sell; must be <= the position's `available` */
+  size: number;
+  /** Limit price. Required for a resting exit; for a marketable exit it is the worst acceptable price (default best bid) */
+  price?: number;
+  /** false (default): post-only resting limit; true: marketable (fill-or-kill) */
+  marketable?: boolean;
+  /** Resting exits only, at least 3 */
+  ttlMinutes?: number;
+  /** Why (stored with the order and in the audit log) */
+  reason: string;
+}
+
+/**
+ * ctx.portfolio — available ONLY to bots running the builtin Position Manager template (checked by the server
+ * from the script record; any other bot gets an error). Exits are risk-exit SELLS placed as the owning bot
+ * through its OrderService and the RiskEngine; there is no way to buy here, and a sell can never exceed what
+ * the bot holds net of its open sells.
+ */
+export interface PortfolioContext {
+  getAllPositions(): Promise<PortfolioPosition[]>;
+  /** Open exit flags (agent / human flag_position_exit) in this mode */
+  getExitFlags(): Promise<PortfolioExitFlag[]>;
+  /** Close an open flag as handled (done) with a note */
+  ackExitFlag(flagId: string, note: string): Promise<boolean>;
+  exit(req: ExitRequest): Promise<OrderResult>;
+  /** Cancel an open exit order this position manager placed */
+  cancelExit(orderId: string): Promise<void>;
 }
 
 export interface OrderBook {
@@ -533,6 +678,11 @@ export type RpcMethod =
   | 'risk:getBudget'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'
+  | 'portfolio:getAllPositions'
+  | 'portfolio:getExitFlags'
+  | 'portfolio:ackExitFlag'
+  | 'portfolio:exit'
+  | 'portfolio:cancelExit'
   | 'storage:get'
   | 'storage:set'
   | 'storage:delete'
@@ -568,7 +718,9 @@ export type MainToWorkerMessage =
   | { type: 'heartbeat' }
   /** Liveness check, answered by the bootstrap without running script code */
   | { type: 'ping' }
-  | { type: 'rpc-response'; response: RpcResponse };
+  | { type: 'rpc-response'; response: RpcResponse }
+  /** Push event for ctx.events (spec §5.2) */
+  | { type: 'bot-event'; name: BotPushEventName; data: Record<string, unknown> };
 
 /** Messages from worker to main process */
 export type WorkerToMainMessage =

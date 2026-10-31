@@ -25,8 +25,20 @@ export interface ScriptRow {
   revision: number;
   trust: ScriptTrust;
   source_hash: string | null;
+  /** Standing builtin template role (5a), set only by the seed for origin builtin; null otherwise */
+  builtin_role?: BuiltinRole | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Roles of the standing builtin templates (spec §9.1, §9.2). */
+export type BuiltinRole = 'forecast-executor' | 'position-manager';
+export const BUILTIN_ROLES: readonly BuiltinRole[] = ['forecast-executor', 'position-manager'];
+
+/** The script's standing role, only for builtin templates (a human or agent script can never claim one). */
+export function builtinRoleOf(row: Pick<ScriptRow, 'origin' | 'is_template' | 'builtin_role'> | null | undefined): BuiltinRole | null {
+  if (!row || row.origin !== 'builtin' || row.is_template !== 1) return null;
+  return row.builtin_role && BUILTIN_ROLES.includes(row.builtin_role) ? row.builtin_role : null;
 }
 
 export interface ScriptVersionRow {
@@ -168,6 +180,11 @@ export class ScriptRepository {
         now
       );
     }
+  }
+
+  /** Seed only: the standing role of a builtin template (ignored for any other script). */
+  setBuiltinRole(id: string, role: BuiltinRole | null): void {
+    this.db.prepare("UPDATE scripts SET builtin_role = ? WHERE id = ? AND origin = 'builtin' AND is_template = 1").run(role, id);
   }
 
   setTrust(id: string, trust: ScriptTrust): void {

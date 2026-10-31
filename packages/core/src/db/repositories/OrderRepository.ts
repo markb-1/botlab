@@ -38,6 +38,8 @@ export interface OrderRow {
   simulated: number;
   /** Wallet of the bot when the order was created (2b review) */
   wallet_id?: string | null;
+  /** Bot that placed it on this bot's behalf (5a: position-manager exits); null = the bot itself */
+  placed_by?: string | null;
   created_at: string; // ISO
   updated_at: string; // ISO
 }
@@ -73,6 +75,24 @@ export class OrderRepository {
     return this.db
       .prepare('SELECT * FROM orders WHERE bot_id = ? ORDER BY created_at DESC LIMIT ?')
       .all(botId, limit) as OrderRow[];
+  }
+
+  /** Forecast of the bot's most recent ledger-driven buy in a token that filled something (position manager). */
+  lastBuyForecastId(botId: string, tokenId: string, simulated: boolean): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT forecast_id FROM orders WHERE bot_id = ? AND token_id = ? AND simulated = ? AND side = 'buy'
+           AND forecast_id IS NOT NULL AND filled_size > 0 ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(botId, tokenId, simulated ? 1 : 0) as { forecast_id: string } | undefined;
+    return row?.forecast_id ?? null;
+  }
+
+  /** Open orders another bot placed on its owners' behalf (position-manager exits). */
+  findOpenPlacedBy(placedBy: string, simulated: boolean): OrderRow[] {
+    return this.db
+      .prepare(`SELECT * FROM orders WHERE status IN ${OPEN_IN} AND placed_by = ? AND simulated = ? ORDER BY created_at`)
+      .all(placedBy, simulated ? 1 : 0) as OrderRow[];
   }
 
   /** Orders that may still fill, optionally for one bot. */
@@ -126,6 +146,8 @@ export class OrderRepository {
     simulated?: boolean;
     /** Default: the bot's current wallet */
     walletId?: string | null;
+    /** Bot placing it on the owner's behalf (position-manager exits) */
+    placedBy?: string | null;
   }): OrderRow {
     const id = data.id || generateId();
     const now = new Date().toISOString();
@@ -134,8 +156,8 @@ export class OrderRepository {
       .prepare(
         `INSERT INTO orders (id, bot_id, exchange, market_id, token_id, side, order_type, price, size,
            notional_usd, expires_at, status, risk_decision, exchange_order_id, reason, forecast_id,
-           simulated, created_at, updated_at, wallet_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT wallet_id FROM bots WHERE id = ?)))`
+           simulated, created_at, updated_at, wallet_id, placed_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, (SELECT wallet_id FROM bots WHERE id = ?)), ?)`
       )
       .run(
         id,
@@ -158,7 +180,8 @@ export class OrderRepository {
         now,
         now,
         data.walletId ?? null,
-        data.botId
+        data.botId,
+        data.placedBy ?? null
       );
 
     return this.findById(id)!;

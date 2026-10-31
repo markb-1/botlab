@@ -41,7 +41,7 @@ describe.skipIf(!sqliteAvailable)('live trading gate', () => {
     const human = asHuman('test');
     const w = Wallet.createRandom();
     const wallet = await core.services.wallets.create({ name: 'real', address: w.address, privateKey: w.privateKey });
-    const script = core.services.scripts.list().find((s) => s.isTemplate)!; // proven template ⇒ probation, not paper stage
+    const script = core.services.scripts.list().find((s) => s.isTemplate && s.trust === 'proven')!; // proven template ⇒ probation, not paper stage
     const bot = await core.services.bots.create({ name: 'live-bot', scriptId: script.id, walletId: wallet.id, mode: 'live' }, human);
     expect(bot.mode).toBe('live');
 

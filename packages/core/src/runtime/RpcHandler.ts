@@ -27,13 +27,15 @@ import {
 import type { BinanceCredentials } from '../exchange/binance/client';
 import { toTradeResult, type OrderResult, type OrderService } from '../orders/OrderService';
 import { scriptFetch } from './scriptFetch';
+import type { BuiltinRole } from '../db/repositories/ScriptRepository';
+import type { PortfolioAccess } from '../orders/PortfolioService';
 
 /** ctx.fetch requests a bot may have in flight; more are rejected at once (spec §5.1 hardening). */
 export const MAX_CONCURRENT_FETCHES = 6;
 import logger from '../utils/logger';
 
 /** A forecast with its bucket's current rights (live). */
-export type LiveForecast = ForecastView & { bucketState: string | null; tradeableNow: boolean };
+export type LiveForecast = ForecastView & { bucketState: string | null; tradeableNow: boolean; complementTokenId?: string | null; endDate?: string | null; bucketAllocationUsd?: number | null };
 
 /** Read-only ledger access for bots (spec §5.2: bots may read ledger data, never write it). */
 export interface LedgerReader {
@@ -63,6 +65,9 @@ export function toBotForecast(f: LiveForecast): BotForecast {
     rationale: f.rationale,
     sources: f.sources,
     createdAt: f.createdAt,
+    complementTokenId: f.complementTokenId ?? null,
+    endDate: f.endDate ?? null,
+    bucketAllocationUsd: f.bucketAllocationUsd ?? null,
   };
 }
 
@@ -91,6 +96,10 @@ export interface RpcHandlerDeps {
   fetchImpl?: typeof fetch;
   /** Forecast ledger (ctx.ledger); missing ⇒ ledger calls fail */
   ledger?: LedgerReader;
+  /** Standing role of the bot's script (builtin templates only; BotManager reads it from the script row) */
+  role?: BuiltinRole | null;
+  /** ctx.portfolio bound to this bot: given only to the builtin position manager; missing ⇒ portfolio calls fail */
+  portfolio?: PortfolioAccess;
 }
 
 /** Legacy ctx.binance.buy/sell result from an OrderService result. */
@@ -144,6 +153,16 @@ export class RpcHandler {
     return this.deps.ledger;
   }
 
+  private get portfolio(): PortfolioAccess {
+    if (!this.deps.portfolio) throw new Error('ctx.portfolio is only available to bots running the builtin Position Manager template');
+    return this.deps.portfolio;
+  }
+
+  /** The position manager only reduces positions: every buy path is refused for it (server-side, 5a). */
+  private refuseBuy(what: string): void {
+    if (this.deps.role === 'position-manager') throw new Error(`${what}: the position manager cannot buy`);
+  }
+
   private get orders(): OrderService {
     if (!this.deps.orderService) throw new Error('Order service unavailable: orders are disabled');
     return this.deps.orderService;
@@ -165,6 +184,7 @@ export class RpcHandler {
 
       // All order methods go through OrderService (risk checks; paper fills in paper mode)
       case 'polymarket:buy': {
+        this.refuseBuy('buy');
         const opts = orderOpts(args[2]);
         const result = await this.orders.placeMarketable({
           tokenId: args[0] as string,
@@ -195,6 +215,7 @@ export class RpcHandler {
 
       case 'polymarket:placeLimit': {
         const opts = (args[4] && typeof args[4] === 'object' ? args[4] : {}) as LimitOrderOpts;
+        if (args[1] !== 'sell') this.refuseBuy('placeLimit');
         return this.orders.placeLimit({
           tokenId: args[0] as string,
           side: args[1] as 'buy' | 'sell',
@@ -244,6 +265,24 @@ export class RpcHandler {
         const f = this.ledger.botForecast(tokenId);
         return f ? toBotForecast(f) : null;
       }
+
+      // === Portfolio (builtin position manager only; scoped by the server, not by the script) ===
+
+      case 'portfolio:getAllPositions':
+        return this.portfolio.getAllPositions();
+
+      case 'portfolio:getExitFlags':
+        return this.portfolio.getExitFlags();
+
+      case 'portfolio:ackExitFlag':
+        return this.portfolio.ackExitFlag(args[0], args[1]);
+
+      case 'portfolio:exit':
+        return this.portfolio.exit(args[0]);
+
+      case 'portfolio:cancelExit':
+        await this.portfolio.cancelExit(args[0]);
+        return;
 
       case 'polymarket:getOrderBook':
         return getOrderBook(
@@ -371,6 +410,7 @@ export class RpcHandler {
       // === Binance Spot Trading ===
 
       case 'binance:buy': {
+        this.refuseBuy('binance.buy');
         const symbol = args[0] as string;
         const result = await this.orders.placeBinance({ symbol, side: 'buy', amount: args[1] as number });
         return toBinanceTradeResult(symbol, 'BUY', result);

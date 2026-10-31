@@ -97,6 +97,15 @@ export class LedgerValidationError extends Error {
   }
 }
 
+/** A forecast as bots read it: live rights, the binary market's other token and its end date (cache). */
+export type BotForecastRow = ForecastView & {
+  bucketState: CategoryRightsState | null;
+  tradeableNow: boolean;
+  complementTokenId: string | null;
+  endDate: string | null;
+  bucketAllocationUsd: number | null;
+};
+
 export interface ForecastView {
   id: string;
   marketId: string;
@@ -203,7 +212,7 @@ export interface ScorerRunResult {
 export interface LedgerDeps {
   forecastRepo: ForecastRepository;
   rightsRepo: CategoryRightsRepository;
-  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'refreshMany' | 'recordForecastAmbiguity' | 'setResolutionSeen'>;
+  marketCache: Pick<MarketCacheService, 'getMarketByToken' | 'getCached' | 'getCachedByToken' | 'refreshMany' | 'recordForecastAmbiguity' | 'setResolutionSeen'>;
   audit?: Pick<AuditService, 'record'>;
   /** CLOB top of book for the snapshot; throw when unavailable */
   getTopOfBook: (tokenId: string) => Promise<{ bestBid: number | null; bestAsk: number | null }>;
@@ -447,14 +456,36 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
   }
 
   /** ctx.ledger: active forecasts with the bucket's current state and live `tradeable`. */
-  botForecasts(filter: { category?: string; tradeableOnly?: boolean } = {}): Array<ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }> {
+  botForecasts(filter: { category?: string; tradeableOnly?: boolean } = {}): BotForecastRow[] {
     const rows = this.deps.forecastRepo.list({ status: 'active', ...(filter.category ? { category: filter.category } : {}) });
-    return rows.map((r) => ({ ...toForecastView(r), ...this.liveRights(r) })).filter((f) => !filter.tradeableOnly || f.tradeableNow);
+    return rows.map((r) => this.toBotRow(r)).filter((f) => !filter.tradeableOnly || f.tradeableNow);
   }
 
-  botForecast(tokenId: string): (ForecastView & { bucketState: CategoryRightsState | null; tradeableNow: boolean }) | null {
+  botForecast(tokenId: string): BotForecastRow | null {
     const r = this.deps.forecastRepo.findActiveByToken(tokenId);
-    return r ? { ...toForecastView(r), ...this.liveRights(r) } : null;
+    return r ? this.toBotRow(r) : null;
+  }
+
+  private toBotRow(r: ForecastRow): BotForecastRow {
+    const market = this.deps.marketCache.getCached(r.market_id);
+    const tokens = market?.tokens ?? [];
+    const complement = tokens.length === 2 && tokens.some((t) => t.tokenId === r.token_id) ? (tokens.find((t) => t.tokenId !== r.token_id)?.tokenId ?? null) : null;
+    const bucketAllocationUsd = this.deps.rightsRepo.get(r.category, r.horizon_bucket)?.max_allocation_usd ?? null;
+    return { ...toForecastView(r), ...this.liveRights(r), complementTokenId: complement, endDate: market?.endDate ?? null, bucketAllocationUsd };
+  }
+
+  /**
+   * The active forecast that prices a held token (position manager, 5a): the token's own forecast, else the
+   * forecast on the other token of its binary market as 1 − p. null when neither exists.
+   */
+  heldTokenForecast(tokenId: string): { forecast: BotForecastRow; probability: number; onComplement: boolean } | null {
+    const own = this.botForecast(tokenId);
+    if (own) return { forecast: own, probability: own.probability, onComplement: false };
+    const tokens = this.deps.marketCache.getCachedByToken(tokenId)?.tokens ?? [];
+    if (tokens.length !== 2) return null;
+    const other = tokens.find((t) => t.tokenId !== tokenId)?.tokenId;
+    const f = other ? this.botForecast(other) : null;
+    return f ? { forecast: f, probability: 1 - f.probability, onComplement: true } : null;
   }
 
   /**

@@ -86,6 +86,8 @@ export interface OrderIntentOpts {
   forecastId?: string;
   /** Sell flagged as a risk exit (see RiskEngine exemptions) */
   riskExit?: boolean;
+  /** Bot placing the order on this bot's behalf (PortfolioService exits; never from a script's own call) */
+  placedBy?: string;
 }
 
 export interface MarketableOrderInput extends OrderIntentOpts {
@@ -132,6 +134,8 @@ export interface OpenOrderInfo {
   status: OrderStatus;
   expiresAt: string | null;
   createdAt: string;
+  forecastId: string | null;
+  placedBy: string | null;
 }
 
 export interface CancelAllResult {
@@ -710,6 +714,7 @@ export class OrderService {
         reason: typeof intent.reason === 'string' ? intent.reason.slice(0, 500) : null,
         forecastId: intent.forecastId ?? null,
         simulated: this.paper,
+        placedBy: intent.placedBy ?? null,
       });
       if (!decision.allowed) {
         try {
@@ -740,6 +745,7 @@ export class OrderService {
             failedCheck: decision.failedCheck,
             reason: decision.reason,
             simulated: this.paper,
+            ...(intent.placedBy ? { placedBy: intent.placedBy } : {}),
           },
           'rejected_risk'
         );
@@ -1151,6 +1157,8 @@ export class OrderService {
       status: o.status,
       expiresAt: o.expires_at,
       createdAt: o.created_at,
+      forecastId: o.forecast_id,
+      placedBy: o.placed_by ?? null,
     }));
   }
 

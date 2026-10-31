@@ -38,6 +38,13 @@ import type {
   RpcResponse,
   ScriptFetchInit,
   ScriptResponse,
+  BotPushEventName,
+  BotPushEventHandler,
+  EventsContext,
+  PortfolioContext,
+  PortfolioPosition,
+  PortfolioExitFlag,
+  ExitRequest,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../utils/kellyCalculator';
 
@@ -73,6 +80,35 @@ export function handleRpcResponse(response: RpcResponse): void {
       pending.reject(new Error(response.error));
     } else {
       pending.resolve(response.result);
+    }
+  }
+}
+
+// ─── Push events (ctx.events, spec §5.2) ───────────────────────────────
+const PUSH_EVENTS: readonly BotPushEventName[] = ['forecast_changed', 'rules_changed', 'halt'];
+const eventHandlers = new Map<BotPushEventName, Set<BotPushEventHandler>>();
+
+const eventsContext: EventsContext = {
+  on(name, handler) {
+    if (!PUSH_EVENTS.includes(name)) throw new Error(`Unknown event ${String(name)} (expected ${PUSH_EVENTS.join(', ')})`);
+    if (typeof handler !== 'function') throw new Error('handler must be a function');
+    let set = eventHandlers.get(name);
+    if (!set) eventHandlers.set(name, (set = new Set()));
+    set.add(handler);
+  },
+  off(name, handler) {
+    eventHandlers.get(name)?.delete(handler);
+  },
+};
+
+/** Called by the bootstrap for a 'bot-event' message: runs the script's handlers; errors go to the bot log. */
+export async function dispatchBotEvent(name: BotPushEventName, data: Record<string, unknown>): Promise<void> {
+  const handlers = [...(eventHandlers.get(name) ?? [])];
+  for (const h of handlers) {
+    try {
+      await h(data ?? {});
+    } catch (err) {
+      void rpcCall('log', 'error', `ctx.events ${name} handler failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
     }
   }
 }
@@ -252,6 +288,17 @@ export function createBotContext(params: {
         rpcCall('ledger:getActiveForecasts', filter) as Promise<BotForecast[]>,
       getForecast: (tokenId: string) => rpcCall('ledger:getForecast', tokenId) as Promise<BotForecast | null>,
     } as LedgerContext,
+
+    events: eventsContext,
+
+    // Position manager only: the server refuses these RPCs for any other bot
+    portfolio: {
+      getAllPositions: () => rpcCall('portfolio:getAllPositions') as Promise<PortfolioPosition[]>,
+      getExitFlags: () => rpcCall('portfolio:getExitFlags') as Promise<PortfolioExitFlag[]>,
+      ackExitFlag: (flagId: string, note: string) => rpcCall('portfolio:ackExitFlag', flagId, note) as Promise<boolean>,
+      exit: (req: ExitRequest) => rpcCall('portfolio:exit', req) as Promise<OrderResult>,
+      cancelExit: (orderId: string) => rpcCall('portfolio:cancelExit', orderId) as Promise<void>,
+    } as PortfolioContext,
 
     // Kelly Criterion (pure math, runs locally in worker)
     kelly: {

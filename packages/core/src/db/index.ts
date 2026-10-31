@@ -601,6 +601,11 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     "ALTER TABLE agent_runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'cycle'",
     'ALTER TABLE agent_runs ADD COLUMN managed INTEGER NOT NULL DEFAULT 0',
     'ALTER TABLE agent_runs ADD COLUMN model TEXT',
+    // 5a: standing builtin templates (forecast-executor / position-manager); set only by the seed for origin
+    // builtin, never from a request. The portfolio capability (ctx.portfolio) is granted by this column.
+    'ALTER TABLE scripts ADD COLUMN builtin_role TEXT',
+    // 5a: the bot that placed an order on another bot's behalf (position-manager exits; NULL = the bot itself)
+    'ALTER TABLE orders ADD COLUMN placed_by TEXT',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

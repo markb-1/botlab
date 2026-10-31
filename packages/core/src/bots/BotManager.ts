@@ -19,7 +19,12 @@ import type { SettingsRepository } from '../db/repositories/SettingsRepository';
 import type { ScriptRepository } from '../db/repositories/ScriptRepository';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import { ScriptBotRunner, type OrderServiceFactory } from '../runtime/ScriptBotRunner';
+import { ScriptBotRunner, DEFAULT_PAPER_BALANCE, type OrderServiceFactory } from '../runtime/ScriptBotRunner';
+import { PaperTradingState } from '../runtime/PaperTradingState';
+import { builtinRoleOf, type BuiltinRole } from '../db/repositories/ScriptRepository';
+import type { PositionExitFlagRepository } from '../db/repositories/AgentRepository';
+import { PortfolioService, type ExitOrderService } from '../orders/PortfolioService';
+import type { BotPushEventName } from '../sdk/types';
 import type { Database } from '../db/index';
 import type { OrderRepository } from '../db/repositories/OrderRepository';
 import type { RiskStateRepository } from '../db/repositories/RiskStateRepository';
@@ -61,6 +66,8 @@ export interface BotManagerOrderDeps {
   ledger?: LedgerService;
   /** Clock skew guard (Reconciler): live orders are refused while the clock is off (spec §15) */
   clock?: ClockSkewGuard;
+  /** position_exit_flags (R140): read and closed by the builtin position manager (ctx.portfolio) */
+  exitFlags?: PositionExitFlagRepository;
 }
 
 /**
@@ -88,6 +95,10 @@ export class BotManager extends EventEmitter {
   private orderServices: Map<string, { service: OrderService; simulated: boolean }> = new Map();
   /** Startup orphan-order recovery running: bots may not start until it finishes */
   private recoveryInProgress = false;
+  /** Running bots on standing builtin templates: one per role and mode (spec §9.1, §9.2) */
+  private roles: Map<string, { role: BuiltinRole; mode: 'live' | 'paper' }> = new Map();
+  /** ctx.portfolio backend (builtin position manager only) */
+  private portfolio: PortfolioService | null = null;
 
   constructor(
     walletManager: WalletManager,
@@ -184,6 +195,12 @@ export class BotManager extends EventEmitter {
    * Throws (so the bot does not start) when the risk config or order store is unavailable.
    */
   private createOrderService: OrderServiceFactory = (args) => {
+    const service = this.buildOrderService(args);
+    this.orderServices.set(args.botId, { service, simulated: args.mode === 'paper' });
+    return service;
+  };
+
+  private buildOrderService(args: Parameters<OrderServiceFactory>[0]): OrderService {
     if (!this.orderDeps) throw new Error('Order store not configured; orders are disabled');
     if (!this.riskEngine || !this.fees) throw new Error(`Risk config not loaded: ${this.configError}`);
 
@@ -252,9 +269,79 @@ export class BotManager extends EventEmitter {
         paperState: ps ?? null,
       }
     );
-    this.orderServices.set(args.botId, { service, simulated: paper });
     return service;
-  };
+  }
+
+  /**
+   * The OrderService a position-manager exit is placed through: the owning bot's running service in this
+   * mode, else a transient one for that bot built the same way (its wallet's client; in paper, its paper
+   * state loaded from storage). Not registered as running. Throws if the bot or its wallet is unavailable.
+   */
+  async getExitOrderService(botId: string, simulated: boolean): Promise<ExitOrderService> {
+    const running = this.getRunningOrderService(botId, simulated);
+    if (running) return running;
+    const row = this.botRepo.findById(botId);
+    if (!row) throw new Error(`Bot not found: ${botId}`);
+    const creds = await this.walletManager.getWallet(row.wallet_id);
+    const clobClient = await this.getClobClient(creds, simulated);
+    let paperState: PaperTradingState | undefined;
+    if (simulated) {
+      let balance = DEFAULT_PAPER_BALANCE;
+      try {
+        const cfg = JSON.parse(row.config || '{}') as { paperBalance?: unknown };
+        if (typeof cfg.paperBalance === 'number' && cfg.paperBalance > 0) balance = cfg.paperBalance;
+      } catch {
+        /* default */
+      }
+      paperState = new PaperTradingState(botId, balance, this.storageRepo);
+      paperState.load();
+    }
+    const script = this.scriptRepo.findById(row.script_id);
+    return this.buildOrderService({
+      botId,
+      botName: row.name,
+      scriptName: script?.name ?? 'script',
+      mode: simulated ? 'paper' : 'live',
+      clobClient,
+      walletAddress: creds.address,
+      proxyAddress: creds.proxyAddress,
+      paperState,
+    });
+  }
+
+  private getPortfolio(): PortfolioService {
+    if (!this.orderDeps?.exitFlags) throw new Error('Exit flags store not configured');
+    if (!this.portfolio) {
+      this.portfolio = new PortfolioService({
+        botRepo: this.botRepo,
+        tradeRepo: this.tradeRepo,
+        orderRepo: this.orderDeps.orderRepo,
+        flagRepo: this.orderDeps.exitFlags,
+        ledger: this.orderDeps.ledger,
+        markets: this.orderDeps.marketCache,
+        audit: this.orderDeps.audit,
+        getExitService: (botId, simulated) => this.getExitOrderService(botId, simulated),
+      });
+    }
+    return this.portfolio;
+  }
+
+  /** ctx.events (spec §5.2): push an event to every running script bot. Never throws. */
+  broadcastScriptEvent(name: BotPushEventName, data: Record<string, unknown>): void {
+    for (const [id, instance] of this.instances) {
+      if (!(instance instanceof ScriptBotRunner)) continue;
+      try {
+        instance.pushEvent(name, data);
+      } catch (err) {
+        logger.warning(`Could not push ${name} to bot ${id}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  }
+
+  /** Standing role of a running bot (executor / position manager), if any. */
+  getRunningRole(botId: string): BuiltinRole | null {
+    return this.instances.has(botId) ? (this.roles.get(botId)?.role ?? null) : null;
+  }
 
   /** Limits currently in force; null when the config failed to load. */
   getLimits(): LimitsConfig | null {
@@ -540,6 +627,17 @@ export class BotManager extends EventEmitter {
       );
     }
 
+    // Standing builtin templates (executor, position manager) run once per mode; the role comes from the
+    // script row (origin builtin), never from the script itself
+    const role = builtinRoleOf(script);
+    if (role) {
+      for (const [otherId, r] of this.roles) {
+        if (otherId !== botId && r.role === role && r.mode === mode && this.instances.has(otherId)) {
+          throw new Error(`A ${role} bot is already running in ${mode} mode (${this.botRepo.findById(otherId)?.name ?? otherId}); it is a single-instance template`);
+        }
+      }
+    }
+
     const settings = this.getSettings();
     const instance: BaseBotRunner = new ScriptBotRunner({ ...bot, mode }, this.walletManager, clobClient, {
       compiledCode: script.compiled,
@@ -555,6 +653,8 @@ export class BotManager extends EventEmitter {
       createOrderService: this.createOrderService,
       fetchAllowlist: () => this.getLimits()?.server.script_fetch_allowlist,
       ledger: this.orderDeps?.ledger,
+      role,
+      ...(role === 'position-manager' ? { createPortfolio: ({ botId: id, simulated }) => this.getPortfolio().forBot(id, simulated) } : {}),
     });
 
     // Forward events
@@ -582,6 +682,8 @@ export class BotManager extends EventEmitter {
 
     // Store instance
     this.instances.set(botId, instance);
+    if (role) this.roles.set(botId, { role, mode });
+    else this.roles.delete(botId);
 
     // Start the bot
     try {

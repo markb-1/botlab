@@ -23,7 +23,7 @@ import type {
  * Step 0 rejects malformed state before any limit is evaluated.
  *
  * Risk exits (sells flagged `riskExit` by the position manager or a human) must be
- * able to close positions under stress, so they are exempt from `max_order_usd`,
+ * able to close positions under stress, so they are exempt from the bot stage, `max_order_usd`,
  * `max_orders_per_hour`, `max_open_orders`, `max_spread`, the end-of-market buffer
  * and the hold time. They still require market scope, a held position (net of open
  * sells), the price range, and `max_slippage` / top-of-book when marketable.
@@ -209,8 +209,12 @@ export class RiskEngine {
       return decide();
     }
     const liveStage = bot.stage === 'probation' || bot.stage === 'full';
-    if (!record(1, 'bot_stage', liveStage,
-      liveStage ? `Stage ${bot.stage} allows live orders` : `Stage ${bot.stage} does not allow live orders`,
+    // A risk exit only reduces a held position (step 5), so it passes from any stage: a bot retired or sent
+    // back to paper while holding live positions can still be exited by the position manager (R160)
+    const stageOk = liveStage || isRiskExit;
+    if (!record(1, 'bot_stage', stageOk,
+      liveStage ? `Stage ${bot.stage} allows live orders`
+        : stageOk ? `Stage ${bot.stage}: risk-exit sell allowed (reduces a held position)` : `Stage ${bot.stage} does not allow live orders`,
       { stage: bot.stage })) {
       return decide();
     }
