@@ -122,6 +122,24 @@ export default [
         },
     },
     {
+        // Connectivity check: clob-client's L1/L2 header builders only (read-only auth, no ClobClient)
+        files: ['packages/core/src/exchange/polymarket/authHeaders.ts'],
+        rules: {
+            '@typescript-eslint/no-restricted-imports': restrictedImports({
+                paths: [
+                    {
+                        name: '@polymarket/clob-client',
+                        allowImportNames: ['createL1Headers', 'createL2Headers'],
+                        message: 'Only the L1/L2 header builders here (read-only connectivity check).',
+                    },
+                    clobValueImports[1],
+                    ...coreTransportImports,
+                ],
+                patterns: [...orderModuleImports, ...coreTransportPatterns],
+            }),
+        },
+    },
+    {
         files: ['packages/core/src/orders/ExchangeAdapter.ts'],
         rules: { '@typescript-eslint/no-restricted-imports': restrictedImports({ paths: coreTransportImports, patterns: coreTransportPatterns }) },
     },

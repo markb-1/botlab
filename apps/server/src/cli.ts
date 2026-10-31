@@ -12,6 +12,10 @@
  *   token create --scope agent|readonly [--name <name>]
  *   token list
  *   token revoke <id>
+ *   check-polymarket [--json] [--with-credentials] [--binance] [--wallet <id|name|address>] [--address <0x…>]
+ *                                     can this machine / IP use Polymarket? Read-only checks of every endpoint
+ *                                     BotLab uses (geo-block vs datacenter / bot blocking); exit 0 ok, 1 blocked,
+ *                                     2 degraded (checkPolymarket.ts)
  *
  * migrate-key refuses to run while the server is running on the same data dir (it rewrites every
  * secret); the other commands are safe while it runs. migrate-key uses the master key the server would
@@ -28,6 +32,7 @@ import { isProduction, resolveDataDir } from './paths';
 import { defaultKeyFile, generateKeyFile, loadMasterKey, MasterKeyError } from './masterKey';
 import { lockHolder } from './instanceLock';
 import { migrateKey, needsNewAdminPassword, needsPassword } from './migrateKey';
+import { checkPolymarketCommand } from './checkPolymarket';
 import fs from 'fs';
 import path from 'path';
 
@@ -80,7 +85,8 @@ function usage(): never {
   set-password [--password <pw>]
   token create --scope agent|readonly [--name <name>]
   token list
-  token revoke <id>`);
+  token revoke <id>
+  check-polymarket [--json] [--with-credentials] [--binance] [--wallet <id|name|address>] [--address <0x…>]`);
   process.exit(2);
 }
 
@@ -100,6 +106,11 @@ async function main(): Promise<void> {
     }
     generateKeyFile(file);
     console.log(`Generated a new master key: ${file}\nBack it up: without it, wallet keys and exchange credentials in the database cannot be decrypted.`);
+    return;
+  }
+
+  if (cmd === 'check-polymarket') {
+    process.exitCode = await checkPolymarketCommand(flags, dataDir);
     return;
   }
 
