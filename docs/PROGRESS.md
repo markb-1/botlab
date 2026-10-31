@@ -13,7 +13,7 @@ Implementation log for `docs/SPEC.md`. Each chunk is implemented, reviewed indep
 | 1e | Telegram notifications, config hot reload | done |
 | 2a | Forecast ledger, scoring, category rights, market cache | done |
 | 2b | Order-book recorder, reconciler | done |
-| 3a | Extract `packages/core` + services | pending |
+| 3a | Extract `packages/core` + services | done |
 | 3b | HTTP server + SSE + auth, web client on fetch, remove Electron + AI assistant, cross-platform scripts, Docker | pending |
 | 3c | UI pages: Risk, Ledger, Audit, config editing | pending |
 
@@ -23,6 +23,11 @@ Known pre-existing failures: `tests/copytrading/1-polymarket-data-api.test.ts` c
 ## Decisions to review
 
 Judgement calls made during the overnight run. Each says how to reverse it.
+
+Paths in R1–R80 predate chunk 3a: `electron/<dir>/` is now `packages/core/src/<dir>/` (`database` → `db`),
+`src/core` → `packages/core/src/bots`, `src/utils` → `packages/core/src/utils`, `electron/sdk/binance.ts` →
+`exchange/binance/client.ts`, `electron/scripts/templates` → `templates/`; Phase A/B in `electron/main.ts` → `core.ts`
+`start()`/`unlock()` (R82, R85).
 
 | # | chunk | decision | why | to reverse |
 |---|---|---|---|---|
@@ -110,6 +115,13 @@ Judgement calls made during the overnight run. Each says how to reverse it.
 | R78 | 2b review | **Adoption safeguards** (see R67): sync first, refuse with unknown-outcome orders, retired/halted bots refused, per-token cap = held before the first order − already adopted; `includePostFirstOrder` adopts the rest and is audited with the post-first-order quantity. | Reviewer S2: adoption could turn an unexplained fill into a sellable position. | `Reconciler.adoptPositions`. |
 | R79 | 2b review | **Polymarket fee in shares — VERIFY against live data.** Until it is known whether the CLOB takes the taker fee in shares (local fills would then exceed the wallet), a `local_excess` up to max(0.01 tokens, 1 % of the local position) is not a mismatch. If fees are in USDC, drop the tolerance; if in shares, record fills net of the fee instead. | Avoid halting on our own fee model. | `LOCAL_EXCESS_FEE_TOLERANCE` in `Reconciler.ts`. |
 | R80 | 2b review | **Snapshot backtests: resting fills consume depth** — a resting order that fills against a snapshot removes the recorded liquidity at or through its price for that step (up to its size), so a marketable order in the same step cannot take it again. | Reviewer N3. | `SnapshotMarket.settleResting`. |
+| R81 | 3a | **One npm package, no workspaces, no `@botlab/core` alias**: `packages/core/src` is imported by relative path (`electron/` → `../packages/core/src/...`). `packages/core/tsconfig.json` typechecks core alone (`npm run typecheck` = core + electron, also in CI); the Electron build still compiles both with `electron/tsconfig.json` into `dist-electron/{electron,packages/core/src}`. | `tsc` does not rewrite path aliases in CommonJS output and the Electron app runs the compiled JS; workspaces would need core built to JS first. Nothing to gain before 3b. | In 3b: npm workspaces (`packages/core` as `@botlab/core`) plus a bundler/tsx for `apps/server`, then replace the relative imports. |
+| R82 | 3a | **Layout choices**: templates at repo root `templates/` (spec §1.1; seed looks in `templatesDir`, then 4 and 5 levels above `db/` for source and compiled output, then `<cwd>/templates`; packaged via `electron-builder` `files`). `sdk/binance.ts` → `exchange/binance/client.ts`, `sdk/trading.ts` → `exchange/polymarket/trading.ts`, `claudeSystemPrompt.ts` → `sdk/guide.ts` (the script-writing guide, still used by the AI assistant; the agent can be given it later), `sdk/claude.ts` stays in Electron (`electron/ai/`). `src/core` → `bots/`, `src/utils` → `utils/`, `electron/ipc/types.ts` → `services/types.ts` (DTOs). | Spec §1.1 subfolders; choke-point ESLint rules and the static test now name the new adapter paths. | `git mv` back; update `eslint.config.mjs` and `tests/orders/choke-point.test.ts`. |
+| R83 | 3a | **Worker entries**: `resolveWorkerEntry(__dirname, name)` returns `<name>.js` next to the module, else `<name>.ts` (a worker inherits the parent's `execArgv`, so a tsx loader carries over). Verified for compiled output only (a compiled core started a paper bot's worker and found the templates); running from `.ts` under tsx is untested (tsx is not installed). | Spec §15.2; 3b's dev server will run from sources. | `packages/core/src/runtime/workerPath.ts`. |
+| R84 | 3a | **Service errors and input checks**: services throw `ServiceError(code, message)` (`invalid_input`, `not_found`, `locked`, `unavailable`, `conflict`); IPC returns the same `{ success: false, error: message }` with the messages it had before. `services/schemas.ts` checks shape and types only, strips unknown keys and leaves value rules (and their messages) to the services; a wrongly typed IPC argument now fails with `Invalid input: <path>: <issue>` instead of reaching a repository. Inputs whose services already validate (config files, adoption, watchlist, ledger writes, backtest required fields) are passed through as before; their typed schemas are for HTTP/MCP. | Spec §8.1: one set of zod schemas for IPC, HTTP and MCP. | Drop `parseInput` calls in `electron/ipc/handlers/*`. |
+| R85 | 3a | **Lifecycle in core**: `createCore` (DB + construction, no timers), `start()` (old Phase A), `unlock(key)` (old Phase B; returns false if already unlocked), `shutdown({ timeoutMs })` (old graceful path, `{ clean }`), `close()`. Services exist from `createCore`; those needing keys throw `locked` before unlock. Electron still registers bot/wallet IPC only after unlock, as before. One change: the clean-shutdown marker is also skipped when the timeout fires during the notifications/Telegram/config-watcher stop (before, only when it had fired before that phase). DB handle and `keyManager` stay module singletons ⇒ one core per process. | Spec §1.2; 3b's server calls `createCore` + `start` + `unlock(env key)`. | `packages/core/src/core.ts`; for several cores per process make the DB handle and key instance-scoped. |
+| R86 | 3a | **`.botlab` export/import on contents**: `ScriptService.exportScript(id)` returns `{ fileName, file }`, `importScripts([{ name, content }], actor)` imports; the Electron handler keeps the save/open dialogs and file I/O. Unreadable files are listed in `errors` before parse/compile errors (before, in file order). | Transport-free core; HTTP will upload/download. | `electron/ipc/handlers/scriptHandlers.ts`. |
+| R87 | 3a | **DB default path** without `createCore`: `BOTLAB_DATA_DIR` else `<cwd>/data` (the `require('electron')` probe is gone; Electron passes `app.getPath('userData')` as before, so the DB location does not change). | Core must not import electron. | `getDbPath` in `packages/core/src/db/index.ts`. |
 
 ## Log
 
@@ -499,3 +511,48 @@ Not done / for later:
   round trips > 2 s (R70); **N2** first order excludes `failed` (R67); **N3** resting fills consume depth (R80); fee-in-shares
   tolerance on Polymarket local excess (R79). Tests for N1, N2, N3 and the tolerance.
 - Migrations: `orders.wallet_id`, `bot_trades.wallet_id` (+ backfill), `recorder_state`, unique exchange-order index.
+
+### 2026-10-31 — chunk 3a
+Done: domain code moved to a transport-free `packages/core` (`git mv`, imports rewritten), business logic extracted from
+the IPC handlers into services with shared zod input schemas, `createCore` composition root with the pre/post-unlock
+lifecycle; Electron is a thin shell over it (Decisions R81–R87). No behaviour change intended beyond R84–R86.
+
+Layout (`packages/core/src/`): `core.ts`, `index.ts`, `services/`, `db/` (index, schema.sql, seed, repositories),
+`bots/`, `runtime/`, `orders/`, `exchange/{polymarket,binance}/`, `risk/`, `config/`, `ledger/`, `reconcile/`,
+`recorder/`, `backtest/`, `audit/`, `notify/`, `security/`, `sdk/`, `utils/`; `templates/` at repo root.
+`electron/` keeps `main.ts`, `preload.ts`, `ipc/respond.ts`, `ipc/handlers/*`, `ai/claude.ts`.
+
+Services (`core.services`): `bots` (BotService: list/get/create/update/delete/start/stop/restart/trades/allTrades/
+positions/stats/dashboardStats; `walletChangeBlocker`), `wallets` (WalletService incl. balance), `scripts`
+(ScriptService: CRUD/compile/getSchema/fork/exportScript/importScripts), `settings` (SettingsService incl. Binance
+credentials and RPC/CLOB/Binance tests), `backtests` (BacktestService: run/list/get/delete), `risk` (RiskService:
+getState/clearHalt/killSwitch), `config` (ConfigFileService: get/write/history/restore), `ledger` (LedgerService as-is),
+`markets` (MarketService: get/setAmbiguity), `reconcile` (ReconcileService: status/adoptPositions/watchlist*),
+`audit` (AuditService). Audited or human-only methods take an explicit `actor`. `services/schemas.ts` (`parseInput`),
+`services/errors.ts` (`ServiceError`), `services/types.ts` (DTOs, formerly `electron/ipc/types.ts`).
+
+Composition root API (for 3b): `createCore({ dataDir, configDir?, templatesDir?, dbPath? })` →
+`{ dataDir, db, repos, services, events, configService, halts, killSwitch, notifications, botManager, walletManager,
+reconciler, isUnlocked(), start(), unlock(key), shutdown({ timeoutMs }), close() }`. `core.events` emits `CORE_EVENTS`
+(`risk:halt`, `risk:halt-cleared`, `config:changed`, `market:rulesChanged`, `bot:event`, `bot:log`) with the payloads the
+renderer already receives; Electron forwards each to `webContents.send(channel)`.
+
+Other:
+- `electron/main.ts`: single-instance lock, window, `createCore({ dataDir: app.getPath('userData') })`, IPC registration
+  (bot/wallet after unlock), quit handling via `core.shutdown` + `core.close`.
+- IPC handlers: validate → service → `respond()` (`{ success, data, message? }`); main-window sender checks unchanged.
+  Auth and the AI assistant stay in Electron (removed in 3b); `settingsHandlers` keeps the Claude settings.
+- ESLint: `packages/core/**` may not import `electron`, `electron/` or `apps/*`; choke-point rules moved to the new adapter
+  paths. `tests/orders/choke-point.test.ts` scans `packages/` and `templates/` and checks core never imports electron.
+- `npm run typecheck` (core + electron) in CI; `packages/core/tsconfig.json`; root `tsconfig.json` is now only the vitest
+  transform settings for `tests/`. Former `src/core` / `src/utils` files now get core's ES2022 settings under vitest
+  too (as they already did in the Electron build).
+- Tests: imports updated; `bot-handlers.test.ts` builds a `BotService`; new `tests/core/create-core.test.ts` (temp data and
+  config dir, network stubbed: start → templates seeded, locked calls refused → clean shutdown marker; unlock → paper bot
+  created → clean shutdown).
+
+Not done / for later:
+- No npm workspaces or `@botlab/core` package name yet (R81); no `apps/` dir. HTTP server, SSE, MCP, auth (3b).
+- The forecast ledger has no wrapper service (LedgerService is exposed directly); `botHandlers`' Gamma/Data API helpers
+  moved unchanged into `BotService` (still uncached prices, own fetches) — candidates for MarketService/MarketDataService
+  reuse later.

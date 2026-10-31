@@ -43,6 +43,7 @@ vitest run tests/electron/rpc-handler.test.ts  # Single test file
 
 ### Code Quality
 ```bash
+npm run typecheck          # tsc for packages/core and electron
 npm run lint               # ESLint check
 npm run lint:fix           # Auto-fix
 npm run format             # Prettier format
@@ -50,38 +51,49 @@ npm run format             # Prettier format
 
 ## Architecture
 
-### Electron App (two processes)
-1. **Main Process** (`electron/`) — SQLite database, IPC handlers, bot runtime, trading SDK
-2. **Renderer Process** (`web/client/`) — React SPA loaded via Vite, communicates with main via IPC
+### Layout
+All domain logic lives in a transport-free core (`packages/core`, imported by relative path; no npm
+workspaces yet). `electron/` is a thin shell over it (window, IPC); chunk 3b replaces it with an
+HTTP server + MCP that call the same services.
+1. **Core** (`packages/core/src/`) — DB, risk, orders, exchanges, bot runtime, ledger, services, `createCore()`
+2. **Electron main** (`electron/`) — single-instance lock, window, IPC handlers (validate → service → `{success, data}`)
+3. **Renderer** (`web/client/`) — React SPA loaded via Vite, communicates with main via IPC
 
 ### Directory Structure
 
 ```
-electron/
-  main.ts                  # App entry point, window creation, IPC registration
-  preload.ts               # Context bridge (exposes IPC to renderer)
-  database/                # SQLite via better-sqlite3, migrations, repositories
-  ipc/handlers/            # IPC handler modules (bots, wallets, settings, scripts, auth)
+packages/core/src/
+  index.ts                 # Public API: createCore, services, schemas, errors, DTO types
+  core.ts                  # Composition root: createCore({ dataDir, configDir? }) → start() / unlock(key) / shutdown() / close()
+  services/                # BotService, WalletService, ScriptService, SettingsService, BacktestService,
+                           # RiskService, ConfigFileService, ReconcileService, MarketService;
+                           # schemas.ts (zod inputs shared by IPC/HTTP/MCP), errors.ts (ServiceError), types.ts (DTOs)
+  db/                      # SQLite via better-sqlite3, migrations (index.ts), repositories/, seed.ts
+  bots/                    # BotManager, BaseBotRunner, WalletManager
   runtime/                 # Bot execution engine
     ScriptRunner.ts        # Manages worker thread lifecycle
     ScriptBotRunner.ts     # BaseBotRunner subclass for script-based bots
     RpcHandler.ts          # Dispatches RPC calls from worker to trading APIs
     BotContextProxy.ts     # Builds the `ctx` object scripts interact with
     PaperTradingState.ts   # Simulated balances for paper trading mode
-    worker-bootstrap.ts    # Worker thread entry point
-  sdk/
-    types.ts               # Shared types (RPC methods, BotContext, Binance/Polymarket types)
-    trading.ts             # Polymarket CLOB trading helpers
-    binance.ts             # Binance REST API client (zero-dependency, HMAC-SHA256 signing)
-  security/                # Encryption key management
-  scripts/templates/       # Built-in bot script templates
+    worker-bootstrap.ts    # Worker thread entry point (resolved with workerPath.ts)
+  orders/                  # OrderService (the order choke point), ExchangeAdapter, fees, risk state
+  exchange/polymarket/     # orders.ts (only CLOB order calls), trading.ts (read-only helpers)
+  exchange/binance/        # client.ts (Binance REST client, HMAC-SHA256)
+  risk/                    # RiskEngine, halts, kill switch, RiskMonitor, ramp, startup recovery
+  config/                  # limits/mandate/fees/server/categories YAML: schema, loader, ConfigService (hot reload)
+  ledger/                  # Forecast ledger, scoring, market cache
+  reconcile/ recorder/ backtest/ audit/ notify/ security/ utils/
+  sdk/                     # types.ts (ctx API types), guide.ts (script-writing guide)
 
-src/core/                  # Bot framework (shared with Electron main)
-  BotManager.ts            # Orchestrates bot instances, CLOB client cache
-  BaseBotRunner.ts         # Abstract bot lifecycle (stopped→starting→running→stopping→error)
-  WalletManager.ts         # AES encryption of private keys, exclusive wallet assignment
+templates/                 # Built-in bot script templates (seeded by db/seed.ts)
 
-src/utils/                 # Shared utilities (logger, fetchData, kellyCalculator, etc.)
+electron/
+  main.ts                  # Single-instance lock, window, createCore, IPC registration, quit handling
+  preload.ts               # Context bridge (exposes IPC to renderer)
+  ipc/respond.ts           # { success, data } wrapping + sender check type
+  ipc/handlers/            # Thin IPC handlers over core services (+ auth, AI assistant until 3b)
+  ai/claude.ts             # AI script assistant client (removed in 3b)
 
 web/client/src/            # React renderer
   pages/                   # Route pages (Dashboard, Bots, Scripts, Wallets, Settings, etc.)
@@ -91,20 +103,20 @@ web/client/src/            # React renderer
 ```
 
 ### Bot Script Execution Flow
-1. User creates/starts a bot → IPC handler calls `BotManager.startBot()`
+1. User creates/starts a bot → IPC handler calls `BotService.start()` → `BotManager.startBot()`
 2. `BotManager` creates a `ScriptBotRunner` with compiled script code
 3. `ScriptBotRunner` spawns a `ScriptRunner` which creates a worker thread
 4. Worker thread runs the script with a `ctx` object (built by `BotContextProxy`)
 5. Script calls like `ctx.binance.getPrice('BTCUSDT')` become RPC messages to the main thread
-6. `RpcHandler` dispatches RPC calls; every order goes through `electron/orders/OrderService` → `RiskEngine` → exchange adapter (live) or `PaperTradingState` (paper). Only `electron/exchange/polymarket/orders.ts` and `electron/sdk/binance.ts` may hit order endpoints (enforced by `tests/orders/choke-point.test.ts`)
+6. `RpcHandler` dispatches RPC calls; every order goes through `packages/core/src/orders/OrderService` → `RiskEngine` → exchange adapter (live) or `PaperTradingState` (paper). Only `packages/core/src/exchange/polymarket/orders.ts` and `packages/core/src/exchange/binance/client.ts` may hit order endpoints (enforced by `tests/orders/choke-point.test.ts`)
 
 ### Key Patterns
-- **IPC Handlers** (`electron/ipc/handlers/`): Each module registers `ipcMain.handle()` handlers. Renderer calls via `window.electronAPI.*`
+- **IPC Handlers** (`electron/ipc/handlers/`): Each module registers `ipcMain.handle()` handlers that parse input with `services/schemas.ts`, call a core service (actor `human`) and wrap the result with `respond()`. Human-only writes also check the sender is the main window. Renderer calls via `window.electronAPI.*`
 - **RPC Dispatch**: Worker scripts send `{ method, params }` messages. `RpcHandler` pattern-matches on method name (`binance:buy`, `clob:getPrice`, `storage:get`, etc.)
 - **Paper Trading**: `PaperTradingState` tracks simulated balances for both Polymarket and Binance. Persisted via `BotStorageRepository`
 - **Script Compilation**: User TypeScript scripts are compiled with esbuild at save time, stored in SQLite
 - **Credential Security**: Wallet private keys and Binance API credentials are AES-encrypted (CryptoJS) at rest. Decrypted only in main process, never sent to renderer
-- **Kelly Criterion**: `ctx.kelly.calculate(winRate, sampleSize, marketPrice, bankroll)` — pure math utility running locally in worker (no RPC). Implemented in `src/utils/kellyCalculator.ts`, exposed via `BotContextProxy`
+- **Kelly Criterion**: `ctx.kelly.calculate(winRate, sampleSize, marketPrice, bankroll)` — pure math utility running locally in worker (no RPC). Implemented in `packages/core/src/utils/kellyCalculator.ts`, exposed via `BotContextProxy`
 
 ### Database (SQLite via better-sqlite3)
 - **bots**: id, name, scriptId, walletId, config (JSON), mode (live/paper), status
@@ -113,7 +125,7 @@ web/client/src/            # React renderer
 - **scripts**: id, name, sourceCode, compiledCode, configSchema (JSON)
 - **bot_trades**: historical trade records per bot
 - **bot_storage**: key-value store for bot state persistence
-- Migrations run automatically in `electron/database/index.ts`
+- Migrations run automatically in `packages/core/src/db/index.ts`
 
 ### Web Client Patterns (`web/client/src/`)
 - React 19 + React Router + TanStack React Query + Tailwind CSS
@@ -127,7 +139,9 @@ web/client/src/            # React renderer
 - **Binance USDT-only**: Paper trading simulator only supports USDT-quoted pairs (BTCUSDT, ETHUSDT, etc.)
 - **Worker thread isolation**: Bot scripts run in worker threads — they can only communicate via the RPC message channel, not access main process directly
 - **Binance credentials**: Encrypted in settings table, decrypted only in `BotManager.getSettings()`. Only `hasBinanceCredentials: boolean` is ever sent to renderer
-- **Script templates**: Registered in `electron/database/seed.ts`, source lives in `electron/scripts/templates/`
+- **Script templates**: Registered in `packages/core/src/db/seed.ts`, source lives in `templates/`
+- **Core is transport-free**: nothing under `packages/core` may import `electron` (ESLint + `tests/orders/choke-point.test.ts`). Business logic goes in services, not IPC handlers
+- **Data dir**: `createCore({ dataDir })` — Electron passes `app.getPath('userData')`, tests a temp dir; without one the DB defaults to `BOTLAB_DATA_DIR` or `./data`
 
 ## Environment Variables
 

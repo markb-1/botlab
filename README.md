@@ -238,25 +238,27 @@ npm run format             # Prettier
 ### Project Structure
 
 ```
-electron/                  # Electron main process
+packages/core/src/         # All domain logic, no transport code
+  core.ts                  # createCore(): composition root and lifecycle
+  services/                # Bot, wallet, script, settings, backtest, risk, config, reconcile services
+  db/                      # SQLite database, migrations, repositories
+  bots/                    # BotManager, BaseBotRunner, WalletManager
+  runtime/                 # Bot execution engine (ScriptRunner, RpcHandler, PaperTradingState)
+  orders/ risk/ ledger/    # Order choke point, risk engine, forecast ledger
+  exchange/                # Polymarket and Binance clients
+  sdk/                     # Script API types and guide
+
+templates/                 # Built-in bot script templates
+
+electron/                  # Electron shell over core
   main.ts                  # App entry, window creation, IPC setup
   preload.ts               # Context bridge (IPC → renderer)
-  database/                # SQLite database, migrations, repositories
-  ipc/handlers/            # IPC handlers (bots, wallets, settings, scripts, auth)
-  runtime/                 # Bot execution engine (ScriptRunner, RpcHandler, PaperTradingState)
-  sdk/                     # Trading clients (Polymarket, Binance) and shared types
-  scripts/templates/       # Built-in bot script templates
-  security/                # Encryption key management
+  ipc/handlers/            # Thin IPC handlers calling core services
 
 web/client/                # React renderer (Vite)
   src/pages/               # UI pages (Dashboard, Bots, Scripts, Wallets, Settings)
   src/hooks/               # React Query hooks wrapping IPC calls
   src/lib/electronApi.ts   # IPC call wrappers
-
-src/core/                  # Bot framework
-  BotManager.ts            # Orchestrates bot instances
-  BaseBotRunner.ts         # Abstract bot lifecycle
-  WalletManager.ts         # Encrypted wallet management
 ```
 
 ### Environment Variables
