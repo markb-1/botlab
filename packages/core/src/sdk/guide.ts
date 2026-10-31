@@ -162,13 +162,17 @@ copy bots are paper bots like any other and not market-scoped (no \`marketIds\`)
   \`max_trade_age_minutes\` (30), \`pm_cooldown_days\` (7). Add or remove a leader with \`update_bot_config\` on your
   own copy bot; it applies at the bot's **next start** (restart it).
 - Behaviour: buys rest at the leader's fill + \`max_chase\` for \`ttl_minutes\` and are skipped when the book has
-  moved beyond (never chased); sells mirror the fraction of their position the leader sold. Buys only in markets that
+  moved beyond (never chased); sells mirror the fraction of their position the leader sold, applied only to what the
+  bot bought copying **that** leader (a sell by leader B never sells shares bought copying leader A; positions without
+  attribution — bought before 5c — use the whole holding). Buys only in markets that
   pass the mandate (category, liquidity, horizon, **assessed** ambiguity), outside the Position Manager's exit window,
   without an exit flag and not sold by the Position Manager recently — so \`assess_market\` the leaders' markets you
   want copied.
 - Scoring: \`get_copy_leaders(botId)\` → per leader: status, orders copied, closed / open copied trades, hit rate,
   realised and unrealised P&L. A leader whose last 20 closed copied trades lost money with a hit rate under 50 % is
-  **dropped automatically** (audited, Telegram); you cannot re-add a dropped leader (a human can re-activate it).
+  **dropped automatically** (audited, Telegram). A dropped leader is blocked for you on **every** bot (also new ones,
+  and after the bot is deleted) until a human re-activates it; removing and re-adding a leader does not reset its
+  score window.
   Report per-leader results in the daily review and replace leaders that do not earn their keep.
 
 - \`kill_switch(reason)\` halts everything (all bots stopped, open orders cancelled). Only a human can clear it —

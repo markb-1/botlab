@@ -67,9 +67,11 @@ export function LeadersPanel({ bot }: { bot: Bot }) {
                   </td>
                   <td className="px-2 py-2">
                     <Badge tone={STATUS_TONE[l.status]}>{l.status}</Badge>
-                    {l.status === 'dropped' && (
+                    {(l.status === 'dropped' || l.blocked) && (
                       <div className="mt-1 text-xs text-red-300/80 max-w-[16rem] break-words">
-                        {l.droppedReason ?? 'dropped'} · {dateTime(l.droppedAt)}
+                        {l.status === 'dropped'
+                          ? `${l.droppedReason ?? 'dropped'} · ${dateTime(l.droppedAt)}`
+                          : 'Dropped on another bot: the agent cannot add it'}
                         <div>
                           <button
                             type="button"

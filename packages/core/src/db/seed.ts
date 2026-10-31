@@ -91,13 +91,20 @@ export async function seedTemplates(
 
     // Check if this template already exists
     // Same name and version, else the builtin row of the same name (a new meta.version updates it in place, so its
-    // bots run the new code — and go back to paper — instead of staying on an orphaned old row)
-    const existing =
-      scriptRepo.findByNameAndVersion(name, version) ?? scriptRepo.findAll().find((r) => r.name === name && r.origin === 'builtin' && r.is_template === 1);
+    // bots run the new code — and go back to paper — instead of staying on an orphaned old row). Both lookups match
+    // builtin template rows only: a human / imported / agent script with the same name and version is never touched.
+    const builtins = scriptRepo.findAll().filter((r) => r.origin === 'builtin' && r.is_template === 1 && r.name === name);
+    const existing = builtins.find((r) => r.version === version) ?? builtins[0];
     if (existing) {
       // Update source and recompile if template file has changed on disk
       const sourceChanged = existing.source.trim() !== source.trim();
-      if (existing.version !== version) scriptRepo.update(existing.id, { version }, 'system');
+      // (name, version) is unique: a non-builtin script already holding the new version keeps it, the builtin row
+      // keeps its old version text (its source is still upgraded)
+      if (existing.version !== version) {
+        const taken = scriptRepo.findByNameAndVersion(name, version);
+        if (!taken) scriptRepo.update(existing.id, { version }, 'system');
+        else console.warn(`[Seed] ${name} v${version} is taken by a ${taken.origin} script: the builtin keeps version ${existing.version}`);
+      }
       if (sourceChanged || !existing.compiled) {
         const compiled = await compileSource(source);
         if (compiled) {
@@ -120,10 +127,12 @@ export async function seedTemplates(
     // Compile the template source
     const compiled = await compileSource(source);
 
+    // A non-builtin script holding this name + version (unique): the builtin gets a distinct version text
+    const createVersion = scriptRepo.findByNameAndVersion(name, version) ? `${version}-builtin` : version;
     const created = scriptRepo.create({
       name,
       description: meta.description || '',
-      version,
+      version: createVersion,
       author: meta.author || 'BotLab',
       source,
       compiled: compiled || undefined,

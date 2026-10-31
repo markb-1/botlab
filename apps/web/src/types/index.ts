@@ -171,6 +171,8 @@ export interface CopyLeader {
   unrealisedPnlUsd: number | null;
   openCostUsd: number;
   window: { trades: number; size: number; pnlUsd: number; hitRate: number | null };
+  /** Dropped on some bot (this or another): blocked for the agent until re-activated */
+  blocked: boolean;
 }
 
 // Dashboard stats per bot (batch endpoint)

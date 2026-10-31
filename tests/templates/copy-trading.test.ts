@@ -216,6 +216,26 @@ describe('copy trading v2: activity', () => {
     expect(same.trades.map((t) => t.key)).toEqual(['0xsame:1', '0xsame:2']);
   });
 
+  it('a trade arriving between two page reads (offsets shift) is not copied twice (review)', async () => {
+    const s = await primed();
+    const fresh = Array.from({ length: 150 }, (_, i) => row({ ts: NOW - (150 - i) * 1000, size: 1, tx: `0xp${i}`, logIndex: null })).reverse();
+    s.state.activity[L] = [...fresh, ...s.state.activity[L]];
+    const orig = s.ctx.fetch.getMockImplementation();
+    let pages = 0;
+    s.ctx.fetch.mockImplementation(async (url: string) => {
+      const r = await orig(url);
+      // After page 1 is read the leader trades again: every row moves one place down
+      if (url.includes('/activity') && pages++ === 0)
+        s.state.activity[L] = [row({ ts: NOW - 100, size: 1, tx: '0xlate', logIndex: null }), ...s.state.activity[L]];
+      return r;
+    });
+    const got = await fetchNewTrades(s.ctx, L, (await s.ctx.storage.get('copy:state')).cursors[L]);
+    const keys = got.trades.map((t) => t.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys.some((k) => k.includes('#2'))).toBe(false);
+    expect(keys).toHaveLength(150);
+  });
+
   it('the first poll of a leader copies no backlog', async () => {
     const s = fakeCtx();
     s.state.activity[L] = [row({ ts: NOW - 10_000, usdcSize: 500 })];
@@ -398,6 +418,28 @@ describe('copy trading v2: cycle', () => {
       20,
       expect.objectContaining({ ttlMinutes: 10, copy: expect.objectContaining({ leader: L }) })
     );
+  });
+
+  it("a leader's sell unwinds only what the bot bought copying that leader; no attribution ⇒ whole holding (review)", async () => {
+    const s = await primed();
+    s.state.positions = [{ tokenId: 'yes', size: 100, avgPrice: 0.4, currentValue: 40 }];
+    s.state.leaderPositions = [{ asset: 'yes', conditionId: '0xm1', size: 0 }]; // the leader exits completely
+    // 70 shares were bought copying another leader, 30 copying L
+    s.ctx.copy.getHoldings = vi.fn(async () => ({ byLeader: { [L]: 30, [L2]: 70 }, attributed: 100 }));
+    s.state.activity[L] = [row({ side: 'SELL', price: 0.6, size: 30 }), ...s.state.activity[L]];
+    await runCopyCycle(s.ctx);
+    expect(s.placeLimit).toHaveBeenLastCalledWith('yes', 'sell', 0.59, 30, expect.anything());
+    // Nothing attributed to L ⇒ nothing sold
+    s.ctx.copy.getHoldings = vi.fn(async () => ({ byLeader: { [L2]: 70 }, attributed: 70 }));
+    s.state.activity[L] = [row({ side: 'SELL', price: 0.6, size: 30 }), ...s.state.activity[L]];
+    await runCopyCycle(s.ctx);
+    expect(s.placeLimit).toHaveBeenCalledTimes(1);
+    // No attribution for the token at all ⇒ the whole holding, logged
+    s.ctx.copy.getHoldings = vi.fn(async () => ({ byLeader: {}, attributed: 0 }));
+    s.state.activity[L] = [row({ side: 'SELL', price: 0.6, size: 30 }), ...s.state.activity[L]];
+    await runCopyCycle(s.ctx);
+    expect(s.placeLimit).toHaveBeenLastCalledWith('yes', 'sell', 0.59, 100, expect.anything());
+    expect(s.ctx.log.info).toHaveBeenCalledWith(expect.stringMatching(/no leader attribution/));
   });
 
   it('builtin template typechecks against the SDK', () => {

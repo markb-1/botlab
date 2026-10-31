@@ -339,14 +339,22 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     ]);
     // A dropped leader cannot be re-added by the agent
     core.db.prepare("UPDATE copy_leaders SET status = 'dropped', dropped_reason = 'auto-drop' WHERE address = ?").run(B);
+    core.db.prepare("INSERT INTO copy_leader_blocks (address, bot_id, reason, blocked_at) VALUES (?, ?, 'auto-drop', '2026-01-01')").run(B, ok.json.id);
     expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A] } })).isError).toBe(false);
-    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).text).toMatch(/was dropped on this bot/);
+    expect((await call('update_bot_config', { botId: ok.json.id, config: { leaders: [A, B] } })).text).toMatch(/was dropped for losing copies/);
+    // Review: a new bot with that leader is refused too, also after the dropping bot is deleted
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp2', config: { leaders: [B] } })).text).toMatch(/was dropped for losing copies/);
+    await core.services.bots.delete(ok.json.id, asHuman('test'));
+    expect((await call('create_bot', { templateId: copyTpl.id, name: 'cp3', config: { leaders: [B] } })).text).toMatch(/was dropped for losing copies/);
+    expect(core.db.prepare('SELECT COUNT(*) AS n FROM copy_leader_blocks WHERE address = ?').get(B)).toEqual({ n: 1 });
+    const again = await call('create_bot', { templateId: copyTpl.id, name: 'cp4', config: { leaders: [A] } });
+    expect(again.json).toMatchObject({ role: 'copy' });
     // A human's copy bot: the agent cannot reconfigure or start it
     const human = await core.services.bots.create({ name: 'human copy', scriptId: copyTpl.id, config: { leaders: [A] } }, asHuman('test'));
     expect((await call('update_bot_config', { botId: human.id, config: { leaders: [B] } })).text).toMatch(/only do this for bots it created/);
     expect((await call('start_bot', { botId: human.id })).text).toMatch(/only do this for bots it created/);
     // Re-activation is a human action over HTTP (agent token refused)
-    const res = await app.request(`/api/bots/${ok.json.id}/copy-leaders/reactivate`, {
+    const res = await app.request(`/api/bots/${again.json.id}/copy-leaders/reactivate`, {
       method: 'POST',
       headers: { host: HOST, authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' },
       body: JSON.stringify({ address: B }),

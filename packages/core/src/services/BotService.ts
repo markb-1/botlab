@@ -373,7 +373,7 @@ export interface BotServiceDeps {
   /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
   getMandate?: () => MandateConfig | null;
   /** Copy-trading leader rows (5c): kept in step with a copy bot's config, dropped leaders stay dropped */
-  copyLeaders?: Pick<CopyLeaderService, 'sync' | 'droppedAmong' | 'forgetBot'>;
+  copyLeaders?: Pick<CopyLeaderService, 'sync' | 'blockedAmong' | 'forgetBot'>;
   now?: () => number;
 }
 
@@ -534,8 +534,9 @@ export class BotService {
       if (invalid.length > 0) deny(`leaders must be 0x addresses (not ${invalid.slice(0, 3).join(', ')})`);
       if (leaders.length === 0) deny('config names no leader (leaders: [0x…]; get_leaderboard proposes some)');
       if (leaders.length > MAX_COPY_LEADERS) deny(`at most ${MAX_COPY_LEADERS} leaders per bot`);
-      const dropped = target ? (this.deps.copyLeaders?.droppedAmong(target, leaders) ?? []) : [];
-      if (dropped.length > 0) deny(`leader ${dropped[0]} was dropped on this bot for losing copies; only a human can re-activate it`);
+      // Dropped anywhere (any bot, also a deleted one) ⇒ blocked for the agent until a human re-activates it
+      const dropped = this.deps.copyLeaders?.blockedAmong(target, leaders) ?? [];
+      if (dropped.length > 0) deny(`leader ${dropped[0]} was dropped for losing copies; only a human can re-activate it`);
       return;
     }
     const tokens = strategyConfigTokens(role, config);

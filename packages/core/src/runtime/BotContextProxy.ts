@@ -53,6 +53,7 @@ import type {
   MandateSummary,
   CopyContext,
   CopyLeaderStatus,
+  CopyHoldings,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../utils/kellyCalculator';
 
@@ -299,6 +300,7 @@ export function createBotContext(params: {
     // Copy Trading template only: the server refuses it for any other bot
     copy: {
       getLeaders: (addresses: string[]) => rpcCall('copy:getLeaders', addresses) as Promise<CopyLeaderStatus[]>,
+      getHoldings: (tokenId: string) => rpcCall('copy:getHoldings', tokenId) as Promise<CopyHoldings>,
     } as CopyContext,
 
     // Retire this bot (server-side, audited as the bot); the worker is stopped shortly after

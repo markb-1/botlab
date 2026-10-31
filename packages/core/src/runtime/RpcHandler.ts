@@ -118,6 +118,7 @@ export interface RpcHandlerDeps {
   /** Copy-trading leaders (5c): given only to the builtin Copy Trading template; missing ⇒ ctx.copy fails, orders are not attributed */
   copy?: {
     getLeaders(addresses: unknown): CopyLeaderStatus[];
+    getHoldings(tokenId: string, simulated: boolean): { byLeader: Record<string, number>; attributed: number };
     recordOrder(orderId: string, info: { leader: string; key?: string | null; side: 'buy' | 'sell'; leaderPrice?: number | null; leaderUsd?: number | null }): void;
   };
 }
@@ -338,6 +339,13 @@ export class RpcHandler {
       case 'copy:getLeaders':
         if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');
         return this.deps.copy.getLeaders(args[0]);
+
+      case 'copy:getHoldings': {
+        if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');
+        const tokenId = args[0];
+        if (typeof tokenId !== 'string' || !tokenId.trim() || tokenId.length > 100) throw new Error('getHoldings: a token id is required');
+        return this.deps.copy.getHoldings(tokenId.trim(), this.isPaper);
+      }
 
       case 'polymarket:getEventMarketIds': {
         const eventId = args[0];

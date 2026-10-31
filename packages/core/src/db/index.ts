@@ -635,6 +635,16 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       created_at TEXT NOT NULL
     )`,
     'CREATE INDEX IF NOT EXISTS idx_copy_trades_bot ON copy_trades(bot_id, leader)',
+    // 5c review: a leader dropped on any bot is blocked for the agent everywhere (kept when the bot is deleted);
+    // only the human re-activation clears it
+    `CREATE TABLE IF NOT EXISTS copy_leader_blocks (
+      address TEXT PRIMARY KEY,
+      bot_id TEXT,
+      reason TEXT,
+      blocked_at TEXT NOT NULL
+    )`,
+    `INSERT OR IGNORE INTO copy_leader_blocks (address, bot_id, reason, blocked_at)
+       SELECT address, bot_id, dropped_reason, COALESCE(dropped_at, updated_at) FROM copy_leaders WHERE status = 'dropped'`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

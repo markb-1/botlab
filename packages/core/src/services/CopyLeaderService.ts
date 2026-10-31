@@ -58,6 +58,8 @@ export interface CopyLeaderView {
   openCostUsd: number;
   /** The auto-drop window: last 20 closed copied trades since `activeSince` */
   window: { trades: number; size: number; pnlUsd: number; hitRate: number | null };
+  /** Dropped on some bot (this one or another, possibly deleted): the agent cannot add it anywhere */
+  blocked: boolean;
 }
 
 export interface CopyLeaderStatusView {
@@ -90,7 +92,8 @@ export class CopyLeaderService {
   /**
    * Keep the leader rows in step with a copy bot's config (BotService, create / config update): new addresses are
    * added active (by `addedBy`), addresses no longer in the config become `removed`, a removed one added back is
-   * active again with a new auto-drop window. A dropped leader stays dropped (a human re-activates it).
+   * active again and its auto-drop window continues (removing and re-adding never resets the score). A dropped leader
+   * stays dropped (a human re-activates it).
    */
   sync(botId: string, config: Record<string, unknown> | null | undefined, addedBy: 'human' | 'agent' | 'system'): void {
     const { leaders } = copyLeadersOf(config);
@@ -104,10 +107,18 @@ export class CopyLeaderService {
     for (const row of rows) if (row.status === 'active' && !leaders.includes(row.address)) this.deps.repo.setRemoved(row.id, at);
   }
 
-  /** Dropped leaders among `addresses` (BotService refuses the agent re-adding them) */
-  droppedAmong(botId: string, addresses: string[]): string[] {
-    const rows = this.deps.repo.list(botId);
-    return addresses.filter((a) => rows.some((r) => r.address === a.toLowerCase() && r.status === 'dropped'));
+  /**
+   * Leaders among `addresses` the agent may not add (BotService): dropped on any bot (global block, kept after the bot
+   * is deleted) unless already active on `botId`, or dropped on `botId`. Only the human re-activation clears a block.
+   */
+  blockedAmong(botId: string | null, addresses: string[]): string[] {
+    const rows = botId ? this.deps.repo.list(botId) : [];
+    return addresses.filter((a) => {
+      const row = rows.find((r) => r.address === a.toLowerCase());
+      if (row?.status === 'dropped') return true;
+      // A leader already active on this bot may stay in its config (only adding it is refused)
+      return !!this.deps.repo.findBlock(a) && row?.status !== 'active';
+    });
   }
 
   /** Attribution of an order a copy-role bot placed (RpcHandler, after placing it) */
@@ -161,6 +172,7 @@ export class CopyLeaderService {
       if (!d.drop) continue;
       const at = this.iso();
       if (!this.deps.repo.drop(row.id, `auto-drop: ${d.reason}`, at)) continue;
+      this.deps.repo.block(row.address, botId, `auto-drop: ${d.reason}`, at);
       dropped.push(row.address);
       this.deps.audit?.record('system', 'copy.leader_dropped', botId, {
         botName: this.deps.botRepo.findById(botId)?.name ?? null,
@@ -220,24 +232,52 @@ export class CopyLeaderService {
         unrealisedPnlUsd: s ? s.unrealisedPnlUsd : 0,
         openCostUsd: s?.openCostUsd ?? 0,
         window: { trades: w.trades, size: AUTO_DROP_WINDOW, pnlUsd: w.windowPnlUsd, hitRate: w.windowHitRate },
+        blocked: !!this.deps.repo.findBlock(row.address),
       };
     });
     return { botId, botName: bot.name, leaders: views };
   }
 
-  /** Re-activate a dropped leader (human only): a new auto-drop window starts now. Audited. */
+  /**
+   * Re-activate a leader (human only): a dropped row on this bot becomes active with a new auto-drop window, and the
+   * global block (dropped on any bot) is cleared. Audited.
+   */
   reactivate(botId: string, address: unknown, by: Actor): CopyLeaderView[] {
     const who = requireActor(by, ['human'], 'copy.reactivateLeader');
     if (typeof address !== 'string' || !ADDRESS_RE.test(address.trim())) throw new ServiceError('invalid_input', 'address must be a 0x address');
     if (!this.deps.botRepo.findById(botId)) throw notFound('Bot not found');
     const row = this.deps.repo.find(botId, address.trim());
     if (!row) throw notFound('Leader not found on this bot');
-    if (row.status !== 'dropped') throw new ServiceError('conflict', `Leader is ${row.status}, not dropped`);
-    this.deps.repo.reactivate(row.id, this.iso());
-    this.deps.audit?.record(auditActorOf(who), 'copy.leader_reactivated', botId, { leader: row.address, droppedReason: row.dropped_reason });
+    const block = this.deps.repo.findBlock(row.address);
+    if (row.status !== 'dropped' && !block) throw new ServiceError('conflict', `Leader is ${row.status}, not dropped or blocked`);
+    if (row.status === 'dropped') this.deps.repo.reactivate(row.id, this.iso());
+    this.deps.repo.unblock(row.address);
+    this.deps.audit?.record(auditActorOf(who), 'copy.leader_reactivated', botId, {
+      leader: row.address,
+      droppedReason: row.dropped_reason,
+      ...(block ? { clearedBlock: { botId: block.bot_id, reason: block.reason } } : {}),
+    });
     return this.leaders(botId).leaders;
   }
 
+  /**
+   * This bot's copied shares of one token per leader in one mode (open lots of the scoring, minus the leader's own open
+   * copied sells): what a leader's sell may unwind (ctx.copy.getHoldings). `attributed` = all attributed open shares.
+   */
+  holdings(botId: string, tokenId: string, simulated: boolean): { byLeader: Record<string, number>; attributed: number } {
+    const { open } = this.score(botId);
+    const selling = this.deps.repo.openCopiedSells(botId, tokenId, simulated);
+    const byLeader: Record<string, number> = {};
+    let attributed = 0;
+    for (const lot of open) {
+      if (lot.tokenId !== tokenId || lot.simulated !== simulated) continue;
+      attributed += lot.shares;
+      byLeader[lot.leader] = Math.max(Math.round((lot.shares - (selling.get(lot.leader) ?? 0)) * 1e6) / 1e6, 0);
+    }
+    return { byLeader, attributed: Math.round(attributed * 1e6) / 1e6 };
+  }
+
+  /** Leader rows and attribution of a deleted bot; global blocks (dropped leaders) are kept */
   forgetBot(botId: string): void {
     this.deps.repo.deleteForBot(botId);
     this.lastEvaluated.delete(botId);

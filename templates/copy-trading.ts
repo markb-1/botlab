@@ -11,7 +11,8 @@
  *     Size = `copy_fraction` × the leader's USD (or `fixed_usd`), capped by `max_order_usd`, the risk budget
  *     (ctx.risk.getBudget: allocation and per-market room). No small-trade boost.
  *   - Sells: the same fraction of our position as the leader sold of theirs (their position read from the data API;
- *     else USD ÷ bid), capped at what we hold net of open sells, as a limit at the leader's price − `max_chase`
+ *     else USD ÷ bid), applied to what we bought copying THAT leader (ctx.copy.getHoldings; the whole holding when the
+ *     token has no attribution) and capped at what we hold net of open sells, as a limit at the leader's price − `max_chase`
  *     (rests when the bid is lower; reducing a position, so it is not skipped).
  *   - Leader filters (buys only; sells always mirror): leader trade ≥ `min_leader_trade_usd`; at most
  *     `max_leader_trades_per_day` leader trades per UTC day (more ⇒ a high-frequency wallet, its buys are skipped for
@@ -250,6 +251,20 @@ export function tradeKeys(rows: any[]): string[] {
   });
 }
 
+/** Exact identity of an activity row (to recognise the same row returned again on a shifted page) */
+export function rowIdentity(r: any): string {
+  return JSON.stringify([
+    r?.transactionHash ?? r?.transaction_hash ?? null,
+    r?.logIndex ?? r?.log_index ?? null,
+    r?.asset ?? null,
+    r?.side ?? null,
+    r?.size ?? null,
+    r?.price ?? null,
+    r?.timestamp ?? null,
+    r?.type ?? null,
+  ]);
+}
+
 function normalise(row: any, key: string): LeaderTrade | null {
   if (!row || row.type !== 'TRADE') return null;
   const side = row.side === 'BUY' || row.side === 'SELL' ? row.side : null;
@@ -299,20 +314,29 @@ export async function fetchNewTrades(
 ): Promise<{ trades: LeaderTrade[]; cursor: LeaderCursor; truncated: boolean }> {
   const seen = new Set((cursor?.seen ?? []).map(([k]) => k));
   const rows: any[] = [];
+  // Offset pages shift when the leader trades while we read: a row already read on an earlier page comes back on the
+  // next one. Such repeats (same identity) are dropped before keying, so they never become a `#2` trade. A genuine
+  // identical fill split across a page boundary is dropped too: a copy can be missed, never doubled.
+  const identities = new Set<string>();
   let truncated = false;
   for (let page = 0; page < MAX_PAGES; page++) {
     const resp = await ctx.fetch(`${DATA_API}/activity?user=${leader}&type=TRADE&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`);
     if (!resp.ok) throw new Error(`activity API HTTP ${resp.status}`);
     const batch = await resp.json<any[]>();
     if (!Array.isArray(batch)) throw new Error('activity API: unexpected answer');
-    rows.push(...batch);
+    const ids = batch.map(rowIdentity);
+    const added = batch.filter((_, i) => !identities.has(ids[i]));
+    for (const id of ids) identities.add(id);
+    rows.push(...added);
     if (!cursor || batch.length < PAGE_SIZE) break;
-    const keys = tradeKeys(rows).slice(rows.length - batch.length);
-    if (batch.some((r, i) => seen.has(keys[i]) || tsOf(r) < cursor.lastTs)) break;
+    const keys = tradeKeys(rows).slice(rows.length - added.length);
+    if (batch.some((r) => tsOf(r) < cursor.lastTs) || added.some((_, i) => seen.has(keys[i]))) break;
     if (page === MAX_PAGES - 1) truncated = true;
   }
   const keys = tradeKeys(rows);
-  const all = rows.map((r, i) => normalise(r, keys[i])).filter((t): t is LeaderTrade => t !== null);
+  // One trade per key within a fetch, whatever the API returned
+  const byKey = new Set<string>();
+  const all = rows.map((r, i) => normalise(r, keys[i])).filter((t): t is LeaderTrade => t !== null && !byKey.has(t.key) && !!byKey.add(t.key));
   if (!cursor) {
     const lastTs = all.reduce((n, t) => Math.max(n, t.ts), 0);
     return { trades: [], cursor: { lastTs, seen: all.map((t) => [t.key, t.ts] as [string, number]).slice(-MAX_SEEN) }, truncated: false };
@@ -585,7 +609,16 @@ export async function runCopyCycle(ctx: BotContext): Promise<CopyCycleResult> {
         const held = (await ctx.getPositions()).find((p) => p.tokenId === t.tokenId);
         if (!held || !(held.size > 0)) continue;
         const open = await ctx.polymarket.getOpenOrders();
-        const available = availableToSell(held.size, open, t.tokenId);
+        let available = availableToSell(held.size, open, t.tokenId);
+        // A leader's sell unwinds only what this bot bought copying that leader (net of its open copied sells). No
+        // attribution for the token (e.g. bought before 5c, or a fork without ctx.copy) ⇒ the whole holding, logged.
+        try {
+          const h = await ctx.copy.getHoldings(t.tokenId);
+          if (h.attributed > 0) available = Math.min(available, h.byLeader[leader] ?? 0);
+          else ctx.log.info(`copy: no leader attribution for ${t.tokenId.slice(0, 10)}…: mirroring ${short(leader)}'s sell on the whole holding`);
+        } catch (err) {
+          ctx.log.info(`copy: leader attribution unavailable (${errMsg(err)}): mirroring ${short(leader)}'s sell on the whole holding`);
+        }
         let laterNet = 0;
         for (const later of trades.slice(i + 1)) if (later.tokenId === t.tokenId) laterNet += later.side === 'BUY' ? later.size : -later.size;
         const leaderNow = await fetchLeaderRemaining(ctx, leader, t.conditionId, t.tokenId);

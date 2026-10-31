@@ -99,7 +99,7 @@ export interface BotManagerOrderDeps {
   /** position_exit_flags (R140): read and closed by the builtin position manager (ctx.portfolio) */
   exitFlags?: PositionExitFlagRepository;
   /** Copy-trading leaders (5c): ctx.copy and order attribution for the builtin Copy Trading template */
-  copyLeaders?: Pick<CopyLeaderService, 'statusFor' | 'recordOrder'>;
+  copyLeaders?: Pick<CopyLeaderService, 'statusFor' | 'recordOrder' | 'holdings'>;
 }
 
 /**
@@ -773,6 +773,7 @@ export class BotManager extends EventEmitter {
         ? {
             copy: {
               getLeaders: (addresses: unknown) => this.orderDeps!.copyLeaders!.statusFor(botId, addresses),
+              getHoldings: (tokenId: string, simulated: boolean) => this.orderDeps!.copyLeaders!.holdings(botId, tokenId, simulated),
               recordOrder: (orderId: string, info: Parameters<CopyLeaderService['recordOrder']>[2]) => this.orderDeps!.copyLeaders!.recordOrder(botId, orderId, info),
             },
           }

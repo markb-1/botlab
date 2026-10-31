@@ -1,5 +1,8 @@
 import type Database from 'better-sqlite3';
 import { generateId } from '../index';
+import { OPEN_ORDER_STATUSES } from './OrderRepository';
+
+const OPEN_IN = `(${OPEN_ORDER_STATUSES.map((st) => `'${st}'`).join(',')})`;
 
 /** Leader of a copy-trading bot (spec §9.5 leader scoring, 5c) */
 export type CopyLeaderStatus = 'active' | 'dropped' | 'removed';
@@ -73,11 +76,11 @@ export class CopyLeaderRepository {
     return this.find(botId, address)!;
   }
 
-  /** removed → active again (re-added to the config): a new auto-drop window */
+  /** removed → active again (re-added to the config); the auto-drop window continues (active_since kept) */
   reAdd(id: string, addedBy: string, at: string): void {
     this.db
-      .prepare("UPDATE copy_leaders SET status = 'active', added_at = ?, added_by = ?, active_since = ?, updated_at = ? WHERE id = ? AND status = 'removed'")
-      .run(at, addedBy, at, at, id);
+      .prepare("UPDATE copy_leaders SET status = 'active', added_at = ?, added_by = ?, updated_at = ? WHERE id = ? AND status = 'removed'")
+      .run(at, addedBy, at, id);
   }
 
   setRemoved(id: string, at: string): void {
@@ -104,6 +107,37 @@ export class CopyLeaderRepository {
     );
   }
 
+  /** Block a leader everywhere (dropped on `botId`); kept when that bot is deleted */
+  block(address: string, botId: string, reason: string, at: string): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO copy_leader_blocks (address, bot_id, reason, blocked_at) VALUES (?, ?, ?, ?)')
+      .run(address.toLowerCase(), botId, reason, at);
+  }
+
+  findBlock(address: string): { address: string; bot_id: string | null; reason: string | null; blocked_at: string } | undefined {
+    return this.db.prepare('SELECT * FROM copy_leader_blocks WHERE address = ?').get(address.toLowerCase()) as
+      | { address: string; bot_id: string | null; reason: string | null; blocked_at: string }
+      | undefined;
+  }
+
+  /** Clear a block (human re-activation only); false if none */
+  unblock(address: string): boolean {
+    return this.db.prepare('DELETE FROM copy_leader_blocks WHERE address = ?').run(address.toLowerCase()).changes > 0;
+  }
+
+  /** Shares of open sells this bot placed copying each leader, per leader, for one token and mode */
+  openCopiedSells(botId: string, tokenId: string, simulated: boolean): Map<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT c.leader AS leader, SUM(MAX(o.size - o.filled_size, 0)) AS n FROM orders o JOIN copy_trades c ON c.order_id = o.id
+         WHERE o.bot_id = ? AND o.token_id = ? AND o.side = 'sell' AND o.simulated = ? AND o.status IN ${OPEN_IN}
+         GROUP BY c.leader`
+      )
+      .all(botId, tokenId, simulated ? 1 : 0) as Array<{ leader: string; n: number }>;
+    return new Map(rows.map((r) => [r.leader, r.n]));
+  }
+
+  /** Leader rows and attribution of a deleted bot; global blocks stay */
   deleteForBot(botId: string): void {
     this.db.prepare('DELETE FROM copy_leaders WHERE bot_id = ?').run(botId);
     this.db.prepare('DELETE FROM copy_trades WHERE bot_id = ?').run(botId);

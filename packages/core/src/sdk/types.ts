@@ -372,6 +372,18 @@ export interface CopyLeaderStatus {
  */
 export interface CopyContext {
   getLeaders(addresses: string[]): Promise<CopyLeaderStatus[]>;
+  /**
+   * This bot's shares of `tokenId` (its mode) attributed to each leader whose buys it copied, net of that leader's
+   * open copied sells; a leader's sell may only unwind its own copies. `attributed` = all attributed shares (0 ⇒ no
+   * attribution, e.g. positions bought before attribution existed).
+   */
+  getHoldings(tokenId: string): Promise<CopyHoldings>;
+}
+
+/** Copied shares of one token per leader (ctx.copy.getHoldings). */
+export interface CopyHoldings {
+  byLeader: Record<string, number>;
+  attributed: number;
 }
 
 /** The Position Manager's risk-exit thresholds (ctx.risk.getExitPolicy). */
@@ -854,6 +866,7 @@ export type RpcMethod =
   | 'risk:getExitPolicy'
   | 'risk:getMandateSummary'
   | 'copy:getLeaders'
+  | 'copy:getHoldings'
   | 'bot:requestRetire'
   | 'ledger:getActiveForecasts'
   | 'ledger:getForecast'

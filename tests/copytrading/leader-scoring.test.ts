@@ -140,19 +140,21 @@ describe.skipIf(!sqliteAvailable)('CopyLeaderService', () => {
     if (leader) service.recordOrder('cb', orderId, { leader, side: side === 'BUY' ? 'buy' : 'sell', key: `k${n}` });
   }
 
-  it('syncs leaders with the config; removed come back with a new window; dropped stay dropped', () => {
+  it('syncs leaders with the config; removed come back active with their window kept', () => {
     service.sync('cb', { leaders: [A.toUpperCase().replace('0X', '0x'), B] }, 'agent');
     expect(service.leaders('cb').leaders.map((l) => [l.address, l.status, l.addedBy])).toEqual([
       [A, 'active', 'agent'],
       [B, 'active', 'agent'],
     ]);
-    service.sync('cb', { leaders: [A] }, 'human');
+    const since = service.leaders('cb').leaders.find((l) => l.address === B)!.activeSince;
+    service.sync('cb', { leaders: [A] }, 'agent');
     expect(service.leaders('cb').leaders.find((l) => l.address === B)!.status).toBe('removed');
     now += 60_000;
-    service.sync('cb', { traders: [A, B] }, 'human'); // pre-5c key
+    service.sync('cb', { traders: [A, B] }, 'agent'); // pre-5c key
     const b = service.leaders('cb').leaders.find((l) => l.address === B)!;
-    expect(b).toMatchObject({ status: 'active', addedBy: 'human' });
-    expect(b.activeSince).toBe(new Date(now).toISOString());
+    expect(b).toMatchObject({ status: 'active', addedBy: 'agent' });
+    // Removing and re-adding never resets the auto-drop window (review)
+    expect(b.activeSince).toBe(since);
   });
 
   it('auto-drops a leader whose last 20 copies lose (audited, Telegram), the bot sees it dropped; only a human re-activates', async () => {
@@ -200,6 +202,11 @@ describe.skipIf(!sqliteAvailable)('CopyLeaderService', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ actor: 'system', target: 'cb' });
     expect(notifier.send).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringMatching(/Copy leader dropped on cb: 0xaaaa/) }));
+    // Blocked everywhere for the agent: a new bot, and after this bot is deleted (review)
+    expect(service.blockedAmong(null, [A, B])).toEqual([A]);
+    t.addBot('cb2');
+    service.sync('cb2', { leaders: [B] }, 'agent');
+    expect(service.blockedAmong('cb2', [A, B])).toEqual([A]);
     // Sticky: a second evaluation does not re-drop or re-notify; the agent cannot re-activate
     service.evaluate('cb');
     expect(new AuditRepository(t.db).list({ action: 'copy.leader_dropped' })).toHaveLength(1);
@@ -214,6 +221,7 @@ describe.skipIf(!sqliteAvailable)('CopyLeaderService', () => {
     const after = service.leaders('cb').leaders.find((l) => l.address === A)!;
     expect(after).toMatchObject({ status: 'active', window: { trades: 0 } });
     expect(service.evaluate('cb')).toEqual([]);
+    expect(service.blockedAmong(null, [A, B])).toEqual([]);
     expect(service.digestText()).toMatch(/Copy leaders:\n- cb 0xaaaa…aaaa: active, 20 closed \/ 0 open, hit 40%, realised -\$4.00/);
     notify.stop?.();
   });
@@ -259,5 +267,120 @@ describe.skipIf(!sqliteAvailable)('Copy Trading v2 seed upgrade (5c)', () => {
     expect(builtinRoleOf(row)).toBe('copy');
     expect(JSON.parse(row.config_schema).properties.leaders).toBeTruthy();
     expect(t.botRepo.findById('old')!.stage).toBe('paper');
+  });
+});
+
+describe.skipIf(!sqliteAvailable)('CopyLeaderService blocks and holdings (5c review)', () => {
+  let t: TestDb;
+  let service: CopyLeaderService;
+  let repo: CopyLeaderRepository;
+  beforeEach(() => {
+    t = openTestDb();
+    t.addBot('cb');
+    repo = new CopyLeaderRepository(t.db);
+    service = new CopyLeaderService({
+      repo,
+      botRepo: t.botRepo,
+      audit: new AuditService(new AuditRepository(t.db)),
+      now: () => Date.parse('2026-06-01T00:00:00Z'),
+    });
+  });
+  afterEach(() => t.close());
+
+  it('a drop survives deleting the bot; a leader blocked elsewhere can stay on a bot it is active on; a human re-activation clears it', () => {
+    t.addBot('other');
+    service.sync('other', { leaders: [A] }, 'agent');
+    service.sync('cb', { leaders: [A] }, 'agent');
+    const row = repo.find('cb', A)!;
+    repo.drop(row.id, 'auto-drop: test', '2026-06-01T00:00:00Z');
+    repo.block(A, 'cb', 'auto-drop: test', '2026-06-01T00:00:00Z');
+    // Already active on `other`: keeping it there is allowed, adding it anywhere else is not
+    expect(service.blockedAmong('other', [A])).toEqual([]);
+    expect(service.blockedAmong(null, [A])).toEqual([A]);
+    service.forgetBot('cb');
+    expect(repo.list('cb')).toEqual([]);
+    expect(service.blockedAmong(null, [A])).toEqual([A]);
+    // The human clears the block from a bot that still lists the leader (not dropped there)
+    expect(service.leaders('other').leaders[0].blocked).toBe(true);
+    service.reactivate('other', A, asHuman('session:x'));
+    expect(service.blockedAmong(null, [A])).toEqual([]);
+  });
+
+  it("holdings: copied shares per leader for one token and mode, net of the leader's open copied sells", () => {
+    const fill = (id: string, side: 'BUY' | 'SELL', qty: number, min: number) =>
+      t.db
+        .prepare(
+          `INSERT INTO bot_trades (id, bot_id, side, exchange, symbol, price, quantity, quote_amount, simulated, order_id, fee_usd, executed_at, created_at)
+           VALUES (?, 'cb', ?, 'polymarket', 'tok', 0.5, ?, ?, 1, ?, 0, ?, ?)`
+        )
+        .run(`f-${id}`, side, qty, qty * 0.5, id, at(min), at(min));
+    fill('oa', 'BUY', 10, 0);
+    service.recordOrder('cb', 'oa', { leader: A, side: 'buy' });
+    fill('ob', 'BUY', 30, 1);
+    service.recordOrder('cb', 'ob', { leader: B, side: 'buy' });
+    t.orderRepo.create({
+      id: 'os',
+      botId: 'cb',
+      exchange: 'polymarket',
+      marketId: 'm',
+      tokenId: 'tok',
+      side: 'sell',
+      orderType: 'limit',
+      price: 0.6,
+      size: 12,
+      notionalUsd: 7.2,
+      status: 'open',
+      simulated: true,
+    });
+    service.recordOrder('cb', 'os', { leader: B, side: 'sell' });
+    expect(service.holdings('cb', 'tok', true)).toEqual({ byLeader: { [A]: 10, [B]: 18 }, attributed: 40 });
+    expect(service.holdings('cb', 'tok', false)).toEqual({ byLeader: {}, attributed: 0 });
+  });
+});
+
+describe.skipIf(!sqliteAvailable)('seed with a non-builtin script of the same name (5c review)', () => {
+  let t: TestDb;
+  beforeEach(() => {
+    t = openTestDb();
+  });
+  afterEach(() => t.close());
+
+  it('never touches a human / agent script named like a builtin, even with the new version; the builtin row is upgraded', async () => {
+    const { ScriptRepository } = await import('../../packages/core/src/db/repositories/ScriptRepository');
+    const { seedTemplates } = await import('../../packages/core/src/db/seed');
+    const fs = await import('fs');
+    const path = await import('path');
+    const scripts = new ScriptRepository(t.db);
+    const builtin = scripts.create({ name: 'Copy Trading', version: '1.0.0', source: 'old', compiled: 'x', isTemplate: true, origin: 'builtin' });
+    const mine = scripts.create({ name: 'Copy Trading', version: '2.0.0', source: 'my own code', compiled: 'y', origin: 'human' });
+    const agents = scripts.create({ name: 'Copy Trading', version: '1.0.1', source: 'agent code', compiled: 'z', origin: 'agent', isTemplate: false });
+    const source = fs.readFileSync(path.join(__dirname, '..', '..', 'templates', 'copy-trading.ts'), 'utf8');
+    const log = console.log;
+    console.log = () => {};
+    try {
+      await seedTemplates(scripts, [{ filename: 'copy-trading.ts', source }]);
+    } finally {
+      console.log = log;
+    }
+    expect(scripts.findById(mine.id)).toMatchObject({ source: 'my own code', version: '2.0.0', origin: 'human', revision: mine.revision });
+    expect(scripts.findById(agents.id)).toMatchObject({ source: 'agent code', origin: 'agent' });
+    // (name, version) is unique: the builtin keeps its version text but runs the new source
+    expect(scripts.findById(builtin.id)).toMatchObject({ version: '1.0.0', source, trust: 'new' });
+    expect(scripts.findAll().filter((r) => r.origin === 'builtin' && r.name === 'Copy Trading')).toHaveLength(1);
+    // Fresh install next to a human script holding the name and version: a separate builtin row is created
+    t.db.prepare('DELETE FROM scripts WHERE id = ?').run(builtin.id);
+    console.log = () => {};
+    try {
+      await seedTemplates(scripts, [{ filename: 'copy-trading.ts', source }]);
+    } finally {
+      console.log = log;
+    }
+    expect(
+      scripts
+        .findAll()
+        .filter((r) => r.origin === 'builtin' && r.name === 'Copy Trading')
+        .map((r) => r.version)
+    ).toEqual(['2.0.0-builtin']);
+    expect(scripts.findById(mine.id)).toMatchObject({ source: 'my own code' });
   });
 });
