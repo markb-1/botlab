@@ -9,6 +9,11 @@
  *   2. Detects new trades since last check
  *   3. Evaluates whether to copy (size limits, daily volume caps)
  *   4. Executes buy/sell orders proportional to the trader's bet
+ *
+ * Sells (hotfix, spec §9.5): ctx.sell takes TOKENS. A leader sell is copied as the same fraction of our
+ * position as the leader sold of theirs (leader position read from the data API); if that cannot be
+ * determined, the USD copy size is converted to tokens at the current bid. Always capped at what this
+ * bot holds (ctx.getPositions). Only activity rows with type TRADE are considered.
  */
 
 export const meta = {
@@ -153,12 +158,15 @@ async function pollTraders(ctx, traders: string[]) {
       const response = await ctx.fetch(
         `https://data-api.polymarket.com/activity?user=${trader}&limit=20`
       );
+      if (!response.ok) throw new Error(`activity API HTTP ${response.status}`);
       const activities = await response.json();
 
       if (!Array.isArray(activities)) continue;
 
-      // Filter new trades (API returns timestamps in seconds, convert to ms)
+      // Filter new trades (API returns timestamps in seconds, convert to ms).
+      // Only TRADE rows: REDEEM/SPLIT/MERGE/REWARD/CONVERSION are not trades to copy.
       const newTrades = activities.filter((a: any) => {
+        if (a.type !== 'TRADE') return false;
         const ts = (a.timestamp < 1e12 ? a.timestamp * 1000 : a.timestamp);
         return ts > lastCheck && (now - ts) < tooOldMs;
       });
@@ -168,8 +176,19 @@ async function pollTraders(ctx, traders: string[]) {
         totalNewTrades += newTrades.length;
       }
 
-      for (const trade of newTrades) {
-        await processTrade(ctx, trade, trader);
+      // Oldest first. For a sell, the leader's position right after it = their current position minus
+      // the net tokens they traded in this asset later in the batch.
+      const tsOf = (a: any) => (a.timestamp < 1e12 ? a.timestamp * 1000 : a.timestamp);
+      newTrades.sort((a: any, b: any) => tsOf(a) - tsOf(b));
+      for (let i = 0; i < newTrades.length; i++) {
+        const trade = newTrades[i];
+        let laterNetTokens = 0;
+        for (const later of newTrades.slice(i + 1)) {
+          if (later.asset !== trade.asset || tsOf(later) <= tsOf(trade)) continue;
+          const size = parseFloat(later.size || '0') || 0;
+          laterNetTokens += later.side === 'BUY' ? size : later.side === 'SELL' ? -size : 0;
+        }
+        await processTrade(ctx, trade, trader, laterNetTokens);
       }
 
       // Update last check timestamp
@@ -189,17 +208,73 @@ async function pollTraders(ctx, traders: string[]) {
   await ctx.storage.set('dailyVolumeDate', dailyVolumeDate);
 }
 
-async function processTrade(ctx, trade: any, traderAddress: string) {
+/**
+ * Token amount to sell when copying a leader's sell. Pure (unit-tested).
+ * - Leader's sold fraction known (sold tokens + leader's remaining position): sell that fraction of ours.
+ * - Otherwise: copy size in USD converted to tokens at `price`.
+ * Always capped at our held tokens; rounded down to 0.01 tokens.
+ */
+export function copySellSize(p: {
+  heldTokens: number;
+  leaderSoldTokens?: number | null;
+  leaderRemainingTokens?: number | null;
+  copyUsd: number;
+  price?: number | null;
+}): { tokens: number; basis: 'fraction' | 'usd' | 'none'; reason?: string } {
+  const held = Number(p.heldTokens);
+  if (!(held > 0)) return { tokens: 0, basis: 'none', reason: 'no position held' };
+
+  let tokens: number;
+  let basis: 'fraction' | 'usd';
+  const sold = Number(p.leaderSoldTokens);
+  const remaining = p.leaderRemainingTokens === null || p.leaderRemainingTokens === undefined ? NaN : Number(p.leaderRemainingTokens);
+  if (sold > 0 && Number.isFinite(sold) && remaining >= 0 && Number.isFinite(remaining)) {
+    const fraction = Math.min(1, sold / (sold + remaining));
+    tokens = held * fraction;
+    basis = 'fraction';
+  } else if (Number(p.price) > 0 && Number(p.copyUsd) > 0) {
+    tokens = Number(p.copyUsd) / Number(p.price);
+    basis = 'usd';
+  } else {
+    return { tokens: 0, basis: 'none', reason: 'leader fraction and price unknown' };
+  }
+
+  tokens = Math.floor(Math.min(tokens, held) * 100 + 1e-9) / 100;
+  if (!(tokens > 0)) return { tokens: 0, basis, reason: 'size rounds to zero' };
+  return { tokens, basis };
+}
+
+/** Leader's remaining position in `tokenId` after their sell, from the data API; null if unknown. */
+async function fetchLeaderRemaining(ctx, traderAddress: string, conditionId: string | undefined, tokenId: string): Promise<number | null> {
+  if (!conditionId) return null;
+  try {
+    const resp = await ctx.fetch(
+      `https://data-api.polymarket.com/positions?user=${traderAddress}&market=${conditionId}&sizeThreshold=0`
+    );
+    if (!resp.ok) return null;
+    const positions = await resp.json();
+    if (!Array.isArray(positions)) return null;
+    // If the API did not filter by market, "absent" would not mean "exited": treat as unknown
+    if (positions.some((x: any) => x.conditionId && String(x.conditionId).toLowerCase() !== String(conditionId).toLowerCase())) return null;
+    const pos = positions.find((x: any) => String(x.asset) === String(tokenId));
+    // Absent from the market's positions ⇒ the leader exited completely
+    return pos ? Math.max(0, parseFloat(pos.size) || 0) : 0;
+  } catch {
+    return null;
+  }
+}
+
+async function processTrade(ctx, trade: any, traderAddress: string, laterNetTokens = 0) {
   const config = ctx.config;
-  const side = trade.side || trade.type;
+  const side = trade.side;
   const tokenId = trade.asset || trade.tokenId;
   // API returns usdcSize (USD value) and size (token quantity) — use USD value for copy sizing
-  const traderSize = parseFloat(trade.usdcSize || trade.size || trade.amount || '0');
+  const traderSize = parseFloat(trade.usdcSize || '0') || (parseFloat(trade.size || '0') * parseFloat(trade.price || '0'));
 
   if (!tokenId || traderSize <= 0) return;
 
-  // Check daily volume limit
-  if (dailyVolume >= (config.maxDailyVolumeUsd || 500)) {
+  // Check daily volume limit (buys only: never block reducing a position)
+  if (side === 'BUY' && dailyVolume >= (config.maxDailyVolumeUsd || 500)) {
     ctx.log.warn('Daily volume limit reached, skipping trade');
     return;
   }
@@ -214,7 +289,7 @@ async function processTrade(ctx, trade: any, traderAddress: string) {
 
   // Enforce limits
   copySize = Math.min(copySize, config.maxOrderSizeUsd || 50);
-  if (copySize < (config.minOrderSizeUsd || 1)) {
+  if (side === 'BUY' && copySize < (config.minOrderSizeUsd || 1)) {
     ctx.log.debug(`Trade too small ($${copySize.toFixed(2)}), skipping`);
     return;
   }
@@ -225,7 +300,38 @@ async function processTrade(ctx, trade: any, traderAddress: string) {
     if (side === 'BUY') {
       result = await ctx.buy(tokenId, copySize);
     } else if (side === 'SELL') {
-      result = await ctx.sell(tokenId, copySize);
+      // ctx.sell takes tokens: mirror the leader's sold fraction, else USD → tokens; capped at our holding
+      const positions = await ctx.getPositions();
+      const held = (positions || []).find((p: any) => String(p.tokenId) === String(tokenId));
+      const heldTokens = held ? Number(held.size) || 0 : 0;
+      if (heldTokens <= 0) {
+        ctx.log.debug(`Leader sold ${String(tokenId).slice(0, 10)}... but we hold none, skipping`);
+        return;
+      }
+      const leaderNow = await fetchLeaderRemaining(ctx, traderAddress, trade.conditionId, tokenId);
+      const leaderRemaining = leaderNow === null ? null : Math.max(0, leaderNow - laterNetTokens);
+      let price: number | null = null;
+      if (leaderRemaining === null) {
+        try {
+          const mp = await ctx.getMarketPrice(tokenId);
+          price = mp.bid > 0 ? mp.bid : mp.mid;
+        } catch {
+          price = null;
+        }
+      }
+      const sizing = copySellSize({
+        heldTokens,
+        leaderSoldTokens: parseFloat(trade.size || '0'),
+        leaderRemainingTokens: leaderRemaining,
+        copyUsd: copySize,
+        price,
+      });
+      if (sizing.tokens <= 0) {
+        ctx.log.debug(`Sell not copied: ${sizing.reason}`);
+        return;
+      }
+      ctx.log.info(`Copying SELL: ${sizing.tokens} of ${heldTokens} tokens held (${sizing.basis})`);
+      result = await ctx.sell(tokenId, sizing.tokens);
     } else {
       ctx.log.debug(`Unknown trade side: ${side}`);
       return;

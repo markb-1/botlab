@@ -1,7 +1,7 @@
 import { ipcMain } from 'electron';
-import CryptoJS from 'crypto-js';
 import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
 import { keyManager } from '../../security/keyManager';
+import { decrypt } from '../../security/crypto';
 import { callClaude, extractCodeFromResponse } from '../../sdk/claude';
 import { buildSystemPrompt } from '../../sdk/claudeSystemPrompt';
 
@@ -14,7 +14,12 @@ function getClaudeApiKey(settingsRepo: SettingsRepository): string {
     throw new Error('No Claude API key configured. Add one in Settings.');
   }
   const encKey = keyManager.getKey();
-  const apiKey = CryptoJS.AES.decrypt(settings.claude_api_key_encrypted, encKey).toString(CryptoJS.enc.Utf8);
+  let apiKey = '';
+  try {
+    apiKey = decrypt(settings.claude_api_key_encrypted, encKey);
+  } catch {
+    /* reported below */
+  }
   if (!apiKey) {
     throw new Error('Failed to decrypt Claude API key. Try re-saving it in Settings.');
   }

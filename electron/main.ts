@@ -15,6 +15,7 @@ import {
 } from './database/repositories/index';
 import type { Database } from './database/index';
 import { keyManager } from './security/keyManager';
+import { migrateSecretsToV2 } from './security/migrateSecrets';
 import { WalletManager } from '../src/core/WalletManager';
 import { BotManager } from '../src/core/BotManager';
 import { registerAuthHandlers } from './ipc/handlers/authHandlers';
@@ -214,6 +215,14 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
   }
 
   console.log('[Main] Phase B: Initializing protected services...');
+
+  // 0. One-time re-encryption of legacy CryptoJS secrets to AES-256-GCM (idempotent, audited)
+  try {
+    migrateSecretsToV2(database, encryptionKey, audit);
+  } catch (err) {
+    console.error('[Main] Secret migration failed (legacy secrets stay readable):', err);
+    audit.record('system', 'secrets.migrate_v2', null, { error: err instanceof Error ? err.message : String(err) }, 'error');
+  }
 
   // 1. Initialize wallet manager with the derived encryption key
   const walletManager = new WalletManager(walletRepo, encryptionKey);

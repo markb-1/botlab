@@ -6,24 +6,18 @@
  */
 
 import type { ScriptRepository } from './repositories/ScriptRepository';
+import { compileScript } from '../runtime/compileScript';
 
 /**
- * Compile TypeScript source to JavaScript using esbuild.
+ * Compile a template with the sandbox compiler (imports rejected, spec §5.1).
  */
 async function compileSource(source: string): Promise<string | null> {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const esbuild = require('esbuild');
-    const result = await esbuild.transform(source, {
-      loader: 'ts',
-      target: 'es2022',
-      format: 'cjs',
-    });
-    return result.code;
-  } catch (err) {
-    console.warn('[Seed] Compilation failed:', err);
+  const result = await compileScript(source);
+  if ('error' in result) {
+    console.warn('[Seed] Compilation failed:', result.error);
     return null;
   }
+  return result.code;
 }
 
 // Template definitions embedded directly to avoid file path issues in packaged apps

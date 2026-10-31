@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { evaluateScript } from '../../electron/runtime/sandbox';
 
 /**
  * Tests for the worker-bootstrap onTick integration.
@@ -13,14 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Simulate the script module extraction logic from worker-bootstrap
 function extractScriptModule(compiledCode: string) {
-  const moduleExports: Record<string, unknown> = {};
-  const moduleObj = { exports: moduleExports };
-
-  // eslint-disable-next-line no-new-func
-  const factory = new Function('module', 'exports', 'require', 'ctx', compiledCode);
-  factory(moduleObj, moduleExports, require, {});
-
-  const exports = moduleObj.exports as Record<string, unknown>;
+  const exports = evaluateScript(compiledCode, {});
 
   // Validation (same as worker-bootstrap.ts)
   if (typeof exports.onStart !== 'function' && typeof exports.onTick !== 'function') {

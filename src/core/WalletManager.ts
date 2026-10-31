@@ -1,4 +1,4 @@
-import CryptoJS from 'crypto-js';
+import { encrypt, decrypt } from '../../electron/security/crypto';
 import { ethers } from 'ethers';
 import type { WalletCredentials, WalletRecord } from './types';
 import type { WalletRepository } from '../../electron/database/repositories/WalletRepository';
@@ -16,8 +16,8 @@ export class WalletManager {
     if (!encryptionKey) {
       throw new Error('Encryption key is not set');
     }
-    if (encryptionKey.length < 32) {
-      throw new Error('Encryption key must be at least 32 characters long');
+    if (!/^[0-9a-fA-F]{64}$/.test(encryptionKey)) {
+      throw new Error('Encryption key must be 64 hex characters (32 bytes)');
     }
     this.encryptionKey = encryptionKey;
     this.walletRepo = walletRepo;
@@ -35,7 +35,8 @@ export class WalletManager {
     // Remove 0x prefix if present
     const cleanKey = privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey;
 
-    return CryptoJS.AES.encrypt(cleanKey, this.encryptionKey).toString();
+    // AES-256-GCM (v2); legacy CryptoJS rows are still readable and migrated at unlock
+    return encrypt(cleanKey, this.encryptionKey);
   }
 
   /**
@@ -47,8 +48,7 @@ export class WalletManager {
     }
 
     try {
-      const decrypted = CryptoJS.AES.decrypt(encryptedKey, this.encryptionKey);
-      const privateKey = decrypted.toString(CryptoJS.enc.Utf8);
+      const privateKey = decrypt(encryptedKey, this.encryptionKey);
 
       if (!privateKey) {
         throw new Error('Decryption failed - invalid key or corrupted data');

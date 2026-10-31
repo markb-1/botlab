@@ -325,7 +325,7 @@ export function Scripts() {
               <section>
                 <h4 className="text-xs font-semibold uppercase tracking-widest text-accent mb-3">HTTP</h4>
                 <div className="space-y-2">
-                  <ApiMethod sig="ctx.fetch(url, init?)" ret="Promise<Response>" desc="Make HTTP requests to any external API (ESPN, CoinGecko, etc.)" />
+                  <ApiMethod sig="ctx.fetch(url, init?)" ret="Promise<Response-like>" desc="HTTPS GET/POST to allowlisted hosts only (Polymarket gamma/data/clob, Binance API by default; limits.yaml server.script_fetch_allowlist)" />
                 </div>
               </section>
 

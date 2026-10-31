@@ -2,10 +2,14 @@
  * Worker Bootstrap - runs inside each worker thread.
  * Receives compiled script code via workerData, creates BotContext,
  * and manages the script lifecycle (start/stop/heartbeat).
+ *
+ * Sandbox (spec §5.1, limits in sandbox.ts): escape-hatch globals (process, fetch, ...) are deleted
+ * before the script is evaluated; the script gets only module/exports/ctx.
  */
 
-import { parentPort, workerData } from 'worker_threads';
+import { parentPort as maybeParentPort, workerData } from 'worker_threads';
 import { createBotContext, handleRpcResponse } from './BotContextProxy';
+import { evaluateScript, hardenWorkerGlobals } from './sandbox';
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
@@ -13,9 +17,12 @@ import type {
   RpcResponse,
 } from '../sdk/types';
 
-if (!parentPort) {
+if (!maybeParentPort) {
   throw new Error('worker-bootstrap must run inside a worker thread');
 }
+const parentPort = maybeParentPort;
+// Keep our own reference: the global is removed before the script runs
+const proc = process;
 
 // Extract data passed from main thread
 const {
@@ -46,17 +53,11 @@ const ctx = createBotContext({
 // Load the compiled script module
 let scriptModule: ScriptModule;
 
+hardenWorkerGlobals();
+
 try {
   // The compiled code should export { onStart?, onTick?, onStop?, onHeartbeat?, meta? }
-  // We use Function constructor to evaluate the compiled CommonJS module
-  const moduleExports: Record<string, unknown> = {};
-  const moduleObj = { exports: moduleExports };
-
-  // eslint-disable-next-line no-new-func
-  const factory = new Function('module', 'exports', 'require', 'ctx', compiledCode);
-  factory(moduleObj, moduleExports, require, ctx);
-
-  const exports = moduleObj.exports as Record<string, unknown>;
+  const exports = evaluateScript(compiledCode, ctx);
 
   if (typeof exports.onStart !== 'function' && typeof exports.onTick !== 'function') {
     throw new Error('Script must export at least one of: onStart, onTick');
@@ -73,11 +74,28 @@ try {
   const message = err instanceof Error ? err.message : String(err);
   const msg: WorkerToMainMessage = { type: 'error', error: `Script load error: ${message}` };
   parentPort.postMessage(msg);
-  process.exit(1);
+  proc.exit(1);
 }
 
 function send(msg: WorkerToMainMessage): void {
-  parentPort!.postMessage(msg);
+  parentPort.postMessage(msg);
+}
+
+// onTick runs one at a time (a tick still in flight skips the next interval). tick-start/tick-end
+// let the main thread's watchdog see a tick that never settles, even if this thread is blocked.
+let tickSeq = 0;
+let tickInFlight = false;
+async function runTick(): Promise<void> {
+  if (tickInFlight) return;
+  tickInFlight = true;
+  const id = ++tickSeq;
+  send({ type: 'tick-start', id });
+  try {
+    await scriptModule.onTick!(ctx);
+  } finally {
+    tickInFlight = false;
+    send({ type: 'tick-end', id });
+  }
 }
 
 // Handle messages from main process
@@ -93,7 +111,7 @@ parentPort.on('message', async (msg: MainToWorkerMessage) => {
         // Start onTick polling loop if defined
         if (scriptModule.onTick) {
           const intervalMs = (config.pollingIntervalMs as number) || 10000;
-          ctx.setInterval(() => scriptModule.onTick!(ctx), intervalMs);
+          ctx.setInterval(runTick, intervalMs);
         }
 
         send({ type: 'started' });
@@ -134,11 +152,11 @@ parentPort.on('message', async (msg: MainToWorkerMessage) => {
 });
 
 // Handle uncaught errors in the worker
-process.on('uncaughtException', (err) => {
+proc.on('uncaughtException', (err) => {
   send({ type: 'error', error: `Uncaught: ${err.message}` });
 });
 
-process.on('unhandledRejection', (reason) => {
+proc.on('unhandledRejection', (reason) => {
   const msg = reason instanceof Error ? reason.message : String(reason);
   send({ type: 'error', error: `Unhandled rejection: ${msg}` });
 });

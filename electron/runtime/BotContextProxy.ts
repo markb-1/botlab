@@ -34,6 +34,8 @@ import type {
   RiskBudget,
   RpcRequest,
   RpcResponse,
+  ScriptFetchInit,
+  ScriptResponse,
 } from '../sdk/types';
 import { calculateKelly, DEFAULT_KELLY_CONFIG } from '../../src/utils/kellyCalculator';
 
@@ -71,6 +73,34 @@ export function handleRpcResponse(response: RpcResponse): void {
       pending.resolve(response.result);
     }
   }
+}
+
+interface FetchResultWire {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+}
+
+/** ctx.fetch: the request runs in the main process; the result is wrapped in a Response-like object. */
+async function scriptFetchProxy(url: unknown, init?: ScriptFetchInit): Promise<ScriptResponse> {
+  // Only plain data crosses the boundary (URL objects, Headers, streams are not supported)
+  const wireInit = init
+    ? { method: init.method, headers: init.headers ? { ...init.headers } : undefined, body: init.body }
+    : undefined;
+  const r = (await rpcCall('fetch', String(url), wireInit)) as FetchResultWire;
+  const headers = new Map(Object.entries(r.headers ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+  return {
+    ok: r.ok,
+    status: r.status,
+    statusText: r.statusText,
+    url: r.url,
+    headers: { get: (name: string) => headers.get(String(name).toLowerCase()) ?? null },
+    text: async () => r.body,
+    json: async <T = unknown>() => JSON.parse(r.body) as T,
+  };
 }
 
 /**
@@ -130,8 +160,8 @@ export function createBotContext(params: {
     getEvent: (eventSlug: string) =>
       rpcCall('polymarket:getEvent', eventSlug) as Promise<PolymarketEvent>,
 
-    // HTTP (runs directly in worker - full autonomy)
-    fetch: globalThis.fetch,
+    // HTTP: proxied to the main process (allowlisted hosts only, see scriptFetch.ts)
+    fetch: (url: string, init?: ScriptFetchInit) => scriptFetchProxy(url, init),
 
     // Scheduling (local in worker, tracked for cleanup)
     setInterval: (fn: () => void | Promise<void>, ms: number): string => {

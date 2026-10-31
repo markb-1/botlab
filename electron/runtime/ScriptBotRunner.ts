@@ -13,6 +13,7 @@ import { PaperTradingState } from './PaperTradingState';
 import type { BotStorageRepository } from '../database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
 import type { OrderService } from '../orders/OrderService';
+import logger from '../../src/utils/logger';
 
 /** Builds the bot's OrderService (BotManager supplies it; throws if orders cannot be risk-checked). */
 export type OrderServiceFactory = (args: {
@@ -39,6 +40,8 @@ export interface ScriptBotRunnerDeps {
   binanceApiSecret?: string;
   /** Without it the bot runs but every order call fails (fail closed) */
   createOrderService?: OrderServiceFactory;
+  /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist) */
+  fetchAllowlist?: readonly string[];
 }
 
 const DEFAULT_PAPER_BALANCE = 10_000;
@@ -78,6 +81,7 @@ export class ScriptBotRunner extends BaseBotRunner {
       clobHttpUrl: this.deps.clobHttpUrl,
       binanceApiKey: this.deps.binanceApiKey,
       binanceApiSecret: this.deps.binanceApiSecret,
+      fetchAllowlist: this.deps.fetchAllowlist,
     };
 
     // Create paper trading state if in paper mode
@@ -121,6 +125,18 @@ export class ScriptBotRunner extends BaseBotRunner {
 
     this.scriptRunner.on('log', (logData: { botId: string; level: string; message: string }) => {
       this.emitEvent('log', logData);
+    });
+
+    // Tick watchdog / unexpected worker exit (spec §5.1)
+    this.scriptRunner.on('tick-timeout', ({ strikes, elapsedMs }: { strikes: number; elapsedMs: number }) => {
+      const message = `onTick still running after ${Math.round(elapsedMs / 1000)} s (watchdog strike ${strikes})`;
+      logger.warning(`[Script:${this.botName}] ${message}`);
+      this.emitEvent('log', { botId: this.botId, level: 'warn', message });
+    });
+
+    this.scriptRunner.on('fatal', ({ message, reason }: { message: string; reason: string }) => {
+      this.scriptRunner = null;
+      void this.markFailed(message, { reason });
     });
 
     this.scriptRunner.on('heartbeat', ({ metrics }: { metrics: Record<string, unknown> }) => {

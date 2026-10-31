@@ -20,7 +20,7 @@ Scripts execute in sandboxed Node.js worker threads, completely isolated from th
 - Scripts CANNOT access the filesystem, database, or main process directly.
 - ALL trading, market data, and storage calls go through \`ctx\` — an RPC bridge to the main process.
 - Scripts CANNOT import external npm modules. The script is self-contained.
-- For HTTP requests to external APIs, use \`ctx.fetch(url, init?)\` which works like the standard Fetch API.
+- For HTTP requests use \`ctx.fetch(url, init?)\`: https GET/POST only, to allowlisted hosts (default: gamma-api/data-api/clob.polymarket.com, api.binance.com), 10 s timeout, 2 MB max. Returns { ok, status, headers.get(), text(), json() }.
 
 ### Lifecycle
 1. The app compiles your TypeScript to JavaScript using esbuild.
@@ -205,7 +205,7 @@ interface BotContext {
   binance: BinanceContext;
 
   // ── HTTP ──
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  fetch(url: string, init?: { method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string }): Promise<{ ok: boolean; status: number; headers: { get(name: string): string | null }; text(): Promise<string>; json(): Promise<any> }>;
 
   // ── Scheduling (auto-cleaned on stop) ──
   setInterval(fn: () => void | Promise<void>, ms: number): string;

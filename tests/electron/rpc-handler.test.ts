@@ -182,9 +182,15 @@ describe('RpcHandler', () => {
       expect(resp.result).toHaveLength(1);
     });
 
-    it('should delegate to trading SDK in live mode', async () => {
-      await liveHandler.handle(makeReq('polymarket:getPositions'));
-      expect(getPositions).toHaveBeenCalledWith(deps.clobClient);
+    it("should return the bot's order-linked live positions in live mode", async () => {
+      const getRiskPositions = vi.fn().mockReturnValue([
+        { bot_id: 'bot-1', exchange: 'polymarket', symbol: 'tok', condition_id: '0xc', net_quantity: 40, cost_basis: 20 },
+      ]);
+      (deps.tradeRepo as any).getRiskPositions = getRiskPositions;
+      const resp = await liveHandler.handle(makeReq('polymarket:getPositions'));
+      expect(getRiskPositions).toHaveBeenCalledWith({ simulated: false, botId: 'bot-1', exchange: 'polymarket' });
+      expect(getPositions).not.toHaveBeenCalled();
+      expect(resp.result).toEqual([{ tokenId: 'tok', conditionId: '0xc', size: 40, currentValue: 20, avgPrice: 0.5 }]);
     });
   });
 

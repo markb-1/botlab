@@ -174,7 +174,8 @@ declare interface BotContext {
 
   // === HTTP ===
   /** Make HTTP requests to external APIs */
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  /** https GET/POST to allowlisted hosts only (limits.yaml server.script_fetch_allowlist); 10 s, 2 MB */
+  fetch(url: string, init?: { method?: 'GET' | 'POST'; headers?: Record<string, string>; body?: string }): Promise<{ ok: boolean; status: number; statusText: string; url: string; headers: { get(name: string): string | null }; text(): Promise<string>; json<T = any>(): Promise<T> }>;
 
   // === Scheduling (auto-cleaned on stop) ===
   /** Run a function on an interval. Returns a handle for clearInterval. */

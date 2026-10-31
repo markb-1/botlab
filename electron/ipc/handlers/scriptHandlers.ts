@@ -3,25 +3,7 @@ import * as fs from 'fs';
 import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
 import type { IpcScript } from '../types';
 import type { AuditService } from '../../audit/AuditService';
-
-/**
- * Compile TypeScript source to JavaScript using esbuild.
- * Returns the compiled code or null if compilation fails.
- */
-async function compileScript(source: string): Promise<{ code: string } | { error: string }> {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const esbuild = require('esbuild');
-    const result = await esbuild.transform(source, {
-      loader: 'ts',
-      target: 'es2022',
-      format: 'cjs',
-    });
-    return { code: result.code };
-  } catch (err: any) {
-    return { error: err.message || 'Compilation failed' };
-  }
-}
+import { compileScript } from '../../runtime/compileScript';
 
 /** .botlab file format */
 interface BotLabScriptFile {

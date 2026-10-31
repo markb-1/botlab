@@ -47,6 +47,11 @@ binance:
   allocation_usd: 100
 server:
   start_halted_after_crash: true     # after an unclean shutdown, start with a global halt (clear it by hand)
+  script_fetch_allowlist:            # hosts bot scripts may reach via ctx.fetch (https, GET/POST only)
+    - gamma-api.polymarket.com
+    - data-api.polymarket.com
+    - clob.polymarket.com
+    - api.binance.com
 `;
 
 export const DEFAULT_MANDATE_YAML = `# BotLab agent mandate (spec §3.2). Human-owned: the agent can read but never write this file.

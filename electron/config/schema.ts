@@ -29,6 +29,14 @@ const dayRange = z
 
 // ─── limits.yaml (§3.1) ──────────────────────────────────────────────
 
+/** Default ctx.fetch allowlist: Polymarket gamma/data/clob and the Binance public API. */
+export const DEFAULT_SCRIPT_FETCH_ALLOWLIST = [
+  'gamma-api.polymarket.com',
+  'data-api.polymarket.com',
+  'clob.polymarket.com',
+  'api.binance.com',
+] as const;
+
 export const LimitsSchema = z.strictObject({
   global: z
     .strictObject({
@@ -98,6 +106,15 @@ export const LimitsSchema = z.strictObject({
     .strictObject({
       // Spec §4.3 puts this in server.yaml; kept here until that file exists
       start_halted_after_crash: z.boolean().default(true),
+      // Hosts bot scripts may reach through ctx.fetch (spec §5.1; server.yaml later). Exact host names, https only.
+      script_fetch_allowlist: z
+        .array(
+          z
+            .string()
+            .regex(/^[a-z0-9.-]+$/i, 'must be a bare host name (no scheme, port or path)')
+            .transform((h) => h.toLowerCase())
+        )
+        .default([...DEFAULT_SCRIPT_FETCH_ALLOWLIST]),
     })
     .prefault({}),
 });

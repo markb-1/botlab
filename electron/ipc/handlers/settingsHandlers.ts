@@ -1,8 +1,8 @@
 import { ipcMain } from 'electron';
-import CryptoJS from 'crypto-js';
 import type { SettingsRepository } from '../../database/repositories/SettingsRepository';
 import type { IpcSettings } from '../types';
 import { keyManager } from '../../security/keyManager';
+import { encrypt, decrypt } from '../../security/crypto';
 import { testConnection } from '../../sdk/binance';
 import { testClaudeConnection } from '../../sdk/claude';
 
@@ -59,8 +59,8 @@ export function registerSettingsHandlers(
   ipcMain.handle('settings:saveBinance', async (_event, data: { apiKey: string; apiSecret: string }) => {
     try {
       const encKey = keyManager.getKey();
-      const encryptedKey = CryptoJS.AES.encrypt(data.apiKey, encKey).toString();
-      const encryptedSecret = CryptoJS.AES.encrypt(data.apiSecret, encKey).toString();
+      const encryptedKey = encrypt(data.apiKey, encKey);
+      const encryptedSecret = encrypt(data.apiSecret, encKey);
 
       const updated = settingsRepo.updateBinanceCredentials({
         binanceApiKeyEncrypted: encryptedKey,
@@ -110,8 +110,8 @@ export function registerSettingsHandlers(
           return { success: false, error: 'No Binance credentials configured.' };
         }
         const encKey = keyManager.getKey();
-        apiKey = CryptoJS.AES.decrypt(settings.binance_api_key_encrypted, encKey).toString(CryptoJS.enc.Utf8);
-        apiSecret = CryptoJS.AES.decrypt(settings.binance_api_secret_encrypted, encKey).toString(CryptoJS.enc.Utf8);
+        apiKey = decrypt(settings.binance_api_key_encrypted, encKey);
+        apiSecret = decrypt(settings.binance_api_secret_encrypted, encKey);
       }
 
       await testConnection({ apiKey, apiSecret });
@@ -160,7 +160,7 @@ export function registerSettingsHandlers(
   ipcMain.handle('settings:saveClaude', async (_event, data: { apiKey: string }) => {
     try {
       const encKey = keyManager.getKey();
-      const encrypted = CryptoJS.AES.encrypt(data.apiKey, encKey).toString();
+      const encrypted = encrypt(data.apiKey, encKey);
 
       const updated = settingsRepo.updateClaudeCredentials({
         claudeApiKeyEncrypted: encrypted,
@@ -204,7 +204,7 @@ export function registerSettingsHandlers(
           return { success: false, error: 'No Claude API key configured.' };
         }
         const encKey = keyManager.getKey();
-        apiKey = CryptoJS.AES.decrypt(settings.claude_api_key_encrypted, encKey).toString(CryptoJS.enc.Utf8);
+        apiKey = decrypt(settings.claude_api_key_encrypted, encKey);
       }
 
       await testClaudeConnection(apiKey);

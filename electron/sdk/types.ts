@@ -33,8 +33,8 @@ export interface BotContext {
   getMarketPrice(tokenId: string): Promise<MarketPrice>;
   getEvent(eventSlug: string): Promise<PolymarketEvent>;
 
-  // === HTTP (runs directly in worker) ===
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  // === HTTP (proxied to the main process; allowlisted hosts, https, GET/POST, 10 s, 2 MB) ===
+  fetch(url: string, init?: ScriptFetchInit): Promise<ScriptResponse>;
 
   // === Scheduling (tracked for cleanup on stop) ===
   setInterval(fn: () => void | Promise<void>, ms: number): string;
@@ -65,6 +65,24 @@ export interface BotContext {
 
   // === Risk budget (read-only) ===
   risk: RiskContext;
+}
+
+/** ctx.fetch options (spec §5.1): GET or POST, string body, plain header object. */
+export interface ScriptFetchInit {
+  method?: 'GET' | 'POST';
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/** Minimal Response-like object returned by ctx.fetch. */
+export interface ScriptResponse {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  url: string;
+  headers: { get(name: string): string | null };
+  text(): Promise<string>;
+  json<T = unknown>(): Promise<T>;
 }
 
 // ============================================================================
@@ -474,7 +492,8 @@ export type RpcMethod =
   | 'binance:getBalance'
   | 'binance:getOrderBook'
   | 'binance:getPrice'
-  | 'binance:getPositions';
+  | 'binance:getPositions'
+  | 'fetch';
 
 export interface RpcRequest {
   id: string;
@@ -503,4 +522,7 @@ export type WorkerToMainMessage =
   | { type: 'stopped' }
   | { type: 'error'; error: string }
   | { type: 'heartbeat-result'; metrics: Record<string, unknown> }
-  | { type: 'rpc-request'; request: RpcRequest };
+  | { type: 'rpc-request'; request: RpcRequest }
+  /** onTick began / settled (main-side tick watchdog) */
+  | { type: 'tick-start'; id: number }
+  | { type: 'tick-end'; id: number };

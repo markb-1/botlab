@@ -34,7 +34,7 @@ import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepo
 import type { LimitsConfig } from '../../electron/config';
 import { getBalance } from '../../electron/sdk/trading';
 import { getBinanceBalance, getBinanceOrderBook } from '../../electron/sdk/binance';
-import CryptoJS from 'crypto-js';
+import { decrypt } from '../../electron/security/crypto';
 import { keyManager } from '../../electron/security/keyManager';
 import logger from '../utils/logger';
 
@@ -300,8 +300,8 @@ export class BotManager extends EventEmitter {
     if (settings.binance_api_key_encrypted && settings.binance_api_secret_encrypted && keyManager.isReady()) {
       try {
         const encKey = keyManager.getKey();
-        result.binanceApiKey = CryptoJS.AES.decrypt(settings.binance_api_key_encrypted, encKey).toString(CryptoJS.enc.Utf8);
-        result.binanceApiSecret = CryptoJS.AES.decrypt(settings.binance_api_secret_encrypted, encKey).toString(CryptoJS.enc.Utf8);
+        result.binanceApiKey = decrypt(settings.binance_api_key_encrypted, encKey);
+        result.binanceApiSecret = decrypt(settings.binance_api_secret_encrypted, encKey);
       } catch {
         logger.error('Failed to decrypt Binance credentials');
       }
@@ -493,6 +493,7 @@ export class BotManager extends EventEmitter {
       binanceApiKey: settings.binanceApiKey,
       binanceApiSecret: settings.binanceApiSecret,
       createOrderService: this.createOrderService,
+      fetchAllowlist: this.getLimits()?.server.script_fetch_allowlist,
     });
 
     // Forward events
@@ -504,6 +505,7 @@ export class BotManager extends EventEmitter {
         } catch {
           /* best effort */
         }
+        if (event.data?.fatal) this.onBotFatal(botId, instance, event.data);
       }
       this.emit('bot:event', event);
     });
@@ -554,6 +556,25 @@ export class BotManager extends EventEmitter {
     });
 
     logger.info(`Bot ${bot.name} (${botId}) started (${mode})`);
+  }
+
+  /**
+   * The bot's worker was terminated by the tick watchdog or died while running (spec §5.1):
+   * forget the instance, persist status `error`, audit.
+   */
+  private onBotFatal(botId: string, instance: BaseBotRunner, data: Record<string, unknown>): void {
+    if (this.instances.get(botId) !== instance) return;
+    this.instances.delete(botId);
+    this.orderServices.delete(botId);
+    const message = String(data.message ?? 'worker died');
+    try {
+      this.botRepo.update(botId, { status: 'error', lastStoppedAt: new Date().toISOString() });
+      this.botRepo.appendError(botId, message);
+    } catch (err) {
+      logger.error(`Could not record fatal error for bot ${botId}: ${err instanceof Error ? err.message : err}`);
+    }
+    this.orderDeps?.audit?.record('system', 'bot.error', botId, { reason: data.reason ?? 'unknown', message }, 'terminated');
+    logger.error(`Bot ${botId} terminated: ${message}`);
   }
 
   /**

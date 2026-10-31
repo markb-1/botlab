@@ -19,7 +19,7 @@ vi.mock('ethers', () => ({
   },
 }));
 
-const VALID_KEY = 'a'.repeat(32);
+const VALID_KEY = 'a'.repeat(64);
 const SAMPLE_HEX_KEY = 'ab'.repeat(32); // 64 hex chars
 
 function makeMockRepo() {
@@ -85,7 +85,7 @@ describe('WalletManager', () => {
 
     it('should throw when encryption key is too short', () => {
       expect(() => new WalletManager(repo as unknown as WalletRepository, 'short')).toThrow(
-        'at least 32 characters'
+        '64 hex characters'
       );
     });
 
@@ -118,7 +118,7 @@ describe('WalletManager', () => {
 
     it('should throw when decrypting with wrong key', () => {
       const encrypted = manager.encryptPrivateKey(SAMPLE_HEX_KEY);
-      const otherManager = new WalletManager(repo as unknown as WalletRepository, 'b'.repeat(32));
+      const otherManager = new WalletManager(repo as unknown as WalletRepository, 'b'.repeat(64));
       expect(() => otherManager.decryptPrivateKey(encrypted)).toThrow('Failed to decrypt');
     });
   });

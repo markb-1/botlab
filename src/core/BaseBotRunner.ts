@@ -162,6 +162,25 @@ export abstract class BaseBotRunner extends EventEmitter {
   }
 
   /**
+   * The bot's runtime died or was terminated while running (e.g. tick watchdog): release the wallet,
+   * set status `error` and emit a fatal `error` event (BotManager persists and audits it).
+   */
+  protected async markFailed(message: string, data: Record<string, unknown> = {}): Promise<void> {
+    if (this._status !== 'running') return;
+    this.stopHeartbeat();
+    try {
+      await this.walletManager.releaseWallet(this.walletId);
+    } catch {
+      logger.error(`[${this.botName}] Failed to release wallet after a fatal error`);
+    }
+    this.walletCredentials = null;
+    this.startTime = null;
+    logger.error(`[${this.botName}] Fatal: ${message}`);
+    this.setStatus('error');
+    this.emitEvent('error', { ...data, message, fatal: true });
+  }
+
+  /**
    * Get health information for this bot instance
    */
   getHealthInfo(): BotHealthInfo {

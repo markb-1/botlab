@@ -15,7 +15,6 @@ import type { PaperTradingState } from './PaperTradingState';
 import {
   getOrderBook,
   getMarketPrice,
-  getPositions,
   getBalance,
 } from '../sdk/trading';
 import {
@@ -26,6 +25,7 @@ import {
 } from '../sdk/binance';
 import type { BinanceCredentials } from '../sdk/binance';
 import { toTradeResult, type OrderResult, type OrderService } from '../orders/OrderService';
+import { scriptFetch } from './scriptFetch';
 import logger from '../../src/utils/logger';
 
 export interface RpcHandlerDeps {
@@ -47,6 +47,10 @@ export interface RpcHandlerDeps {
    * order goes through OrderService and the RiskEngine. Missing ⇒ order methods fail.
    */
   orderService?: OrderService;
+  /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist); default list if unset */
+  fetchAllowlist?: readonly string[];
+  /** Test hook: replaces the global fetch used by ctx.fetch */
+  fetchImpl?: typeof fetch;
 }
 
 /** Legacy ctx.binance.buy/sell result from an OrderService result. */
@@ -184,11 +188,22 @@ export class RpcHandler {
           args[0] as string
         );
 
-      case 'polymarket:getPositions':
+      case 'polymarket:getPositions': {
         if (this.isPaper) {
           return this.paperState!.getPositions();
         }
-        return getPositions(this.deps.clobClient);
+        // Live: this bot's order-linked holdings, i.e. exactly what the risk engine lets it sell (R8).
+        // Valued at cost (no mark); currentValue = cost basis.
+        return this.deps.tradeRepo
+          .getRiskPositions({ simulated: false, botId: this.deps.botId, exchange: 'polymarket' })
+          .map((p) => ({
+            tokenId: p.symbol,
+            conditionId: p.condition_id ?? undefined,
+            size: p.net_quantity,
+            currentValue: p.cost_basis,
+            avgPrice: p.net_quantity > 0 ? p.cost_basis / p.net_quantity : 0,
+          }));
+      }
 
       case 'polymarket:getBalance': {
         if (this.isPaper) {
@@ -229,6 +244,11 @@ export class RpcHandler {
         } catch (err) {
           throw new Error(`Failed to fetch event: ${err instanceof Error ? err.message : err}`);
         }
+
+      // === HTTP (allowlisted, executed here so the worker has no network access of its own) ===
+
+      case 'fetch':
+        return scriptFetch(args[0], args[1], { allowlist: this.deps.fetchAllowlist, fetchImpl: this.deps.fetchImpl });
 
       // === Storage ===
 

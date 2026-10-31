@@ -283,4 +283,20 @@ describe('ScriptBotRunner', () => {
       expect(health.metrics).toEqual({});
     });
   });
+
+  describe('fatal worker errors (tick watchdog)', () => {
+    it('marks the bot error, releases the wallet and emits a fatal error event', async () => {
+      await runner.start();
+      const events: any[] = [];
+      runner.on('bot:error', (e) => events.push(e));
+
+      mockScriptRunnerInstance.emit('fatal', { message: 'onTick hung', reason: 'tick_watchdog' });
+      await new Promise((r) => setImmediate(r));
+
+      expect(runner.status).toBe('error');
+      expect(walletManager.releaseWallet).toHaveBeenCalledWith('wallet-1');
+      expect(events).toHaveLength(1);
+      expect(events[0].data).toMatchObject({ fatal: true, reason: 'tick_watchdog', message: 'onTick hung' });
+    });
+  });
 });
