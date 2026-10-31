@@ -166,6 +166,48 @@ describe('position manager: cycle', () => {
     expect(f.exit).toHaveBeenCalledWith(expect.objectContaining({ marketable: true, size: 20, price: 0.61 }));
   });
 
+  it('F2: a refused marketable exit falls back to a resting exit one tick above the bid, retried marketable only later', async () => {
+    const flag = { id: 'fl', botId: 'b1', tokenId: 'yes1', marketId: 'm1', reason: 'thesis broken', createdBy: 'agent', createdAt: '' };
+    const p = position({ exitFlag: flag });
+    const thin = { yes1: book(0.5, 0.53) };
+    const started = { 'exit:b1:yes1': { startedAt: NOW - 40 * MIN, kind: 'flag', openedAt: p.openedAt } };
+    let f = fakeCtx([p], { storage: started, books: thin });
+    f.exit
+      .mockResolvedValueOnce({ ok: false, status: 'rejected_risk', failedCheck: 'top_of_book', error: 'Top of book $16.5 < $200', orderId: 'r1' })
+      .mockResolvedValueOnce({ ok: true, status: 'open', orderId: 'e2' });
+    let r = await runManagerCycle(f.ctx);
+    expect(f.exit).toHaveBeenCalledTimes(2);
+    expect(f.exit.mock.calls[0][0]).toMatchObject({ marketable: true });
+    expect(f.exit.mock.calls[1][0]).toMatchObject({ size: 20, price: 0.51 });
+    expect(f.exit.mock.calls[1][0].marketable).toBeUndefined();
+    expect(r.exits).toEqual([expect.objectContaining({ kind: 'flag', marketable: false, status: 'open' })]);
+    const saved = f.store.get('exit:b1:yes1') as { marketableRefusedAt: number };
+    expect(saved.marketableRefusedAt).toBe(NOW);
+
+    // Next cycle (2 min later), the fallback rests at the same price: kept, no new marketable attempt
+    const resting = { orderId: 'e2', orderType: 'limit', price: 0.51, size: 20, filledSize: 0, status: 'open', placedByMe: true, createdAt: '', expiresAt: null };
+    const withExit = position({ exitFlag: flag, openSellSize: 20, available: 0, exitOrders: [resting] });
+    f = fakeCtx([withExit], { storage: { 'exit:b1:yes1': saved }, books: thin, now: NOW + 2 * MIN });
+    r = await runManagerCycle(f.ctx);
+    expect(f.exit).not.toHaveBeenCalled();
+    expect(f.cancelExit).not.toHaveBeenCalled();
+
+    // The bid moved: the fallback follows it (still resting, never left without an exit order)
+    f = fakeCtx([withExit], { storage: { 'exit:b1:yes1': saved }, books: { yes1: book(0.47, 0.5) }, now: NOW + 4 * MIN });
+    (f.ctx as any).portfolio.getAllPositions.mockResolvedValueOnce([withExit]).mockResolvedValueOnce([p]);
+    await runManagerCycle(f.ctx);
+    expect(f.cancelExit).toHaveBeenCalledWith('e2');
+    expect(f.exit).toHaveBeenCalledTimes(1);
+    expect(f.exit.mock.calls[0][0]).toMatchObject({ price: 0.48 });
+    expect(f.exit.mock.calls[0][0].marketable).toBeUndefined();
+
+    // After the retry window the marketable exit is tried again
+    f = fakeCtx([withExit], { storage: { 'exit:b1:yes1': saved }, books: thin, now: NOW + 11 * MIN });
+    (f.ctx as any).portfolio.getAllPositions.mockResolvedValueOnce([withExit]).mockResolvedValueOnce([p]);
+    await runManagerCycle(f.ctx);
+    expect(f.exit.mock.calls[0][0]).toMatchObject({ marketable: true });
+  });
+
   it('cancels its exits when the trigger is gone', async () => {
     const mine = { orderId: 'e0', orderType: 'limit', price: 0.64, size: 20, filledSize: 0, status: 'open', placedByMe: true, createdAt: '', expiresAt: null };
     const f = fakeCtx([position({ openSellSize: 20, available: 0, exitOrders: [mine] })], { books: { yes1: book(0.55, 0.57) } });

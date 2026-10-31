@@ -25,8 +25,11 @@
  *   - stop:         best bid ≤ entry − `stop_loss_move` and the forecast was not renewed since entry
  * Exits rest post-only first (take-profit at max(best bid + tick, fair − margin), others one tick inside the
  * ask); after `escalate_after_minutes` without a full exit (or with the end closer than the escalation
- * window) they go marketable at best bid − `escalate_slippage`. Exits of positions whose trigger disappeared
- * are cancelled. `ignore_bot_ids` leaves bots alone.
+ * window) they go marketable at best bid − `escalate_slippage`. When the risk engine refuses the marketable exit
+ * (e.g. a thin top of book), the exit rests post-only at the lowest non-crossing price (one tick above the best
+ * bid) instead, and the marketable attempt is retried only after `MARKETABLE_RETRY_MINUTES`: a position with an
+ * active trigger is never left without an exit order. Exits of positions whose trigger disappeared are
+ * cancelled. `ignore_bot_ids` leaves bots alone.
  */
 
 export const meta = {
@@ -115,6 +118,8 @@ const DEMAND_MAX_AGE_MS = 3_600_000;
 const MIN_MS = 60_000;
 const MIN_PRICE = 0.01;
 const MAX_PRICE = 0.99;
+/** After a refused marketable exit, rest at the fallback price this long before trying marketable again */
+export const MARKETABLE_RETRY_MINUTES = 10;
 
 export interface ManagerConfig {
   takeProfitMargin: number;
@@ -242,6 +247,17 @@ interface ExitState {
   kind: ExitKind;
   /** The position this state belongs to (a later position in the same token starts afresh) */
   openedAt: string | null;
+  /** Last time a marketable exit was refused (rests at the fallback price until the retry window passed) */
+  marketableRefusedAt?: number;
+}
+
+/**
+ * Resting fallback when a marketable exit is refused: the lowest price that does not cross (one tick above the
+ * best bid; it may join the best ask), else the trigger's own resting price; null when the book is empty.
+ */
+export function fallbackExitPrice(top: Top, restingPrice: number | null): number | null {
+  if (top.bestBid === null) return restingPrice;
+  return Math.min(Math.max(ceilTick(top.bestBid + top.tick, top.tick), MIN_PRICE), MAX_PRICE);
 }
 
 const stateKey = (p: { botId: string; tokenId: string }) => `exit:${p.botId}:${p.tokenId}`;
@@ -316,21 +332,28 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
     if (!valid) await ctx.storage.set(key, state);
 
     const minutesToEnd = p.market?.endDate ? (Date.parse(p.market.endDate) - now) / MIN_MS : Infinity;
-    const escalate =
+    const wantMarketable =
       decision.restingPrice === null ||
       now - state.startedAt >= cfg.escalateAfterMinutes * MIN_MS ||
       (decision.kind !== 'take_profit' && minutesToEnd <= cfg.escalateAfterMinutes);
+    const fallback = fallbackExitPrice(top, decision.restingPrice);
+    // A recent refusal of the marketable exit: keep resting at the fallback until the retry window passed (F2)
+    const refusedRecently =
+      wantMarketable &&
+      typeof state.marketableRefusedAt === 'number' &&
+      now - state.marketableRefusedAt < MARKETABLE_RETRY_MINUTES * MIN_MS &&
+      fallback !== null;
+    const escalate = wantMarketable && !refusedRecently;
+    const restingPrice = refusedRecently ? (fallback as number) : decision.restingPrice;
 
     // Everything we can sell: what is free plus what our own exits hold (they are replaced)
     const mineRemaining = mine.reduce((n, o) => n + Math.max(o.size - o.filledSize, 0), 0);
     const size = Math.floor((p.available + mineRemaining) * 100) / 100;
     if (!(size > 0)) continue;
 
-    if (!escalate) {
-      const price = decision.restingPrice as number;
-      const same = mine.length === 1 && mine[0].orderType === 'limit' && Math.abs(mine[0].price - price) < 1e-9 && Math.abs(mine[0].size - mine[0].filledSize - size) < 0.01;
-      if (same) continue;
-    }
+    const sameResting = (price: number) =>
+      mine.length === 1 && mine[0].orderType === 'limit' && Math.abs(mine[0].price - price) < 1e-9 && Math.abs(mine[0].size - mine[0].filledSize - size) < 0.01;
+    if (!escalate && sameResting(restingPrice as number)) continue;
     for (const o of mine) {
       try {
         await ctx.portfolio.cancelExit(o.orderId);
@@ -343,24 +366,38 @@ export async function runManagerCycle(ctx: BotContext): Promise<CycleResult> {
     const sellable = fresh ? Math.floor(fresh.available * 100) / 100 : 0;
     if (!(sellable > 0)) continue;
 
-    const r = escalate
-      ? await ctx.portfolio.exit({
-          botId: p.botId,
-          tokenId: p.tokenId,
-          size: sellable,
-          marketable: true,
-          ...(top.bestBid !== null ? { price: Math.max(floorTick(top.bestBid - cfg.escalateSlippage, top.tick), MIN_PRICE) } : {}),
-          reason: `${decision.kind} (marketable): ${decision.reason}`,
-        })
-      : await ctx.portfolio.exit({
-          botId: p.botId,
-          tokenId: p.tokenId,
-          size: sellable,
-          price: decision.restingPrice as number,
-          ttlMinutes: Math.max(3, cfg.checkMinutes * 3),
-          reason: `${decision.kind}: ${decision.reason}`,
-        });
-    out.exits.push({ botId: p.botId, tokenId: p.tokenId, kind: decision.kind, size: sellable, marketable: escalate, status: r.status });
+    const resting = (price: number, reason: string) =>
+      ctx.portfolio.exit({
+        botId: p.botId,
+        tokenId: p.tokenId,
+        size: sellable,
+        price,
+        ttlMinutes: Math.max(3, cfg.checkMinutes * 3),
+        reason,
+      });
+
+    let r: OrderResult;
+    let marketable = escalate;
+    if (escalate) {
+      r = await ctx.portfolio.exit({
+        botId: p.botId,
+        tokenId: p.tokenId,
+        size: sellable,
+        marketable: true,
+        ...(top.bestBid !== null ? { price: Math.max(floorTick(top.bestBid - cfg.escalateSlippage, top.tick), MIN_PRICE) } : {}),
+        reason: `${decision.kind} (marketable): ${decision.reason}`,
+      });
+      if (!r.ok && fallback !== null) {
+        // Refused (e.g. top of book too thin): never leave the position without an exit order (F2)
+        ctx.log.warn(`position manager: marketable exit of ${p.botName ?? p.botId} ${p.tokenId} refused (${r.error ?? r.status}); resting at ${fallback}`);
+        await ctx.storage.set(key, { ...state, marketableRefusedAt: now });
+        r = await resting(fallback, `${decision.kind} (fallback, marketable refused): ${decision.reason}`);
+        marketable = false;
+      }
+    } else {
+      r = await resting(restingPrice as number, `${decision.kind}${refusedRecently ? ' (fallback, marketable refused)' : ''}: ${decision.reason}`);
+    }
+    out.exits.push({ botId: p.botId, tokenId: p.tokenId, kind: decision.kind, size: sellable, marketable, status: r.status });
     if (!r.ok) ctx.log.warn(`position manager: exit of ${p.botName ?? p.botId} ${p.tokenId} (${decision.kind}) not placed: ${r.error ?? r.status}`);
   }
   return out;
