@@ -65,19 +65,20 @@ export const RESOURCES: ResourceDef[] = [
 
 export const TEMPLATE_URI_PREFIX = 'botlab://templates/';
 
-/** `botlab://templates/{id}`: one template's metadata and source */
-export function readTemplate(services: CoreServices, id: string): string {
+/** `botlab://templates/{id}`: one template's metadata and source (stored text: wrapped as untrusted by the server, R147) */
+export function readTemplate(services: CoreServices, id: string): Record<string, unknown> {
   const summary = services.scripts.templates().find((t) => t.id === id);
   if (!summary) throw notFound(`No template ${id}`);
   const script = services.scripts.get(id);
-  return JSON.stringify({ ...summary, source: script.source }, null, 2);
+  return { ...summary, source: script.source };
 }
 
 export function listTemplateResources(services: CoreServices): Array<{ uri: string; name: string; description: string; mimeType: string }> {
   return services.scripts.templates().map((t) => ({
     uri: `${TEMPLATE_URI_PREFIX}${t.id}`,
-    name: `template: ${t.name}`,
-    description: `${t.origin} template r${t.revision} (trust ${t.trust})${t.description ? ` — ${t.description.slice(0, 200)}` : ''}`,
+    // No stored text (names / descriptions) in the listing: read the resource, where it is wrapped as untrusted
+    name: `template ${t.id}`,
+    description: `${t.origin} template r${t.revision} (trust ${t.trust}${t.builtin ? ', builtin' : ''})`,
     mimeType: 'application/json',
   }));
 }

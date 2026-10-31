@@ -759,6 +759,7 @@ export function createCore(options: CoreOptions): Core {
         await botManager.shutdown();
       }
       await recorder.stop().catch((error) => console.error('[Core] Error stopping recorder:', error));
+      await services.scripts.close().catch((error) => console.error('[Core] Error stopping the typecheck worker:', error));
       await backups?.stop().catch((error) => console.error('[Core] Error stopping backups:', error));
       await ledger.stop().catch((error) => console.error('[Core] Error stopping ledger scorer:', error));
       await marketCache.stop().catch((error) => console.error('[Core] Error stopping market cache:', error));

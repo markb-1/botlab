@@ -5,6 +5,7 @@
  *
  *   BOTLAB_URL          server base URL (default http://127.0.0.1:3780)
  *   BOTLAB_AGENT_TOKEN  an agent-scope API token (`npm run cli -- token create --scope agent --name claude`)
+ *   BOTLAB_ALLOW_INSECURE=1  allow sending the token over plain http to another host (see insecureUrlReason)
  *
  * Run: `node dist/apps/server/src/mcp-stdio.js` (after `npm run build`) or `npm run mcp:stdio:dev`.
  * stdout carries the protocol only; diagnostics go to stderr.
@@ -26,6 +27,8 @@ export interface StdioProxyOptions {
   /** fetch override (tests) */
   fetch?: typeof fetch;
   log?: (message: string) => void;
+  /** Allow plain http to a non-loopback, non-Tailscale host (BOTLAB_ALLOW_INSECURE=1) */
+  allowInsecure?: boolean;
 }
 
 export interface StdioProxy {
@@ -36,6 +39,26 @@ export interface StdioProxy {
 
 const isRequest = (m: JSONRPCMessage): m is JSONRPCMessage & { id: string | number; method: string } => 'method' in m && 'id' in m;
 
+/** 100.64.0.0/10 (Tailscale CGNAT addresses) */
+function isTailscaleIpv4(host: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  return !!m && Number(m[1]) === 100 && Number(m[2]) >= 64 && Number(m[2]) <= 127;
+}
+
+/**
+ * Why sending the bearer token to this URL is unsafe, or null (R148). https: always fine. Plain http: only
+ * to loopback (localhost, 127.0.0.0/8, ::1) or over Tailscale (a `*.ts.net` MagicDNS name or a 100.64.0.0/10
+ * address — WireGuard encrypts the traffic); anything else needs BOTLAB_ALLOW_INSECURE=1.
+ */
+export function insecureUrlReason(url: URL): string | null {
+  if (url.protocol === 'https:') return null;
+  if (url.protocol !== 'http:') return `unsupported protocol ${url.protocol}`;
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host === '::1' || /^127\./.test(host)) return null;
+  if (host.endsWith('.ts.net') || isTailscaleIpv4(host)) return null;
+  return `refusing to send the agent token over plain http to ${host}: use https, a loopback or Tailscale address, or set BOTLAB_ALLOW_INSECURE=1`;
+}
+
 export function mcpEndpoint(baseUrl: string): URL {
   const base = baseUrl.trim().replace(/\/+$/, '');
   return new URL(base.endsWith('/mcp') ? base : `${base}/mcp`);
@@ -43,6 +66,8 @@ export function mcpEndpoint(baseUrl: string): URL {
 
 export async function startStdioProxy(opts: StdioProxyOptions): Promise<StdioProxy> {
   const log = opts.log ?? ((m: string) => process.stderr.write(`[botlab-mcp] ${m}\n`));
+  const insecure = insecureUrlReason(mcpEndpoint(opts.url));
+  if (insecure && !opts.allowInsecure) throw new Error(insecure);
   const server = new StdioServerTransport(opts.stdin, opts.stdout);
   const client = new StreamableHTTPClientTransport(mcpEndpoint(opts.url), {
     requestInit: { headers: { Authorization: `Bearer ${opts.token}` } },
@@ -102,7 +127,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   const url = process.env.BOTLAB_URL?.trim() || DEFAULT_BOTLAB_URL;
-  const proxy = await startStdioProxy({ url, token, stdin: process.stdin, stdout: process.stdout });
+  const proxy = await startStdioProxy({ url, token, stdin: process.stdin, stdout: process.stdout, allowInsecure: process.env.BOTLAB_ALLOW_INSECURE === '1' });
   process.stderr.write(`[botlab-mcp] proxying stdio to ${mcpEndpoint(url).href}\n`);
   process.stdin.once('end', () => void proxy.close());
   await proxy.closed;

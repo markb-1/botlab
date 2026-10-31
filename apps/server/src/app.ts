@@ -68,7 +68,10 @@ export function createApp(opts: AppOptions): BotLabApp {
   });
 
   registerAuthRoutes(app, core, { lockReason: opts.lockReason ?? (() => null), limiter: opts.limiter, loopbackOnly: opts.loopbackOnly ?? false });
-  mountRoutes(app, apiRoutes(core.services));
+  mountRoutes(app, apiRoutes(core.services), {
+    before: (actor, name) => core.services.agent.beforeToolCall(name, actor),
+    after: (runId, action) => core.services.agent.afterToolCall(runId, action),
+  });
 
   app.get('/api/app/info', (c) => {
     try {

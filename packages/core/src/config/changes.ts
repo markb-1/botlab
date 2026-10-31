@@ -133,6 +133,7 @@ const LIMIT_RULES: Record<string, Rule> = {
   'agent.max_active_bots': 'up',
   'agent.max_run_cost_usd': 'up',
   'agent.max_tool_calls_per_run': 'up',
+  'agent.max_tool_calls_per_hour': 'up',
   'approvals.new_template_live': 'disable',
   'binance.enabled': 'enable',
   'binance.max_order_usd': 'up',

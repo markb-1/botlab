@@ -5,8 +5,10 @@
  * tool-call cap) live in the services, so the HTTP API and MCP behave the same.
  *
  * Every description states the tool's risk impact. Tools whose output carries third-party text (market
- * questions and rules, bot log lines, trader names, rationales quoting the web) set `untrusted` so the
- * result is wrapped as untrusted data (spec §7.5; `server.ts`).
+ * questions and rules, bot log lines, trader names, rationales quoting the web) and stored agent- or
+ * human-written text (bot / script names, descriptions, source, notes, run summaries) is wrapped as untrusted
+ * data (spec §7.5; `server.ts`). Wrapping is the default; only tools whose output is numbers, ids and
+ * BotLab-computed state opt out with `trustedOutput` (R147).
  *
  * Not exposed, by design (spec §4.6, §7.3): wallets, credentials, settings, config writes, raw order
  * placement, SQL, clearing halts, the human ambiguity assessment, category-rights overrides, deleting bots,
@@ -66,8 +68,10 @@ export interface ToolDef {
   group: ToolGroup;
   description: string;
   input: z.ZodObject;
-  /** The output contains third-party text: wrapped as untrusted data, labelled with this source */
+  /** Label of the untrusted-data block (default: stored BotLab text) */
   untrusted?: string;
+  /** The output holds only numbers, ids and BotLab-computed state: not wrapped (R147) */
+  trustedOutput?: boolean;
   /** Reads only (MCP annotation readOnlyHint) */
   readOnly?: boolean;
   /** Irreversible or broad effect (annotation destructiveHint) */
@@ -140,6 +144,7 @@ export const TOOLS: ToolDef[] = [
     input: OrderbookInputSchema,
     readOnly: true,
     target: (a) => a.tokenId as string,
+    trustedOutput: true,
     run: (a, { services }) => services.markets.orderbook(a.tokenId, a.depth),
   }),
   def({
@@ -149,6 +154,7 @@ export const TOOLS: ToolDef[] = [
     input: PriceHistoryInputSchema,
     readOnly: true,
     target: (a) => a.tokenId as string,
+    trustedOutput: true,
     run: (a, { services }) => services.markets.priceHistory(a.tokenId, { interval: a.interval, fidelityMinutes: a.fidelityMinutes }),
   }),
   def({
@@ -262,6 +268,7 @@ export const TOOLS: ToolDef[] = [
     description: `Per (category, horizon) bucket: rights state (shadow / trading / suspended / deprioritised), scored count, skill and its lower bound, convergence, allocation cap, mandate listing, expected date to the trading threshold. ${NO_RISK}`,
     input: empty,
     readOnly: true,
+    trustedOutput: true,
     run: (_a, { services }) => services.ledger.stats(),
   }),
   def({
@@ -437,6 +444,7 @@ export const TOOLS: ToolDef[] = [
       'EMERGENCY: global halt — stops every bot and cancels every open order. Only a human can clear it. Use only for genuine emergencies. Risk: stops all trading.',
     input: AgentKillSwitchSchema,
     destructive: true,
+    trustedOutput: true,
     run: (a, { services, actor }) => services.risk.killSwitch(a.reason, actor),
   }),
   def({
@@ -445,6 +453,7 @@ export const TOOLS: ToolDef[] = [
     description: 'Add a token to the order-book recorder watchlist (snapshots for future backtests). Risk: none.',
     input: WatchlistAddSchema,
     target: (a) => a.tokenId as string,
+    trustedOutput: true,
     run: (a, { services, actor }) => {
       services.reconcile.watchlistAdd(a.tokenId, a.marketId, a.note, actor);
       return { watching: a.tokenId };
@@ -456,6 +465,7 @@ export const TOOLS: ToolDef[] = [
     description: 'Remove a token from the recorder watchlist. Risk: none.',
     input: UnwatchInputSchema,
     target: (a) => a.tokenId as string,
+    trustedOutput: true,
     run: (a, { services, actor }) => services.reconcile.watchlistRemove(a.tokenId, actor),
   }),
   def({
@@ -471,23 +481,24 @@ export const TOOLS: ToolDef[] = [
     description: 'Delete a note. Risk: none.',
     input: NoteIdSchema,
     target: (a) => a.id as string,
+    trustedOutput: true,
     run: (a, { services, actor }) => services.agent.deleteNote(a.id, actor),
   }),
   def({
     name: 'start_run',
     group: 'operate',
     description:
-      'Start an agent run (one at a time; refused when this month’s LLM budget is used up). Returns the budget (incl. max_run_cost_usd and max_tool_calls_per_run) and the last run. Tool calls in the run are counted; after the cap only finish_run and kill_switch work. Risk: none.',
+      'Start an agent run (one at a time; refused when this month’s LLM budget is used up). Returns the budget (incl. max_run_cost_usd, max_tool_calls_per_run and max_tool_calls_per_hour) and the last run. Calls are counted per run and per hour; after a cap only finish_run and kill_switch work. Risk: none.',
     input: StartRunSchema,
     run: (a, { services, actor }) => services.agent.startRun({ trigger: a.trigger }, actor),
   }),
   def({
     name: 'finish_run',
     group: 'operate',
-    description: 'End the open run with a markdown summary (sent to the owner by Telegram) and, if known, token counts and cost. Risk: none.',
+    description:
+      'End the open run with a markdown summary (sent to the owner by Telegram). Cost and tokens are recorded by the BotLab runner, not by you. Risk: none.',
     input: FinishRunSchema,
-    run: (a, { services, actor }) =>
-      services.agent.finishRun({ summaryMd: a.summary_md, status: a.status, tokensIn: a.tokens_in, tokensOut: a.tokens_out, costUsd: a.cost_usd }, actor),
+    run: (a, { services, actor }) => services.agent.finishRun({ summaryMd: a.summary_md, status: a.status }, actor),
   }),
 ];
 

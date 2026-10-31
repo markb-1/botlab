@@ -221,16 +221,16 @@ export const LeaderboardInputSchema = z.object({
   wallet: z.string().regex(/^0x[0-9a-fA-F]{40}$/).optional().describe('Also return this wallet’s recent activity'),
   activityLimit: z.number().int().min(1).max(200).optional(),
 });
-export const ValidateScriptSchema = z.object({ source: z.string().min(1).max(200_000).describe('TypeScript bot script') });
+export const ValidateScriptSchema = z.object({ source: z.string().min(1).max(65_536).describe('TypeScript bot script (≤ 64 KB)') });
 export const CreateTemplateSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().max(2000).optional(),
-  source: z.string().min(1).max(200_000),
+  source: z.string().min(1).max(65_536),
   configSchema: jsonObject.optional().describe('JSON Schema of the bot config (also exported as meta.configSchema)'),
 });
 export const UpdateTemplateSchema = z.object({
   templateId: z.string().min(1).max(100),
-  source: z.string().min(1).max(200_000).optional(),
+  source: z.string().min(1).max(65_536).optional(),
   description: z.string().max(2000).optional(),
   configSchema: jsonObject.optional(),
 });
@@ -261,12 +261,10 @@ export const WriteNoteSchema = z.object({
 });
 export const NoteIdSchema = z.object({ id: z.string().min(1).max(100) });
 export const StartRunSchema = z.object({ trigger: z.enum(['manual', 'schedule', 'event']).optional() });
-export const FinishRunSchema = z.object({
+/** Strict: the agent cannot report cost or tokens (the runner records them, R146) */
+export const FinishRunSchema = z.strictObject({
   summary_md: z.string().min(1).max(20_000).describe('Run report (markdown), sent to the owner'),
   status: z.enum(['ok', 'error', 'aborted']).optional(),
-  tokens_in: z.number().int().nonnegative().optional(),
-  tokens_out: z.number().int().nonnegative().optional(),
-  cost_usd: z.number().nonnegative().optional().describe('LLM cost of this run, if known'),
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

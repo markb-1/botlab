@@ -563,10 +563,15 @@ export class BotService {
   }
 
   async delete(id: string, by: Actor): Promise<void> {
-    const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'bots.delete'));
+    const who = requireActor(by, ['human', 'agent'], 'bots.delete');
+    const actor = auditActorOf(who);
     const { botRepo, walletRepo, audit } = this.deps;
     // Check if the bot has a paper wallet that should be cleaned up
     const botRow = botRepo.findById(id);
+    if (who.kind === 'agent') {
+      if (!botRow) throw notFound('Bot not found');
+      this.requireAgentOwned(botRow, 'bot.delete');
+    }
     const paperWalletId = botRow?.wallet_id;
     const wallet = paperWalletId ? walletRepo.findById(paperWalletId) : undefined;
     const isPaperWallet = wallet?.is_paper === 1;
@@ -628,8 +633,15 @@ export class BotService {
     return this.get(id);
   }
 
+  /** Restart (starts a stopped bot too): the agent needs ownership exactly as for start (R134) */
   async restart(id: string, by: Actor): Promise<void> {
-    await this.manager().restartBot(id, auditActorOf(requireActor(by, ['human', 'agent', 'system'], 'bots.restart')));
+    const who = requireActor(by, ['human', 'agent', 'system'], 'bots.restart');
+    if (who.kind === 'agent') {
+      const row = this.deps.botRepo.findById(id);
+      if (!row) throw notFound('Bot not found');
+      this.requireAgentOwned(row, 'bot.restart');
+    }
+    await this.manager().restartBot(id, auditActorOf(who));
   }
 
   /** Open positions from order-linked fills (paper and/or live), optionally one bot / market (spec §7.3 get_positions) */

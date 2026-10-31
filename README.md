@@ -223,8 +223,10 @@ with an **agent-scope token only** (a readonly token or the admin session is ref
 do goes through the same core services and rules as the UI: its bots are paper bots on their own paper wallet,
 it may change / start / retire only bots it created (it may pause any), bot creation is capped by
 `limits.yaml` `agent.max_bots_created_per_day` / `max_active_bots`, its ambiguity assessments can only set or
-raise a score (never lower it or override yours), and runs stop at `agent.monthly_llm_budget_usd` and
-`max_tool_calls_per_run`. It cannot touch limits, the mandate, wallets, credentials, settings or orders, and
+raise a score (never lower it or override yours), new runs are refused once `agent.monthly_llm_budget_usd` is
+used, and tool calls are capped per run (`max_tool_calls_per_run`) and per token per hour
+(`max_tool_calls_per_hour`, also for its `/api` calls). LLM cost is recorded only by BotLab's agent runner (4b):
+**interactive use from Claude Code / Claude Desktop is not cost-tracked by BotLab** (that bill is your client's). It cannot touch limits, the mandate, wallets, credentials, settings or orders, and
 cannot clear halts. Every tool call is in the audit log (`mcp.<tool>`, actor `agent`). The Agent page shows
 runs, notes, budget and exit flags.
 
@@ -267,7 +269,9 @@ database: it forwards every message to the running server's `/mcp` with the toke
 
 On Windows use `"args": ["C:\\Users\\you\\botlab\\dist\\apps\\server\\src\\mcp-stdio.js"]`. The same
 proxy works for Claude Code (`claude mcp add botlab -e BOTLAB_URL=http://127.0.0.1:3780 -e BOTLAB_AGENT_TOKEN=blt_… -- node /path/to/mcp-stdio.js`).
-Revoking the token (`npm run cli -- token revoke <id>` or Settings) cuts the agent off at once.
+Revoking the token (`npm run cli -- token revoke <id>` or Settings) cuts the agent off at once. The proxy refuses
+to send the token over plain `http://` except to loopback or Tailscale (`*.ts.net`, 100.64.0.0/10); use https
+or set `BOTLAB_ALLOW_INSECURE=1` to override.
 
 Tool results that contain third-party text (market questions and rules, names, log lines) are wrapped in
 `<untrusted_data>` blocks and the guide tells the agent not to follow instructions in them; the real protection

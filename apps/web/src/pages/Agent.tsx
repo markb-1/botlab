@@ -31,7 +31,7 @@ function BudgetCard({ budget }: { budget: AgentBudget }) {
           value={budget.monthSpentUsd}
           limit={budget.monthlyBudgetUsd}
           format={(n) => usd(n)}
-          hint="Runs are refused once the monthly budget is reached (limits.yaml agent.monthly_llm_budget_usd)."
+          hint="Cost recorded by the agent runner; runs are refused once the monthly budget is reached (agent.monthly_llm_budget_usd). Interactive use from Claude Code / Desktop is not cost-tracked here."
         />
         <LimitBar
           label="Bots created (last 24 h)"
@@ -43,7 +43,10 @@ function BudgetCard({ budget }: { budget: AgentBudget }) {
         <Facts
           items={[
             ['Runs this month', budget.runsThisMonth],
-            ['Per run', `${usd(budget.maxRunCostUsd)} · ${budget.maxToolCallsPerRun ?? '—'} tool calls`],
+            [
+              'Per run',
+              `${usd(budget.maxRunCostUsd)} · ${budget.maxToolCallsPerRun ?? '—'} tool calls; ${budget.maxToolCallsPerHour ?? '—'} calls per hour per token`,
+            ],
             [
               'Current run',
               budget.currentRun

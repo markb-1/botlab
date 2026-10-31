@@ -7,11 +7,15 @@
  *   limits cannot be read (fail closed).
  * - One run at a time; a run open for more than 30 minutes is closed as `timeout` when the next one starts
  *   (or on the next tool call).
- * - Tool calls during an open run are counted; beyond `max_tool_calls_per_run` every tool except
- *   `finish_run` and `kill_switch` is refused. Calls outside a run (interactive use) are not counted but
- *   are still audited by the transport.
- * - `max_run_cost_usd` is reported to the runner (4b), which stops a run above it; `finish_run` records
- *   the cost and flags an overrun.
+ * - Every agent call (MCP tool or /api request) is checked and counted **synchronously** in
+ *   `beforeToolCall`, before the call does any work, so parallel calls cannot overshoot (R146):
+ *   per token in a rolling hour (`max_tool_calls_per_hour`, in memory, independent of runs: finishing and
+ *   starting a run does not reset it), and within the open run (`max_tool_calls_per_run`). Beyond either,
+ *   every tool except `finish_run` and `kill_switch` is refused.
+ * - Cost and token usage are never reported by the agent: only a system actor (the 4b runner) records them
+ *   (`recordRunUsage`), also on a run that already finished or timed out. The monthly budget counts that
+ *   recorded cost only; interactive use through Claude Code / Desktop is not cost-tracked by BotLab (the
+ *   LLM bill is the client's). `max_run_cost_usd` is reported to the runner, which stops a run above it.
  */
 
 import type {
@@ -87,6 +91,7 @@ export interface AgentBudgetView {
   remainingUsd: number | null;
   maxRunCostUsd: number | null;
   maxToolCallsPerRun: number | null;
+  maxToolCallsPerHour: number | null;
   runsThisMonth: number;
   botsCreatedLast24h: number;
   maxBotsCreatedPerDay: number | null;
@@ -192,6 +197,7 @@ export class AgentService {
       remainingUsd: a ? Math.max(0, a.monthly_llm_budget_usd - spent) : null,
       maxRunCostUsd: a?.max_run_cost_usd ?? null,
       maxToolCallsPerRun: a?.max_tool_calls_per_run ?? null,
+      maxToolCallsPerHour: a?.max_tool_calls_per_hour ?? null,
       runsThisMonth: this.deps.runRepo.countSince(startIso),
       botsCreatedLast24h: this.deps.botRepo.countCreatedSince('agent', this.iso(this.now() - 86_400_000)),
       maxBotsCreatedPerDay: a?.max_bots_created_per_day ?? null,
@@ -230,11 +236,11 @@ export class AgentService {
     return { run: runView(row), budget: this.budget(), lastRun: lastRow ? runView(lastRow) : null };
   }
 
-  /** Close the open run with the summary (spec §7.2 step 7); sends the Telegram run report */
-  finishRun(
-    input: { runId?: unknown; summaryMd: unknown; status?: unknown; tokensIn?: unknown; tokensOut?: unknown; costUsd?: unknown },
-    by: Actor
-  ): AgentRunView {
+  /**
+   * Close the open run with the summary (spec §7.2 step 7); sends the Telegram run report. The agent cannot
+   * report cost or tokens (R146): `recordRunUsage` (system actor) does.
+   */
+  finishRun(input: { runId?: unknown; summaryMd: unknown; status?: unknown }, by: Actor): AgentRunView {
     const who = requireActor(by, ['agent', 'human', 'system'], 'agent.finishRun');
     const actor = auditActorOf(who);
     const summary = typeof input.summaryMd === 'string' ? input.summaryMd.trim() : '';
@@ -242,23 +248,17 @@ export class AgentService {
     if (summary.length > MAX_SUMMARY_CHARS) throw invalidInput(`summary_md must be at most ${MAX_SUMMARY_CHARS} characters`);
     const status = input.status ?? 'ok';
     if (status !== 'ok' && status !== 'error' && status !== 'aborted') throw invalidInput('status must be ok, error or aborted');
-    const tokensIn = Math.floor(nonNegative(input.tokensIn, 'tokens_in'));
-    const tokensOut = Math.floor(nonNegative(input.tokensOut, 'tokens_out'));
-    const costUsd = nonNegative(input.costUsd, 'cost_usd');
     const row = typeof input.runId === 'string' && input.runId ? this.deps.runRepo.findById(input.runId) : this.deps.runRepo.findRunning();
     if (!row) throw notFound(typeof input.runId === 'string' && input.runId ? 'Run not found' : 'No run in progress (call start_run first)');
     if (row.status !== 'running') throw conflict(`Run ${row.id} is already ${row.status}`);
-    const done = this.deps.runRepo.finish(row.id, { status, finishedAt: this.iso(), summaryMd: summary, tokensIn, tokensOut, costUsd })!;
+    const done = this.deps.runRepo.finish(row.id, { status, finishedAt: this.iso(), summaryMd: summary })!;
     const view = runView(done);
-    const maxCost = this.deps.getLimits()?.agent.max_run_cost_usd ?? null;
-    const overBudget = maxCost !== null && view.costUsd > maxCost;
+    const overBudget = this.overRunBudget(view);
     this.deps.audit?.record(actor, 'agent.run_finish', row.id, {
       status,
-      tokensIn,
-      tokensOut,
       costUsd: view.costUsd,
       toolCalls: view.toolCalls,
-      ...(overBudget ? { overRunBudget: maxCost } : {}),
+      ...(overBudget ? { overRunBudget: true } : {}),
     });
     try {
       this.deps.notify?.agentRunFinished(view, overBudget);
@@ -268,21 +268,72 @@ export class AgentService {
     return view;
   }
 
+  private overRunBudget(run: AgentRunView): boolean {
+    const maxCost = this.deps.getLimits()?.agent.max_run_cost_usd ?? null;
+    return maxCost !== null && run.costUsd > maxCost;
+  }
+
   /**
-   * Before a tool call (transport hook): refuses beyond `max_tool_calls_per_run` within the open run.
-   * Returns the open run id (or null when no run is open).
+   * Token usage and LLM cost of a run, reported by the agent runner (4b) — system actor only (R146). Adds to
+   * the run whatever its status (a timed-out or finished run keeps the cost); the monthly budget counts it.
    */
-  beforeToolCall(tool: string): string | null {
-    const run = this.currentRun();
-    if (!run) return null;
-    const max = this.deps.getLimits()?.agent.max_tool_calls_per_run ?? 0;
-    if (!TOOLS_EXEMPT_FROM_CAP.has(tool) && run.toolCalls >= max) {
-      throw new ServiceError('conflict', `Tool-call limit for this run reached (${run.toolCalls} of agent.max_tool_calls_per_run = ${max}); call finish_run`);
+  recordRunUsage(runId: string, usage: { tokensIn?: unknown; tokensOut?: unknown; costUsd?: unknown }, by: Actor): AgentRunView {
+    const actor = auditActorOf(requireActor(by, ['system'], 'agent.recordRunUsage'));
+    const tokensIn = Math.floor(nonNegative(usage.tokensIn, 'tokensIn'));
+    const tokensOut = Math.floor(nonNegative(usage.tokensOut, 'tokensOut'));
+    const costUsd = nonNegative(usage.costUsd, 'costUsd');
+    if (!this.deps.runRepo.findById(runId)) throw notFound('Run not found');
+    const view = runView(this.deps.runRepo.addUsage(runId, { tokensIn, tokensOut, costUsd })!);
+    this.deps.audit?.record(actor, 'agent.run_usage', runId, {
+      tokensIn,
+      tokensOut,
+      costUsd,
+      totalCostUsd: view.costUsd,
+      ...(this.overRunBudget(view) ? { overRunBudget: true } : {}),
+    });
+    return view;
+  }
+
+  /** Per-principal call times in the last hour (in memory; independent of runs) */
+  private hourly = new Map<string, number[]>();
+
+  /**
+   * Before an agent call (MCP tool or /api request), synchronously — nothing may await between the check
+   * and the reservation (R146). Refuses beyond `max_tool_calls_per_hour` for the principal (rolling hour)
+   * and beyond `max_tool_calls_per_run` within the open run, except `finish_run` / `kill_switch`; then
+   * reserves the call in both. Returns the open run id (or null when no run is open).
+   */
+  beforeToolCall(tool: string, by: Actor): string | null {
+    const who = requireActor(by, ['agent'], 'agent.toolCall');
+    const limits = this.deps.getLimits()?.agent ?? null;
+    const exempt = TOOLS_EXEMPT_FROM_CAP.has(tool);
+    const now = this.now();
+    const recent = (this.hourly.get(who.principal) ?? []).filter((t) => now - t < 3_600_000);
+    const perHour = limits?.max_tool_calls_per_hour ?? 0;
+    if (!exempt && recent.length >= perHour) {
+      this.hourly.set(who.principal, recent);
+      throw new ServiceError(
+        'rate_limited',
+        `Tool-call limit reached: ${recent.length} calls in the last hour (agent.max_tool_calls_per_hour = ${perHour}); try again later`
+      );
     }
+    const run = this.currentRun();
+    const perRun = limits?.max_tool_calls_per_run ?? 0;
+    if (run && !exempt && run.toolCalls >= perRun) {
+      throw new ServiceError(
+        'rate_limited',
+        `Tool-call limit for this run reached (${run.toolCalls} of agent.max_tool_calls_per_run = ${perRun}); call finish_run`
+      );
+    }
+    recent.push(now);
+    this.hourly.set(who.principal, recent);
+    if (this.hourly.size > 1000) for (const [k, v] of this.hourly) if (v.every((t) => now - t >= 3_600_000)) this.hourly.delete(k);
+    if (!run) return null;
+    this.deps.runRepo.reserveCall(run.id);
     return run.id;
   }
 
-  /** After a tool call: counted on the run and kept in its actions (bounded) */
+  /** After an agent call: kept in the run's actions (bounded); the count was reserved before */
   afterToolCall(runId: string | null, action: { tool: string; ok: boolean; target?: string | null }): void {
     if (!runId) return;
     this.deps.runRepo.recordAction(runId, { tool: action.tool, at: this.iso(), ok: action.ok, ...(action.target ? { target: action.target } : {}) });

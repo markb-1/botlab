@@ -37,6 +37,7 @@ export interface AgentBudget {
   remainingUsd: number | null;
   maxRunCostUsd: number | null;
   maxToolCallsPerRun: number | null;
+  maxToolCallsPerHour: number | null;
   runsThisMonth: number;
   botsCreatedLast24h: number;
   maxBotsCreatedPerDay: number | null;

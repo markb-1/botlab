@@ -46,6 +46,7 @@ import {
   type ThresholdEstimate,
 } from './scoring';
 import logger from '../utils/logger';
+import { ServiceError } from '../services/errors';
 
 export const SCORER_INTERVAL_MS = 3_600_000;
 export const MIN_HOURS_BEFORE_END = 6;
@@ -397,6 +398,11 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     const existing = this.deps.forecastRepo.findById(id);
     if (!existing) throw new LedgerValidationError(`Unknown forecast ${id}`);
     if (existing.status !== 'active') throw new LedgerValidationError(`Forecast ${id} is ${existing.status}, not active`);
+    // The agent withdraws only its own forecasts (R145)
+    if (actor === 'agent' && existing.created_by !== 'agent') {
+      this.deps.audit?.record(actor, 'ledger.withdraw', id, { marketId: existing.market_id }, 'denied: not an agent forecast');
+      throw new ServiceError('forbidden', 'ledger.withdraw: the agent may only withdraw its own forecasts');
+    }
     this.deps.forecastRepo.withdraw(id, why, new Date(this.now()).toISOString());
     this.deps.audit?.record(actor, 'ledger.withdraw', id, { reason: why, marketId: existing.market_id, tokenId: existing.token_id }, 'ok');
     const view = toForecastView(this.deps.forecastRepo.findById(id)!);

@@ -69,12 +69,26 @@ export function checkScope(principal: Principal, def: Pick<RouteDef, 'method' | 
   }
 }
 
-export function mountRoutes(app: Hono<AppEnv>, defs: RouteDef[]): void {
+/**
+ * Agent call accounting (R146): every `/api` request by an agent token is checked and counted like an MCP
+ * tool call (per-token hourly and per-run caps), synchronously before the handler runs.
+ */
+export interface AgentCallHooks {
+  before(actor: Actor, name: string): string | null;
+  after(runId: string | null, action: { tool: string; ok: boolean; target?: string | null }): void;
+}
+
+export function mountRoutes(app: Hono<AppEnv>, defs: RouteDef[], agentHooks?: AgentCallHooks): void {
   for (const def of defs) {
     app.on(def.method.toUpperCase(), def.path, async (c) => {
+      let agentRun: { runId: string | null; name: string } | null = null;
       try {
         const principal = requirePrincipal(c);
         checkScope(principal, def);
+        if (agentHooks && principal.scope === 'agent') {
+          const name = `api:${def.method.toUpperCase()} ${def.path}`;
+          agentRun = { runId: agentHooks.before(actorOf(principal), name), name };
+        }
         const body = def.method === 'get' || def.method === 'delete' ? undefined : await readJsonBody(c);
         const ctx: RouteContext = {
           c,
@@ -95,8 +109,10 @@ export function mountRoutes(app: Hono<AppEnv>, defs: RouteDef[]): void {
           throw err;
         }
         const message = typeof def.message === 'function' ? def.message(data) : def.message;
+        if (agentRun) agentHooks?.after(agentRun.runId, { tool: agentRun.name, ok: true, target: c.req.path });
         return ok(c, data, message);
       } catch (err) {
+        if (agentRun) agentHooks?.after(agentRun.runId, { tool: agentRun.name, ok: false, target: c.req.path });
         return fail(c, err);
       }
     });

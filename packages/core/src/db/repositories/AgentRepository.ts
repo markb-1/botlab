@@ -59,7 +59,12 @@ export class AgentRunRepository {
     return this.findById(id)!;
   }
 
-  /** Count a tool call on a running run and keep it in `actions` (bounded) */
+  /** Reserve one tool call on a running run, synchronously (R146); false when the run is not running */
+  reserveCall(id: string): boolean {
+    return this.db.prepare("UPDATE agent_runs SET tool_calls = tool_calls + 1 WHERE id = ? AND status = 'running'").run(id).changes > 0;
+  }
+
+  /** Keep a finished tool call in `actions` (bounded); the count was reserved by reserveCall */
   recordAction(id: string, action: AgentRunAction): void {
     this.db.transaction(() => {
       const row = this.findById(id);
@@ -71,22 +76,24 @@ export class AgentRunRepository {
       } catch {
         /* rewrite */
       }
-      if (actions.length < MAX_RUN_ACTIONS) actions.push(action);
-      this.db.prepare('UPDATE agent_runs SET actions = ?, tool_calls = tool_calls + 1 WHERE id = ?').run(JSON.stringify(actions), id);
+      if (actions.length >= MAX_RUN_ACTIONS) return;
+      actions.push(action);
+      this.db.prepare('UPDATE agent_runs SET actions = ? WHERE id = ?').run(JSON.stringify(actions), id);
     })();
   }
 
-  finish(
-    id: string,
-    data: { status: Exclude<AgentRunStatus, 'running'>; finishedAt: string; summaryMd: string | null; tokensIn?: number; tokensOut?: number; costUsd?: number }
-  ): AgentRunRow | undefined {
+  /** Token usage and cost recorded by the runner (any status: a timed-out run keeps its cost) */
+  addUsage(id: string, usage: { tokensIn: number; tokensOut: number; costUsd: number }): AgentRunRow | undefined {
     this.db
-      .prepare(
-        `UPDATE agent_runs SET status = ?, finished_at = ?, summary_md = ?,
-           tokens_in = tokens_in + ?, tokens_out = tokens_out + ?, cost_usd = cost_usd + ?
-         WHERE id = ? AND status = 'running'`
-      )
-      .run(data.status, data.finishedAt, data.summaryMd, data.tokensIn ?? 0, data.tokensOut ?? 0, data.costUsd ?? 0, id);
+      .prepare('UPDATE agent_runs SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?, cost_usd = cost_usd + ? WHERE id = ?')
+      .run(usage.tokensIn, usage.tokensOut, usage.costUsd, id);
+    return this.findById(id);
+  }
+
+  finish(id: string, data: { status: Exclude<AgentRunStatus, 'running'>; finishedAt: string; summaryMd: string | null }): AgentRunRow | undefined {
+    this.db
+      .prepare("UPDATE agent_runs SET status = ?, finished_at = ?, summary_md = ? WHERE id = ? AND status = 'running'")
+      .run(data.status, data.finishedAt, data.summaryMd, id);
     return this.findById(id);
   }
 

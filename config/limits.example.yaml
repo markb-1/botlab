@@ -36,8 +36,9 @@ agent:                               # MCP agent (spec §7); enforced by the ser
   monthly_llm_budget_usd: 50         # start_run is refused once this month's run costs reach it
   max_bots_created_per_day: 10       # agent-created bots in the last 24 h
   max_active_bots: 25                # agent-created bots not retired
-  max_run_cost_usd: 1.50             # per run (the agent runner stops a run above it)
+  max_run_cost_usd: 1.50             # per run, cost recorded by the runner (it stops a run above it)
   max_tool_calls_per_run: 200        # tool calls refused beyond this within one run (finish_run / kill_switch still work)
+  max_tool_calls_per_hour: 300       # per agent token, rolling hour, with or without a run (MCP and /api)
 approvals:
   new_template_live: false           # set true to require approval
 binance:

@@ -15,12 +15,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { sqliteAvailable } from '../orders/db';
 import { createCore, type Core } from '../../packages/core/src';
-import { asHuman } from '../../packages/core/src/services/actors';
+import { asAgent, asHuman, asSystem } from '../../packages/core/src/services/actors';
 import { createApp } from '../../apps/server/src/app';
 import { LoginLimiter } from '../../apps/server/src/routes/auth';
-import { TOOL_NAMES } from '../../apps/server/src/mcp/tools';
+import { TOOLS, TOOL_NAMES } from '../../apps/server/src/mcp/tools';
+import { apiRoutes } from '../../apps/server/src/routes/api';
 import { formatResult, redactArgs } from '../../apps/server/src/mcp/server';
-import { startStdioProxy } from '../../apps/server/src/mcp-stdio';
+import { insecureUrlReason, startStdioProxy } from '../../apps/server/src/mcp-stdio';
 import { SCRIPT_GUIDE_MD } from '../../packages/core/src/sdk/guide';
 
 const HOST = '127.0.0.1:3780';
@@ -50,6 +51,22 @@ function gammaMarket(o: Record<string, unknown> = {}) {
     ...o,
   };
 }
+
+/** A tool result's JSON, unwrapping an <untrusted_data> block */
+function parseOut(text: string): any {
+  return JSON.parse(text.startsWith('<untrusted_data') ? text.split('\n')[1] : text);
+}
+
+/** Recursive tuple types that keep the TypeScript checker busy for > 10 s and > 1 GB (review finding) */
+const PATHOLOGICAL_SOURCE = `
+type T0 = [1, 1];
+type D<T extends any[]> = [...T, ...T];
+type T1 = D<D<D<D<T0>>>>; type T2 = D<D<D<D<T1>>>>; type T3 = D<D<T2>>;
+type P<T extends any[], A extends any[] = []> = T extends [any, ...infer R] ? P<R, [...A, A['length']]> : A;
+type X = P<T3>;
+const x: X = null as any;
+export async function onTick(ctx) { const y: string = x; }
+`;
 
 const EXPECTED_TOOLS = [
   'get_overview',
@@ -139,7 +156,7 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     fs.mkdirSync(configDir, { recursive: true });
     fs.writeFileSync(
       path.join(configDir, 'limits.yaml'),
-      'agent:\n  monthly_llm_budget_usd: 5\n  max_bots_created_per_day: 3\n  max_active_bots: 2\n  max_run_cost_usd: 1\n  max_tool_calls_per_run: 12\n'
+      'agent:\n  monthly_llm_budget_usd: 5\n  max_bots_created_per_day: 3\n  max_active_bots: 2\n  max_run_cost_usd: 1\n  max_tool_calls_per_run: 12\n  max_tool_calls_per_hour: 60\n'
     );
     core = createCore({ dataDir: path.join(tmp, 'data'), configDir, backups: false });
     await core.start();
@@ -178,7 +195,7 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     expect(r.status).toBe(200);
     const result = r.json.result as { isError?: boolean; content: Array<{ text: string }> };
     const text = result.content[0].text;
-    const json = text.startsWith('<untrusted_data') ? JSON.parse(text.split('\n')[1]) : text.startsWith('{') || text.startsWith('[') ? JSON.parse(text) : null;
+    const json = text.startsWith('<untrusted_data') || text.startsWith('{') || text.startsWith('[') ? parseOut(text) : null;
     return { isError: result.isError === true, text, json };
   }
 
@@ -318,29 +335,214 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
   it('flag_position_exit: needs a held position, is idempotent, audited; places no order', async () => {
     const bot = (await call('create_bot', { templateId: template().id, name: 'holder' })).json;
     expect((await call('flag_position_exit', { botId: bot.id, tokenId: YES, reason: 'rules changed' })).text).toMatch(/holds no position/);
-    const order = core.repos.orderRepo.create({ botId: bot.id, exchange: 'polymarket', marketId: MARKET_ID, tokenId: YES, side: 'buy', orderType: 'market', price: 0.5, size: 10, notionalUsd: 5, status: 'filled', simulated: true });
-    core.repos.tradeRepo.create({ botId: bot.id, side: 'BUY', exchange: 'polymarket', symbol: YES, conditionId: MARKET_ID, price: 0.5, quantity: 10, quoteAmount: 5, simulated: 1, orderId: order.id });
+    const order = core.repos.orderRepo.create({
+      botId: bot.id,
+      exchange: 'polymarket',
+      marketId: MARKET_ID,
+      tokenId: YES,
+      side: 'buy',
+      orderType: 'market',
+      price: 0.5,
+      size: 10,
+      notionalUsd: 5,
+      status: 'filled',
+      simulated: true,
+    });
+    core.repos.tradeRepo.create({
+      botId: bot.id,
+      side: 'BUY',
+      exchange: 'polymarket',
+      symbol: YES,
+      conditionId: MARKET_ID,
+      price: 0.5,
+      quantity: 10,
+      quoteAmount: 5,
+      simulated: 1,
+      orderId: order.id,
+    });
     const ordersBefore = core.repos.orderRepo.findByBot(bot.id).length;
     const f = await call('flag_position_exit', { botId: bot.id, tokenId: YES, reason: 'rules changed' });
-    expect(f.json).toMatchObject({ botId: bot.id, tokenId: YES, marketId: MARKET_ID, simulated: true, status: 'open', createdBy: 'agent', alreadyFlagged: false });
+    expect(f.json).toMatchObject({
+      botId: bot.id,
+      tokenId: YES,
+      marketId: MARKET_ID,
+      simulated: true,
+      status: 'open',
+      createdBy: 'agent',
+      alreadyFlagged: false,
+    });
     expect((await call('flag_position_exit', { botId: bot.id, tokenId: YES, reason: 'again' })).json).toMatchObject({ id: f.json.id, alreadyFlagged: true });
     expect(core.repos.orderRepo.findByBot(bot.id)).toHaveLength(ordersBefore);
     expect(audit('position.exit_flag')).toHaveLength(1);
     expect(core.services.agent.listExitFlags('open').map((x) => x.id)).toEqual([f.json.id]);
   });
 
-  it('caps tool calls per run (finish_run still works)', async () => {
-    expect((await call('start_run', { trigger: 'manual' })).json).toMatchObject({ run: { status: 'running' }, budget: { maxToolCallsPerRun: 12 } });
-    expect((await call('start_run')).text).toMatch(/in progress/);
-    for (let i = 0; i < 11; i++) expect((await call('get_notes')).isError).toBe(false); // + the refused start_run = 12
-    expect((await call('get_notes')).text).toMatch(/Tool-call limit/);
-    const done = await call('finish_run', { summary_md: 'capped', cost_usd: 0.5 });
-    expect(done.json).toMatchObject({ status: 'ok', toolCalls: 12, costUsd: 0.5 }); // the refused call is not counted
+  it('every agent-allowed /api mutation respects R133-R135 / R145 against a human bot, script, forecast and watch', async () => {
+    const human = asHuman('session:test');
+    const tpl = template();
+    const script = await core.services.scripts.create({ name: 'human script', source: 'export async function onTick(ctx) {}' }, human);
+    const bot = await core.services.bots.create({ name: 'human bot', scriptId: tpl.id }, human);
+    const forecast = await core.services.ledger.submitForecast(
+      { tokenId: YES, probability: 0.6, rationale: 'human view', sources: [], ambiguityScore: 1 },
+      human
+    );
+    core.services.reconcile.watchlistAdd('999', null, 'human watch', human);
+    const ok = 'allowed';
+    const expected: Record<string, { status: number | typeof ok; body?: unknown }> = {
+      'POST /api/bots': { status: 403, body: { name: 'x', scriptId: script.id } },
+      'PATCH /api/bots/:id': { status: 403, body: { config: {} } },
+      'POST /api/bots/:id/start': { status: 403 },
+      'POST /api/bots/:id/restart': { status: 403 },
+      'POST /api/bots/:id/stop': { status: ok }, // pausing any bot reduces risk (R134)
+      'POST /api/scripts/compile': { status: ok, body: { source: 'export async function onTick(ctx) {}' } },
+      'POST /api/scripts': { status: ok, body: { name: 'agent script', source: 'export async function onTick(ctx) {}' } },
+      'PATCH /api/scripts/:id': { status: 403, body: { description: 'changed' } },
+      'POST /api/scripts/:id/fork': { status: ok, body: { newName: 'agent copy' } },
+      'POST /api/backtests': { status: ok, body: { scriptId: script.id } },
+      'POST /api/ledger/forecasts': { status: ok, body: {} },
+      'POST /api/ledger/forecasts/:id/withdraw': { status: 403, body: { reason: 'agent' } },
+      'POST /api/recorder/watchlist': { status: ok, body: { tokenId: '888' } },
+      'DELETE /api/recorder/watchlist/:tokenId': { status: 403 },
+      'POST /api/risk/kill-switch': { status: ok, body: { reason: 'matrix' } },
+    };
+    const routes = apiRoutes(core.services).filter((r) => r.method !== 'get' && (r.allow ?? []).includes('agent'));
+    expect(routes.map((r) => `${r.method.toUpperCase()} ${r.path}`).sort()).toEqual(Object.keys(expected).sort());
+    // kill switch last (it halts everything)
+    routes.sort((a, b) => Number(a.path.includes('kill')) - Number(b.path.includes('kill')));
+    for (const r of routes) {
+      const key = `${r.method.toUpperCase()} ${r.path}`;
+      const url = r.path
+        .replace(':id', r.path.startsWith('/api/scripts') ? script.id : r.path.startsWith('/api/ledger') ? forecast.id : bot.id)
+        .replace(':tokenId', '999');
+      const e = expected[key];
+      const res = await app.request(url, {
+        method: r.method.toUpperCase(),
+        headers: { host: HOST, authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' },
+        body: e.body !== undefined ? JSON.stringify(e.body) : undefined,
+      });
+      if (e.status === ok) expect({ key, status: res.status }).not.toEqual({ key, status: 403 });
+      else expect({ key, status: res.status }).toEqual({ key, status: e.status });
+    }
+    expect(core.services.bots.get(bot.id).status).toBe('stopped'); // never started by the agent
+    expect(core.services.ledger.getForecast(forecast.id)?.status).toBe('active');
+    expect(core.services.scripts.get(script.id).description).not.toBe('changed');
   });
 
-  it('refuses start_run once the monthly budget is used', async () => {
-    await call('start_run');
-    await call('finish_run', { summary_md: 'expensive', cost_usd: 5 });
+  it('agent scripts over /api must compile and typecheck (create and PATCH)', async () => {
+    const req = (method: string, p: string, body: unknown) =>
+      app.request(p, {
+        method,
+        headers: { host: HOST, authorization: `Bearer ${agentToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    const bad = 'export async function onTick(ctx) { ctx.nope(); }';
+    expect((await req('POST', '/api/scripts', { name: 'bad', source: bad })).status).toBe(400);
+    const created = await (await req('POST', '/api/scripts', { name: 'good', source: 'export async function onTick(ctx) { ctx.log.info(1); }' })).json();
+    expect(created.data).toMatchObject({ origin: 'agent' });
+    const patched = await req('PATCH', `/api/scripts/${created.data.id}`, { source: bad });
+    expect(patched.status).toBe(400);
+    expect(((await patched.json()) as { error: string }).error).toMatch(/does not compile or typecheck/);
+  });
+
+  it('a pathological typecheck is cut off in a worker (time / memory) and the server stays responsive', async () => {
+    const started = Date.now();
+    const pending = call('validate_script', { source: PATHOLOGICAL_SOURCE });
+    const healthLatency: number[] = [];
+    let finished = false;
+    void pending.finally(() => (finished = true));
+    while (!finished) {
+      const t = Date.now();
+      const h = await app.request('/healthz', { headers: { host: HOST } });
+      expect(h.status).toBeLessThan(600);
+      healthLatency.push(Date.now() - t);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    const r = await pending;
+    expect(Date.now() - started).toBeLessThan(12_500);
+    expect(r.json).toMatchObject({ ok: false, typecheckError: expect.stringMatching(/timed out|memory limit/) });
+    expect(healthLatency.length).toBeGreaterThan(3);
+    expect(Math.max(...healthLatency)).toBeLessThan(1000);
+    // The next check works (a fresh worker)
+    expect((await call('validate_script', { source: 'export async function onTick(ctx) { ctx.log.info(1); }' })).json).toMatchObject({ ok: true });
+    expect((await call('validate_script', { source: 'x'.repeat(70_000) })).text).toMatch(/Invalid input/);
+  }, 40_000);
+
+  it('wraps stored text: every tool but the numeric ones, template resources, no stored text in listings', async () => {
+    expect(
+      TOOLS.filter((t) => t.trustedOutput)
+        .map((t) => t.name)
+        .sort()
+    ).toEqual(['delete_note', 'get_ledger_stats', 'get_orderbook', 'get_price_history', 'kill_switch', 'unwatch_market', 'watch_market'].sort());
+    for (const [name, args] of [
+      ['list_templates', {}],
+      ['get_script', { scriptId: template().id }],
+      ['get_overview', {}],
+      ['list_bots', {}],
+      ['get_notes', {}],
+      ['get_run_history', {}],
+    ] as const) {
+      expect({ name, wrapped: (await call(name, args)).text.startsWith('<untrusted_data') }).toEqual({ name, wrapped: true });
+    }
+    const res = await rpc({ jsonrpc: '2.0', id: 1, method: 'resources/read', params: { uri: `botlab://templates/${template().id}` } });
+    expect(res.json.result.contents[0].text.startsWith('<untrusted_data')).toBe(true);
+    const list = await rpc({ jsonrpc: '2.0', id: 2, method: 'resources/list', params: {} });
+    expect(JSON.stringify(list.json.result)).not.toContain(template().name);
+  });
+
+  it('stdio proxy refuses plain http to a non-loopback, non-Tailscale host', () => {
+    for (const ok of [
+      'http://127.0.0.1:3780',
+      'http://localhost:3780',
+      'http://[::1]:3780',
+      'https://botlab.example.com',
+      'http://box.tail1234.ts.net:3780',
+      'http://100.101.2.3:3780',
+    ]) {
+      expect({ ok, reason: insecureUrlReason(new URL(ok)) }).toEqual({ ok, reason: null });
+    }
+    for (const bad of ['http://192.168.1.5:3780', 'http://botlab.example.com', 'http://100.128.0.1']) {
+      expect(insecureUrlReason(new URL(bad))).toMatch(/BOTLAB_ALLOW_INSECURE/);
+    }
+    return expect(
+      startStdioProxy({ url: 'http://10.0.0.2:3780', token: 't', stdin: new PassThrough(), stdout: new PassThrough(), log: () => undefined })
+    ).rejects.toThrow(/plain http/);
+  });
+
+  it('caps tool calls per run, reserving each call before it runs (parallel calls cannot overshoot)', async () => {
+    expect((await call('start_run', { trigger: 'manual' })).json).toMatchObject({ run: { status: 'running' }, budget: { maxToolCallsPerRun: 12 } });
+    expect((await call('start_run')).text).toMatch(/in progress/); // counted: 1
+    const results = await Promise.all(Array.from({ length: 20 }, () => call('get_notes')));
+    expect(results.filter((r) => !r.isError)).toHaveLength(11);
+    expect(results.filter((r) => /Tool-call limit for this run/.test(r.text))).toHaveLength(9);
+    const done = await call('finish_run', { summary_md: 'capped' }); // exempt from the cap, counted
+    expect(done.json).toMatchObject({ status: 'ok', toolCalls: 13, costUsd: 0 });
+  });
+
+  it('per-token hourly limit applies with or without a run, and a new run does not reset it', async () => {
+    const results = await Promise.all(Array.from({ length: 70 }, () => call('get_notes')));
+    expect(results.filter((r) => !r.isError)).toHaveLength(60);
+    expect(results.filter((r) => /max_tool_calls_per_hour = 60/.test(r.text))).toHaveLength(10);
+    expect((await call('start_run')).text).toMatch(/max_tool_calls_per_hour/);
+    expect((await call('kill_switch', { reason: 'still allowed' })).isError).toBe(false); // exempt
+    // /api calls with the agent token count against the same limit
+    const res = await app.request('/api/bots', { headers: { host: HOST, authorization: `Bearer ${agentToken}` } });
+    expect(res.status).toBe(429);
+    // finish_run + start_run do not reset it: a run started by the system (4b runner) still sees the limit
+    core.services.agent.startRun({ trigger: 'schedule' }, asSystem());
+    expect((await call('finish_run', { summary_md: 'done' })).isError).toBe(false);
+    expect((await call('get_notes')).text).toMatch(/max_tool_calls_per_hour/);
+  });
+
+  it('cost is recorded by the system only; the monthly budget counts it (also on a timed-out run)', async () => {
+    expect((await call('finish_run', { summary_md: 'x', cost_usd: 0 })).text).toMatch(/Unrecognized key/);
+    const run = (await call('start_run')).json.run;
+    expect(() => core.services.agent.recordRunUsage(run.id, { costUsd: 1 }, asAgent('token:x'))).toThrow(/not allowed for agent/);
+    await call('finish_run', { summary_md: 'expensive' });
+    expect(core.services.agent.recordRunUsage(run.id, { tokensIn: 10, tokensOut: 5, costUsd: 5 }, asSystem())).toMatchObject({
+      costUsd: 5,
+      tokensIn: 10,
+      status: 'ok',
+    });
     expect((await call('start_run')).text).toMatch(/Monthly LLM budget used/);
   });
 
@@ -356,12 +558,12 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     expect(tools.tools.map((t) => t.name)).toEqual(EXPECTED_TOOLS);
     const text = (r: unknown) => (r as { content: Array<{ text: string }> }).content[0].text;
 
-    const run = JSON.parse(text(await client.callTool({ name: 'start_run', arguments: { trigger: 'manual' } })));
+    const run = parseOut(text(await client.callTool({ name: 'start_run', arguments: { trigger: 'manual' } })));
     expect(run.run.status).toBe('running');
-    const overview = JSON.parse(text(await client.callTool({ name: 'get_overview', arguments: {} })));
+    const overview = parseOut(text(await client.callTool({ name: 'get_overview', arguments: {} })));
     expect(overview).toHaveProperty('exposure');
 
-    const bot = JSON.parse(text(await client.callTool({ name: 'create_bot', arguments: { templateId: template().id, name: 'agent paper bot' } })));
+    const bot = parseOut(text(await client.callTool({ name: 'create_bot', arguments: { templateId: template().id, name: 'agent paper bot' } })));
     expect(bot).toMatchObject({ mode: 'paper', createdBy: 'agent' });
 
     const fc = await client.callTool({
@@ -369,7 +571,7 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
       arguments: { tokenId: YES, probability: 0.62, rationale: 'Base effects push CPI up.', sources: ['https://www.bls.gov/cpi'], ambiguityScore: 1 },
     });
     expect(fc.isError).toBeFalsy();
-    expect(JSON.parse(text(fc))).toMatchObject({ tokenId: YES, probability: 0.62, marketPriceAtForecast: 0.5, createdBy: 'agent', ambiguityScore: 1 });
+    expect(parseOut(text(fc))).toMatchObject({ tokenId: YES, probability: 0.62, marketPriceAtForecast: 0.5, createdBy: 'agent', ambiguityScore: 1 });
     expect(core.services.markets.search(MARKET_ID)[0]).toMatchObject({ ambiguityScore: 1 }); // the forecast assessed the market
 
     await client.callTool({ name: 'write_note', arguments: { scope: `market:${MARKET_ID}`, title: 'CPI', body_md: 'Watch the release date.' } });
@@ -389,15 +591,16 @@ describe.skipIf(!sqliteAvailable)('MCP server', () => {
     const limits = JSON.parse((await client.readResource({ uri: 'botlab://config/limits' })).contents[0].text as string);
     expect(limits.agent).toMatchObject({ max_active_bots: 2, max_tool_calls_per_run: 12 });
 
-    const finished = JSON.parse(
+    const finished = parseOut(
       text(
         await client.callTool({
           name: 'finish_run',
-          arguments: { summary_md: '## Run\n- 1 forecast, 1 paper bot', tokens_in: 1000, tokens_out: 200, cost_usd: 0.12 },
+          arguments: { summary_md: '## Run\n- 1 forecast, 1 paper bot' },
         })
       )
     );
-    expect(finished).toMatchObject({ status: 'ok', costUsd: 0.12, tokensIn: 1000 });
+    expect(finished).toMatchObject({ status: 'ok', costUsd: 0, tokensIn: 0 });
+    core.services.agent.recordRunUsage(run.run.id, { tokensIn: 1000, tokensOut: 200, costUsd: 0.12 }, asSystem());
     expect(finished.actions.map((a: { tool: string }) => a.tool)).toEqual(['get_overview', 'create_bot', 'submit_forecast', 'write_note']);
     expect(core.services.agent.budget()).toMatchObject({ monthSpentUsd: 0.12, monthlyBudgetUsd: 5, activeAgentBots: 1, currentRun: null });
     expect(audit('mcp.').every((r) => r.actor === 'agent')).toBe(true);

@@ -70,6 +70,12 @@ export class ReconcileService {
   watchlistRemove(tokenId: unknown, by: Actor): { removed: boolean } {
     const actor = auditActorOf(requireActor(by, ['human', 'agent'], 'recorder.watchlistRemove'));
     if (typeof tokenId !== 'string' || !tokenId) throw invalidInput('tokenId required');
+    // The agent removes only tokens it added (R145)
+    const row = this.deps.snapshotRepo.watchlist().find((w) => w.token_id === tokenId);
+    if (actor === 'agent' && row && row.added_by !== 'agent') {
+      this.deps.audit.record(actor, 'recorder.watch_remove', tokenId, undefined, 'denied: added by a human');
+      throw new ServiceError('forbidden', 'recorder.watchlistRemove: the agent may only remove tokens it added');
+    }
     const removed = this.deps.snapshotRepo.removeWatch(tokenId);
     this.deps.audit.record(actor, 'recorder.watch_remove', tokenId, undefined, removed ? 'ok' : 'not found');
     return { removed };

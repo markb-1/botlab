@@ -9,7 +9,8 @@ import type { IpcScript } from './types';
 import type { AuditService } from '../audit/AuditService';
 import { auditActorOf, requireActor, type Actor } from './actors';
 import { compileScript } from '../runtime/compileScript';
-import { typecheckScript, type ScriptDiagnostic } from '../runtime/typecheckScript';
+import type { ScriptDiagnostic, TypecheckResult } from '../runtime/typecheckScript';
+import { TypecheckLimitError, TypecheckRunner } from '../runtime/TypecheckRunner';
 import { conflict, notFound, ServiceError } from './errors';
 import type { ScriptCreateInput, ScriptImportFile, ScriptUpdateInput } from './schemas';
 import type { MandateConfig } from '../config/schema';
@@ -22,6 +23,8 @@ export interface ScriptValidation {
   diagnostics: ScriptDiagnostic[];
   /** Diagnostics left out (only the first 50 are returned) */
   truncated: number;
+  /** The typecheck could not finish (timeout / memory limit / busy, R144); ok is false */
+  typecheckError: string | null;
 }
 
 /** Template summary for list_templates (no source) */
@@ -37,7 +40,8 @@ export interface TemplateSummary {
   updatedAt: string;
 }
 
-export const MAX_SCRIPT_SOURCE_CHARS = 200_000;
+/** Source size cap for validation / templates (R144): bounds compile and typecheck work */
+export const MAX_SCRIPT_SOURCE_CHARS = 64 * 1024;
 
 /** .botlab file format */
 export interface BotLabScriptFile {
@@ -82,12 +86,28 @@ export interface ScriptServiceDeps {
   audit?: AuditService;
   /** Mandate in force (`strategies.allow_custom_templates` gates agent templates); null = config unavailable */
   getMandate?: () => MandateConfig | null;
+  /** Typecheck (default: a worker thread with time and memory limits, R144) */
+  typecheck?: (source: string) => Promise<TypecheckResult>;
 }
 
 const originOf = (actor: Actor): 'human' | 'agent' => (actor.kind === 'agent' ? 'agent' : 'human');
 
 export class ScriptService {
+  private runner: TypecheckRunner | null = null;
+
   constructor(private deps: ScriptServiceDeps) {}
+
+  private typecheck(source: string): Promise<TypecheckResult> {
+    if (this.deps.typecheck) return this.deps.typecheck(source);
+    this.runner ??= new TypecheckRunner();
+    return this.runner.run(source);
+  }
+
+  /** Stop the typecheck worker (core shutdown) */
+  async close(): Promise<void> {
+    await this.runner?.close();
+    this.runner = null;
+  }
 
   private auditScript(
     by: Actor,
@@ -132,6 +152,8 @@ export class ScriptService {
 
   async create(data: ScriptCreateInput, actor: Actor): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.create');
+    // Agent code must compile and typecheck (R135 amended)
+    if (who.kind === 'agent') this.requireValid(await this.validate(data.source), actor, 'script.create', null);
     // Compile TypeScript to JavaScript
     let compiled: string | undefined;
     const compileResult = await compileScript(data.source);
@@ -158,10 +180,26 @@ export class ScriptService {
   async validate(source: unknown): Promise<ScriptValidation> {
     if (typeof source !== 'string' || !source.trim()) throw new ServiceError('invalid_input', 'source is required');
     if (source.length > MAX_SCRIPT_SOURCE_CHARS) throw new ServiceError('invalid_input', `source is longer than ${MAX_SCRIPT_SOURCE_CHARS} characters`);
+    // esbuild compiles in its own child process; the TypeScript check runs in a limited worker thread
     const compiled = await compileScript(source);
-    const tc = typecheckScript(source);
     const compileError = 'error' in compiled ? compiled.error : null;
-    return { ok: compileError === null && tc.ok, compiled: compileError === null, compileError, diagnostics: tc.diagnostics, truncated: tc.truncated };
+    let tc: TypecheckResult | null = null;
+    let typecheckError: string | null = null;
+    try {
+      tc = await this.typecheck(source);
+    } catch (err) {
+      if (!(err instanceof TypecheckLimitError)) throw err;
+      if (err.reason === 'busy') throw new ServiceError('conflict', err.message);
+      typecheckError = err.message;
+    }
+    return {
+      ok: compileError === null && tc !== null && tc.ok,
+      compiled: compileError === null,
+      compileError,
+      diagnostics: tc?.diagnostics ?? [],
+      truncated: tc?.truncated ?? 0,
+      typecheckError,
+    };
   }
 
   /** Scripts of kind template (builtin, human or agent), without source (spec §7.3 list_templates) */
@@ -181,7 +219,7 @@ export class ScriptService {
 
   private requireValid(v: ScriptValidation, by: Actor, action: string, target: string | null): void {
     if (v.ok) return;
-    const first = v.compileError ?? v.diagnostics.filter((d) => d.category === 'error').slice(0, 5).map((d) => `${d.line}:${d.column} ${d.message}`).join('; ');
+    const first = v.compileError ?? v.typecheckError ?? v.diagnostics.filter((d) => d.category === 'error').slice(0, 5).map((d) => `${d.line}:${d.column} ${d.message}`).join('; ');
     this.deps.audit?.record(auditActorOf(by), action, target, { compiled: v.compiled, errors: v.diagnostics.length }, 'denied: script does not compile / typecheck');
     throw new ServiceError('invalid_input', `Script does not compile or typecheck (run validate_script): ${first}`);
   }
@@ -233,14 +271,11 @@ export class ScriptService {
     const existing = this.deps.scriptRepo.findById(id);
     if (!existing) throw notFound('Script not found');
     if (existing.kind !== 'template') throw conflict('Not a template (update_template edits templates only)');
-    if (input.source !== undefined) {
-      const v = await this.validate(input.source);
-      this.requireValid(v, actor, 'script.update', id);
-    }
-    return this.update(id, input, actor);
+    return this.update(id, input, actor, { validate: true });
   }
 
-  async update(id: string, input: ScriptUpdateInput, actor: Actor): Promise<IpcScript> {
+  /** `validate`: the new source must compile and typecheck — always for the agent (R135), and for templates */
+  async update(id: string, input: ScriptUpdateInput, actor: Actor, opts: { validate?: boolean } = {}): Promise<IpcScript> {
     const who = requireActor(actor, ['human', 'agent'], 'scripts.update');
     const { scriptRepo } = this.deps;
     const data = { ...input };
@@ -254,6 +289,9 @@ export class ScriptService {
     if (who.kind === 'agent' && existing.origin !== 'agent') {
       this.deps.audit?.record('agent', 'script.update', id, { name: existing.name, origin: existing.origin }, 'denied: not an agent script');
       throw new ServiceError('forbidden', 'scripts.update: the agent may only edit scripts it wrote (origin agent)');
+    }
+    if ((opts.validate || who.kind === 'agent') && data.source !== undefined && data.source !== existing.source) {
+      this.requireValid(await this.validate(data.source), actor, 'script.update', id);
     }
 
     // Auto-bump patch version if source code changed and no explicit version provided
@@ -289,7 +327,11 @@ export class ScriptService {
   }
 
   delete(id: string, actor: Actor): void {
-    requireActor(actor, ['human', 'agent'], 'scripts.delete');
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.delete');
+    if (who.kind === 'agent' && this.deps.scriptRepo.findById(id)?.origin !== 'agent') {
+      this.deps.audit?.record('agent', 'script.delete', id, undefined, 'denied: not an agent script');
+      throw new ServiceError('forbidden', 'scripts.delete: the agent may only delete scripts it wrote (origin agent)');
+    }
     const deleted = this.deps.scriptRepo.delete(id);
     if (!deleted) throw conflict('Script not found, is a template, or has bots using it');
     this.deps.audit?.record(auditActorOf(actor), 'script.delete', id);
@@ -355,7 +397,7 @@ export class ScriptService {
 
   /** Import `.botlab` files; a bad file is reported in `errors` and does not stop the others */
   async importScripts(files: ScriptImportFile[], actor: Actor): Promise<ScriptImportResult> {
-    requireActor(actor, ['human', 'agent'], 'scripts.import');
+    const who = requireActor(actor, ['human', 'agent'], 'scripts.import');
     const imported: IpcScript[] = [];
     const errors: string[] = [];
 
@@ -404,6 +446,7 @@ export class ScriptService {
           compiled: compileResult.code,
           configSchema: parsed.configSchema || {},
           isTemplate: false,
+          origin: originOf(who),
         });
         this.auditScript(actor, 'script.create', row, { importedFrom: filePath });
 

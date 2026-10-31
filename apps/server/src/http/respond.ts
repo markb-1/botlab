@@ -20,6 +20,7 @@ const STATUS: Record<ServiceErrorCode, ContentfulStatusCode> = {
   conflict: 409,
   locked: 423,
   unavailable: 503,
+  rate_limited: 429,
 };
 
 /** An error with an HTTP status, thrown by the transport layer itself */

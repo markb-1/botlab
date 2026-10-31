@@ -25,8 +25,9 @@ caps, category rights and the monthly budget; every tool call is in the audit lo
 ## 2. Run cycle
 
 1. \`start_run\` (refused when the monthly LLM budget is used up or another run is open; returns your budget and
-   the last run summary). Tool calls in a run are capped (\`agent.max_tool_calls_per_run\`); after the cap only
-   \`finish_run\` and \`kill_switch\` work.
+   the last run summary). Tool calls are capped per run (\`agent.max_tool_calls_per_run\`) and per hour for your
+   token (\`agent.max_tool_calls_per_hour\`, with or without a run); after a cap only \`finish_run\` and
+   \`kill_switch\` work. LLM cost is recorded by the BotLab runner, not by you.
 2. Orient: \`get_overview\`, \`get_notes\`, \`get_run_history\`, \`list_bots\`.
 3. Maintain: halted / erroring bots (\`get_bot_logs\`), rules changes, positions near resolution, stale forecasts.
 4. Scan: \`search_markets\` (mandate flags tell you why a market is out of scope), research with \`get_market\`,
@@ -153,7 +154,7 @@ Memory is capped (128 MB); an \`onTick\` that runs longer than 30 s three times 
 
 ### Templates you write
 
-\`validate_script(source)\` compiles and typechecks against types.d.ts (untyped lifecycle \`ctx\` parameters are
+\`validate_script(source)\` (≤ 64 KB; the typecheck stops after 10 s or 256 MB) compiles and typechecks against types.d.ts (untyped lifecycle \`ctx\` parameters are
 checked as \`BotContext\`). \`create_template\` / \`update_template\` refuse code that does not pass; new templates
 have trust \`new\` (their bots stay in paper), and only while the mandate allows custom templates. Backtest with
 \`run_backtest\` (Binance klines, or Polymarket recorded order books with \`source: polymarket-snapshots\`).

@@ -105,6 +105,8 @@ export const LimitsSchema = z.strictObject({
       // Per agent run (spec §7.1): the runner stops a run above this cost; the server refuses tool calls beyond the count
       max_run_cost_usd: usd.default(1.5),
       max_tool_calls_per_run: count.default(200),
+      // Per agent token, rolling hour, whether or not a run is open (MCP and /api calls)
+      max_tool_calls_per_hour: count.default(300),
     })
     .prefault({}),
   approvals: z

@@ -14,7 +14,9 @@ export type ServiceErrorCode =
   /** The action is refused in the current state (e.g. editing a template) */
   | 'conflict'
   /** The actor may not do this (e.g. an agent calling a human-only action) */
-  | 'forbidden';
+  | 'forbidden'
+  /** A rate or count limit was reached (e.g. the agent's tool calls per hour / per run) */
+  | 'rate_limited';
 
 export class ServiceError extends Error {
   constructor(
