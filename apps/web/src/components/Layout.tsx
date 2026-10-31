@@ -65,6 +65,15 @@ const navItems = [
     ),
   },
   {
+    path: '/agent',
+    label: 'Agent',
+    icon: (
+      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 3v2m6-2v2M9 19v2m6-2v2M3 9h2m-2 6h2m14-6h2m-2 6h2M7 5h10a2 2 0 012 2v10a2 2 0 01-2 2H7a2 2 0 01-2-2V7a2 2 0 012-2zm3 5h4v4h-4v-4z" />
+      </svg>
+    ),
+  },
+  {
     path: '/audit',
     label: 'Audit',
     icon: (

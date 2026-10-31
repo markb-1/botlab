@@ -16,6 +16,7 @@ import { Risk } from './pages/Risk';
 import { Ledger } from './pages/Ledger';
 import { Markets } from './pages/Markets';
 import { Audit } from './pages/Audit';
+import { Agent } from './pages/Agent';
 import { Approvals } from './pages/Approvals';
 import { ReauthDialog } from './components/ReauthDialog';
 import { useAuth } from './hooks/useAuth';
@@ -74,6 +75,7 @@ function AppContent() {
             <Route path="/ledger" element={<Ledger />} />
             <Route path="/markets" element={<Markets />} />
             <Route path="/audit" element={<Audit />} />
+            <Route path="/agent" element={<Agent />} />
             <Route path="/approvals" element={<Approvals />} />
           </Routes>
         </Layout>

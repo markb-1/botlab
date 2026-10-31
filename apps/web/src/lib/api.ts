@@ -404,3 +404,14 @@ export const events = {
   onConfigChanged: (callback: Listener) => onServerEvent('config:changed', callback),
   onMarketRulesChanged: (callback: Listener) => onServerEvent('market:rulesChanged', callback),
 };
+
+// ── Agent (runs, notes, budget, exit flags; spec §7) ──────────────────────
+
+export const agentApi = {
+  budget: () => call('GET', '/agent/budget'),
+  runs: (limit?: number, before?: string) => call('GET', `/agent/runs${qs({ limit, before })}`),
+  run: (id: string) => call('GET', `/agent/runs/${enc(id)}`),
+  notes: (filter?: { scope?: string; q?: string; limit?: number }) => call('GET', `/agent/notes${qs(filter)}`),
+  deleteNote: (id: string) => call('DELETE', `/agent/notes/${enc(id)}`),
+  exitFlags: (status?: string) => call('GET', `/agent/exit-flags${qs({ status })}`),
+};
