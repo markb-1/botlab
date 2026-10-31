@@ -1,4 +1,4 @@
-import { ipcMain } from 'electron';
+import { ipcMain, type WebContents } from 'electron';
 import type { HaltService } from '../../risk/HaltService';
 import type { KillSwitch } from '../../risk/KillSwitch';
 import type { BotRepository } from '../../database/repositories/BotRepository';
@@ -7,7 +7,15 @@ import type { BotRepository } from '../../database/repositories/BotRepository';
  * Risk IPC (spec §4.2, §4.3, §4.6). Everything arriving over IPC comes from the UI, so the actor
  * is `human` — the only actor allowed to clear a halt.
  */
-export function registerRiskHandlers(halts: HaltService, killSwitch: KillSwitch, botRepo: BotRepository): void {
+export function registerRiskHandlers(
+  halts: HaltService,
+  killSwitch: KillSwitch,
+  botRepo: BotRepository,
+  /** Only the app's main window may clear halts or press the kill switch */
+  isTrustedSender: (sender: WebContents) => boolean
+): void {
+  const untrusted = { success: false, error: 'Not allowed from this window' };
+
   ipcMain.handle('risk:getState', async () => {
     try {
       const state = halts.getState();
@@ -35,7 +43,8 @@ export function registerRiskHandlers(halts: HaltService, killSwitch: KillSwitch,
     }
   });
 
-  ipcMain.handle('risk:clearHalt', async (_event, scope: string, reason: string) => {
+  ipcMain.handle('risk:clearHalt', async (event, scope: string, reason: string) => {
+    if (!isTrustedSender(event.sender)) return untrusted;
     try {
       halts.clearHalt(scope, reason, 'human');
       return { success: true };
@@ -44,7 +53,8 @@ export function registerRiskHandlers(halts: HaltService, killSwitch: KillSwitch,
     }
   });
 
-  ipcMain.handle('risk:killSwitch', async (_event, reason: string) => {
+  ipcMain.handle('risk:killSwitch', async (event, reason: string) => {
+    if (!isTrustedSender(event.sender)) return untrusted;
     try {
       const result = await killSwitch.activate(typeof reason === 'string' && reason.trim() ? reason : 'manual kill switch', 'human');
       return {

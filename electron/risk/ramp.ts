@@ -1,7 +1,8 @@
 /**
  * Ramp stages (spec §4.5) — pure transition rules, no I/O.
  *
- *   paper → probation : ≥ new_template_paper_days in paper, the bot ran in that time, no runtime
+ *   paper → probation : ≥ new_template_paper_days in paper, running on ≥ ceil(days / 2) distinct
+ *                       UTC days (at least 1) in that time, no runtime
  *                       errors, not halted; blocked for a `new` template when
  *                       approvals.new_template_live is true (approval records come later)
  *   probation → full  : ≥ probation_min_fills live fills, ≥ probation_min_days, no halt since
@@ -23,8 +24,8 @@ export interface RampInput {
   stageSince: number;
   now: number;
   templateTrust: ScriptTrust;
-  /** Bot was started at least once since entering the stage */
-  ranSinceStageChange: boolean;
+  /** Distinct UTC days on which the bot was running since entering the stage (incl. that day) */
+  runDaysSinceStageChange: number;
   /** Last runtime error (epoch ms) or null */
   lastErrorAt: number | null;
   halted: boolean;
@@ -78,7 +79,10 @@ export function decideRampTransition(
       if (days < ramp.new_template_paper_days) {
         return { action: 'none', reason: `${days.toFixed(1)} of ${ramp.new_template_paper_days} paper days` };
       }
-      if (!input.ranSinceStageChange) return { action: 'none', reason: 'bot has not run in paper' };
+      const needDays = Math.max(1, Math.ceil(ramp.new_template_paper_days / 2));
+      if (!(input.runDaysSinceStageChange >= needDays)) {
+        return { action: 'none', reason: `ran on ${input.runDaysSinceStageChange} of ${needDays} required days in paper` };
+      }
       if (input.lastErrorAt !== null && input.lastErrorAt >= input.stageSince) {
         return { action: 'none', reason: 'runtime error during paper stage' };
       }

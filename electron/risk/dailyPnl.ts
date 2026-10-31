@@ -8,8 +8,10 @@
  * `qty_dayStart` is rebuilt from the fills (net quantity of fills before the day start), so the
  * result is exact even when the day-start marks were captured some minutes after midnight.
  *
- * Marks: the current mid if available, else the last known mark, else the day-start mark,
- * else the average cost (zero unrealized). Every fallback is reported in `staleMarks` so the
+ * Marks now: the current mid if available, else the last known mark, else the day-start mark,
+ * else the average cost. Day-start marks: the frozen mark captured for the day, else the average
+ * cost at the day start (never the moving last-known mark). Sold quantity beyond the recorded
+ * holding contributes zero P&L. Every fallback is reported in `staleMarks` so the
  * caller can log/audit it — a missing price is never silently treated as "no loss".
  */
 
@@ -115,11 +117,14 @@ export function computeDailyPnl(input: DailyPnlInput): DailyPnlResult {
     } else {
       const sold = Math.min(qty, b.qty);
       const avg = b.qty > QTY_EPS ? b.cost / b.qty : 0;
-      const pnl = quote - avg * sold; // selling more than held: excess proceeds count as P&L
+      // Only the part backed by recorded holdings counts: selling more than the order-linked
+      // fills show contributes zero P&L (e.g. paper positions opened before OrderService)
+      const proceeds = qty > QTY_EPS ? quote * (sold / qty) : 0;
+      const pnl = proceeds - avg * sold;
       realizedAllTime += pnl;
       if (today) {
         realizedToday += pnl;
-        cashFlowToday += quote;
+        cashFlowToday += proceeds;
       }
       b.cost -= avg * sold;
       b.qty -= sold;
@@ -165,11 +170,9 @@ export function computeDailyPnl(input: DailyPnlInput): DailyPnlResult {
     let markStart = 0;
     let markStartSource: MarkSource = 'day_start';
     if (b.qtyStart > QTY_EPS) {
+      // Never the moving last-known mark: that would re-baseline the loss as the price falls
       if (validPrice(input.dayStartMarks[key])) {
         markStart = input.dayStartMarks[key];
-      } else if (validPrice(input.lastKnownMarks[key])) {
-        markStart = input.lastKnownMarks[key];
-        markStartSource = 'last_known';
       } else {
         markStart = b.avgAtStart;
         markStartSource = 'cost';

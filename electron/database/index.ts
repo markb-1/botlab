@@ -360,6 +360,15 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     'ALTER TABLE bots ADD COLUMN stage_changed_at TEXT',
     'ALTER TABLE bots ADD COLUMN last_error_at TEXT',
     'ALTER TABLE bots ADD COLUMN reached_full_at TEXT',
+    // 1c review: per-mode daily P&L, loss baseline set when a human clears a halt, run days for the ramp
+    'ALTER TABLE risk_state ADD COLUMN day_live_pnl REAL',
+    'ALTER TABLE risk_state ADD COLUMN day_paper_pnl REAL',
+    'ALTER TABLE risk_state ADD COLUMN loss_baseline TEXT',
+    `CREATE TABLE IF NOT EXISTS bot_run_days (
+      bot_id TEXT NOT NULL,
+      day TEXT NOT NULL,
+      PRIMARY KEY (bot_id, day)
+    )`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

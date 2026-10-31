@@ -158,7 +158,18 @@ export class HaltService extends EventEmitter {
     if (!row || row.halted !== 1) throw new Error(`${scope === GLOBAL_SCOPE ? 'Global scope' : `Bot ${scope}`} is not halted`);
 
     this.deps.riskStateRepo.setHalted(scope, false);
-    this.deps.audit.record(actor, 'risk.halt_clear', scope, { reason: reason.trim(), previousReason: row.halted_reason, haltedAt: row.halted_at });
+    // The daily loss limit applies afresh from here: losing another full limit today halts again
+    const day = this.deps.riskStateRepo.getGlobal()?.day_start ?? null;
+    const baseline = day
+      ? { day, live: row.day_live_pnl ?? 0, paper: row.day_paper_pnl ?? 0, at: new Date().toISOString() }
+      : null;
+    this.deps.riskStateRepo.setLossBaseline(scope, baseline);
+    this.deps.audit.record(actor, 'risk.halt_clear', scope, {
+      reason: reason.trim(),
+      previousReason: row.halted_reason,
+      haltedAt: row.halted_at,
+      lossBaseline: baseline,
+    });
     logger.info(`[Halt] ${scope} halt cleared by ${actor}: ${reason.trim()}`);
     this.emit(RISK_HALT_CLEARED_EVENT, { scope, reason: reason.trim(), actor, at: new Date().toISOString() });
   }

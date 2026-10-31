@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, powerMonitor } from 'electron';
 import path from 'path';
 import { initializeDatabase, closeDatabase, getDataDir } from './database/index';
 import {
@@ -95,6 +95,11 @@ async function createWindow(): Promise<void> {
     await mainWindow.loadFile(indexPath);
   }
 
+  // Windows: forced shutdown / restart / log off (see also powerMonitor 'shutdown' in whenReady)
+  mainWindow.on('session-end', () => {
+    startGracefulShutdown();
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -187,7 +192,7 @@ async function initializePhaseA(): Promise<void> {
   registerBacktestHandlers(db, scriptRepo, backtestRepo);
 
   // 9. Risk handlers (halts, kill switch) — available before unlock
-  registerRiskHandlers(halts, killSwitch, botRepo);
+  registerRiskHandlers(halts, killSwitch, botRepo, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
 
   // 10. App info handlers
   ipcMain.handle('app:version', () => app.getVersion());
@@ -284,13 +289,37 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
 }
 
 // App lifecycle
+// One instance only: a second one would share the DB and overwrite the shutdown marker.
+// It quits before touching either.
+const hasInstanceLock = app.requestSingleInstanceLock();
+if (!hasInstanceLock) {
+  console.error('[Main] Another BotLab instance is running; quitting');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 app.whenReady().then(async () => {
+  if (!hasInstanceLock) return;
   try {
     // Phase A: DB + repos + auth handlers
     await initializePhaseA();
 
     // Create window (React will call auth:status to decide what to show)
     await createWindow();
+
+    // OS shutdown/logoff: run the graceful path so a reboot does not start halted.
+    // Linux/macOS: powerMonitor 'shutdown' can delay it; Windows: 'session-end'.
+    // (typed without the event, but Electron passes one whose preventDefault delays the shutdown)
+    powerMonitor.on('shutdown', (event?: { preventDefault?: () => void }) => {
+      event?.preventDefault?.();
+      startGracefulShutdown();
+    });
 
     app.on('activate', () => {
       // On macOS, re-create window when dock icon is clicked
@@ -337,9 +366,8 @@ async function gracefulShutdown(): Promise<void> {
   }
 }
 
-app.on('before-quit', (event) => {
-  if (shutdownDone) return;
-  event.preventDefault();
+/** Starts the graceful shutdown once; quits the app when it is done (or timed out). */
+function startGracefulShutdown(): void {
   if (shutdownStarted) return;
   shutdownStarted = true;
 
@@ -358,6 +386,13 @@ app.on('before-quit', (event) => {
       shutdownDone = true;
       app.quit();
     });
+}
+
+app.on('before-quit', (event) => {
+  // Second instance: never initialised anything, nothing to shut down
+  if (!hasInstanceLock || shutdownDone) return;
+  event.preventDefault();
+  startGracefulShutdown();
 });
 
 // Ctrl+C / service stop / Windows console close: quit gracefully (spec §15.2)

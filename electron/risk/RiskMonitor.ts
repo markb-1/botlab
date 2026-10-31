@@ -35,7 +35,7 @@ const MAX_CONSECUTIVE_FAILURES = 5;
 const QTY_EPS = 1e-9;
 
 export interface RiskMonitorDeps {
-  botRepo: Pick<BotRepository, 'findAll' | 'setStage' | 'countReachedFull'>;
+  botRepo: Pick<BotRepository, 'findAll' | 'setStage' | 'countReachedFull' | 'countRunDays'>;
   scriptRepo: Pick<ScriptRepository, 'findById' | 'setTrust'>;
   tradeRepo: Pick<BotTradeRepository, 'findPnlFills'>;
   riskStateRepo: RiskStateRepository;
@@ -286,16 +286,22 @@ export class RiskMonitor {
         dayStartEquity: shown.dayStartValue,
         dayRealizedPnl: shown.realizedPnl,
         dayUnrealizedPnl: shown.unrealizedChange,
+        dayLivePnl: live.totalPnl,
+        dayPaperPnl: paper.totalPnl,
       });
 
       this.trackDrawdown(bot, live, stateByScope.get(bot.id));
 
       if (!limits) continue;
       const limit = limits.per_bot_defaults.daily_loss_limit_usd;
+      const baseline = riskStateRepo.getLossBaseline(bot.id);
       for (const [mode, r] of [['live', live], ['paper', paper]] as const) {
-        const loss = -r.totalPnl;
+        // After a human cleared a halt today, the loss counts from the P&L at that moment
+        const base = baseline?.day === dayStart ? baseline[mode] : 0;
+        const loss = -(r.totalPnl - base);
         if (loss > 0 && loss >= limit && !riskStateRepo.isHalted(bot.id)) {
-          const reason = `daily loss limit: ${mode} loss ${usd(loss)} USD ≥ ${usd(limit)} USD`;
+          const since = base !== 0 ? ` since the halt was cleared at ${baseline!.at}` : '';
+          const reason = `daily loss limit: ${mode} loss ${usd(loss)} USD${since} ≥ ${usd(limit)} USD`;
           await this.deps.halts.haltBot(bot.id, reason, 'system', { lossHalt: true });
           halted.push(bot.id);
         }
@@ -313,11 +319,13 @@ export class RiskMonitor {
       dayStartEquity: liveResults.reduce((s, r) => s + r.dayStartValue, 0),
       dayRealizedPnl: global.realizedPnl,
       dayUnrealizedPnl: global.unrealizedChange,
+      dayLivePnl: global.totalPnl,
     });
 
     let killSwitch = false;
     if (limits) {
-      const loss = -global.totalPnl;
+      const baseline = riskStateRepo.getLossBaseline(GLOBAL_SCOPE);
+      const loss = -(global.totalPnl - (baseline?.day === dayStart ? baseline.live : 0));
       const limit = limits.global.daily_loss_limit_usd;
       if (loss > 0 && loss >= limit && !riskStateRepo.isHalted(GLOBAL_SCOPE)) {
         await this.deps.killSwitch.activate(`global daily loss limit: loss ${usd(loss)} USD ≥ ${usd(limit)} USD`, 'system');
@@ -369,7 +377,7 @@ export class RiskMonitor {
       const liveFills = fillRows.filter(
         (f) => f.bot_id === bot.id && f.simulated !== 1 && parseDbTime(f.executed_at) >= stageSince
       ).length;
-      const started = bot.last_started_at ? parseDbTime(bot.last_started_at) : NaN;
+      const runDays = this.deps.botRepo.countRunDays(bot.id, new Date(utcDayStart(stageSince)).toISOString().slice(0, 10));
 
       const decision = decideRampTransition(
         {
@@ -377,7 +385,7 @@ export class RiskMonitor {
           stageSince,
           now,
           templateTrust: trust,
-          ranSinceStageChange: started >= stageSince || bot.status === 'running',
+          runDaysSinceStageChange: runDays,
           lastErrorAt: bot.last_error_at ? parseDbTime(bot.last_error_at) : null,
           halted: state?.halted === 1,
           lastHaltedAt: state?.last_halted_at ? parseDbTime(state.last_halted_at) : null,

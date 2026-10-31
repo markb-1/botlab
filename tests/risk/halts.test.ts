@@ -125,8 +125,99 @@ describe.skipIf(!sqliteAvailable)('halts, daily loss limits and the kill switch'
     expect(r.staleMarks).toEqual(['polymarket:t1']);
     expect(r.bots.find((b) => b.scope === 'b1')!.result.totalPnl).toBeCloseTo(-60);
     expect(h.auditRepo.list({ action: 'risk.marks_stale' })).toHaveLength(1);
-    // Loss still above the limit ⇒ halted again
+    // The loss limit counts from the P&L when the halt was cleared (R23): no new loss ⇒ not re-halted
+    expect(h.riskStateRepo.isHalted('b1')).toBe(false);
+  });
+
+  it('after a human clears a loss halt the limit applies afresh: another full limit of loss halts again', async () => {
+    h.limits.global.daily_loss_limit_usd = 1000;
+    h.addBot('b1', { stage: 'probation' });
+    h.addFill('b1', 't1', 'BUY', 400, 0.5, DAY_START - 3_600_000);
+    h.marks['polymarket:t1'] = 0.5;
+    await h.monitor.runOnce();
+    h.marks['polymarket:t1'] = 0.35; // −60
+    h.clock.now += 60_000;
+    await h.monitor.runOnce();
     expect(h.riskStateRepo.isHalted('b1')).toBe(true);
+    h.halts.clearHalt('b1', 'accepting the risk', 'human');
+    expect(h.riskStateRepo.getLossBaseline('b1')).toMatchObject({ live: expect.closeTo(-60, 5) });
+
+    h.marks['polymarket:t1'] = 0.3; // −80 today, −20 since the clear
+    h.clock.now += 60_000;
+    await h.monitor.runOnce();
+    expect(h.riskStateRepo.isHalted('b1')).toBe(false);
+
+    h.marks['polymarket:t1'] = 0.22; // −112 today, −52 since the clear
+    h.clock.now += 60_000;
+    await h.monitor.runOnce();
+    expect(h.riskStateRepo.get('b1')!.halted_reason).toMatch(/live loss 52\.00 USD since the halt was cleared/);
+
+    // A new day ignores the old baseline
+    h.halts.clearHalt('b1', 'again', 'human');
+    h.clock.now = T0 + DAY;
+    h.marks['polymarket:t1'] = 0.22;
+    await h.monitor.runOnce();
+    h.marks['polymarket:t1'] = 0.08; // −56 from today's 0.22 day-start mark
+    h.clock.now += 60_000;
+    await h.monitor.runOnce();
+    expect(h.riskStateRepo.get('b1')!.halted_reason).toMatch(/live loss 56\.00 USD ≥/);
+  });
+
+  it('reviewer case in the monitor: no mark at the day start ⇒ cost basis, and a late first mark never re-baselines', async () => {
+    h.limits.per_bot_defaults.daily_loss_limit_usd = 1000;
+    h.limits.global.daily_loss_limit_usd = 1000;
+    h.addBot('b1', { stage: 'full' });
+    h.addFill('b1', 't1', 'BUY', 1000, 0.6, DAY_START - 3_600_000);
+    // First run of the day: book unavailable, no last known mark
+    const r1 = await h.monitor.runOnce();
+    expect(r1.newDay).toBe(true);
+    expect(JSON.parse(h.riskStateRepo.getGlobal()!.day_start_marks!)).toEqual({});
+
+    h.marks['polymarket:t1'] = 0.3;
+    for (let i = 0; i < 2; i++) {
+      h.clock.now += 60_000;
+      const r = await h.monitor.runOnce();
+      expect(r.bots.find((b) => b.scope === 'b1')!.result.totalPnl).toBeCloseTo(-300);
+    }
+    expect(JSON.parse(h.riskStateRepo.getGlobal()!.day_start_marks!)).toEqual({});
+  });
+
+  it('an order the exchange accepts after the kill switch finished is cancelled immediately', async () => {
+    h.addBot('b1', { stage: 'full' });
+    h.running.add('b1');
+    let answer!: (v: unknown) => void;
+    h.poly.postLimitOrder.mockImplementation(
+      () => new Promise((resolve) => {
+        answer = resolve;
+      })
+    );
+    const svc = h.orderService('b1');
+    const placing = svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+    await vi.waitFor(() => expect(h.poly.postLimitOrder).toHaveBeenCalled());
+
+    // Kill switch runs to completion while the order is in flight (no exchange id yet)
+    const ks = await h.killSwitch.activate('test', 'human');
+    expect(ks.unknownOutcome).toBeGreaterThan(0);
+    expect(h.poly.cancelOrders).not.toHaveBeenCalled();
+
+    answer({ kind: 'accepted', exchangeOrderId: 'ex-late', status: 'live', filledSize: null, filledNotional: null });
+    const r = await placing;
+    expect(h.poly.cancelOrders).toHaveBeenCalledWith(['ex-late']);
+    expect(r.status).toBe('cancelled');
+    expect(h.orderRepo.findById(r.orderId!)!.status).toBe('cancelled');
+    expect(h.auditRepo.list({ action: 'order.cancel_after_halt' })[0]).toMatchObject({ target: r.orderId, result: 'ok' });
+  });
+
+  it('a bot halt set while the order was in flight also cancels it', async () => {
+    h.addBot('b1', { stage: 'full' });
+    let answer!: (v: unknown) => void;
+    h.poly.postLimitOrder.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    const placing = h.orderService('b1').placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20 });
+    await vi.waitFor(() => expect(h.poly.postLimitOrder).toHaveBeenCalled());
+    await h.halts.haltBot('b1', 'manual', 'human');
+    answer({ kind: 'accepted', exchangeOrderId: 'ex-late', status: 'live', filledSize: null, filledNotional: null });
+    expect((await placing).status).toBe('cancelled');
+    expect(h.poly.cancelOrders).toHaveBeenCalledWith(['ex-late']);
   });
 
   it('global loss over the limit ⇒ kill switch', async () => {

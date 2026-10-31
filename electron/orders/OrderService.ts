@@ -575,12 +575,58 @@ export class OrderService {
     } catch (err) {
       outcome = { kind: 'unknown', error: err instanceof Error ? err.message : String(err) };
     }
-    const updated = this.applyOutcome(row, outcome, feeRate, ctx);
+    const updated = await this.cancelIfHaltedAfterSubmit(this.applyOutcome(row, outcome, feeRate, ctx));
     if (this.paper && ctx.info && updated.filled_size > 0) {
       this.bot.paperState?.updatePositionMeta(input.tokenId, ctx.info.question, ctx.info.outcome);
     }
     if (outcome.kind !== 'accepted') return resultFromRow(updated, { ok: false, error: outcome.error });
-    return resultFromRow(updated, updated.status === 'cancelled' ? { error: 'Order did not fill (unmatched)' } : {});
+    return resultFromRow(updated, updated.status === 'cancelled' ? { error: 'Order cancelled: did not fill (unmatched) or cancelled after a halt' } : {});
+  }
+
+  /**
+   * The order passed the risk check before a halt or kill switch, but the exchange answered after
+   * it (whose cancel pass could not see an exchange id yet). If a halt is now set and the order may
+   * still rest, cancel it right away. Orders without an exchange id cannot be cancelled; they are
+   * audited and expire on their own.
+   */
+  private async cancelIfHaltedAfterSubmit(row: OrderRow): Promise<OrderRow> {
+    if (!OPEN_STATUSES.includes(row.status)) return row;
+    const global = this.deps.provider.isGloballyHalted();
+    const bot = this.deps.provider.getBotInfo(this.bot.botId);
+    if (!global.halted && bot && !bot.halted) return row;
+    const why = global.halted
+      ? `global halt: ${global.reason ?? 'no reason'}`
+      : `bot halt: ${bot?.haltReason ?? (bot ? 'no reason' : 'bot not found')}`;
+
+    let error: string | null = null;
+    try {
+      await this.botLock(async () => {
+        const fresh = this.deps.orderRepo.findById(row.id);
+        if (!fresh || !OPEN_STATUSES.includes(fresh.status)) return;
+        if (this.paper) {
+          this.deps.orderRepo.update(fresh.id, { status: 'cancelled' });
+        } else if (fresh.exchange === 'polymarket' && fresh.exchange_order_id) {
+          await this.cancelRows([fresh]);
+        } else {
+          error = 'no exchange order id (outcome unknown); cannot cancel';
+        }
+      });
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+    const after = this.deps.orderRepo.findById(row.id) ?? row;
+    const stillOpen = OPEN_STATUSES.includes(after.status);
+    logger.warning(
+      `[OrderService] ${this.bot.botName}: order ${row.id} answered after a halt (${why}); ${stillOpen ? `still ${after.status}${error ? `: ${error}` : ''}` : after.status}`
+    );
+    this.deps.audit?.record(
+      'system',
+      'order.cancel_after_halt',
+      row.id,
+      { botId: this.bot.botId, why, status: after.status, ...(error ? { error } : {}) },
+      stillOpen ? 'failed' : 'ok'
+    );
+    return after;
   }
 
   private async lookupForecast(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null> {
@@ -836,7 +882,9 @@ export class OrderService {
       return resultFromRow(r, { ok: false, error: 'Order did not fill' });
     }
     // Binance fees are charged in the traded asset/BNB; not modelled here (fee_usd = 0)
-    const updated = this.applyOutcome(row, outcome, 0, { info: null, market: null, book: null, feeCategory: null, category: null });
+    const updated = await this.cancelIfHaltedAfterSubmit(
+      this.applyOutcome(row, outcome, 0, { info: null, market: null, book: null, feeCategory: null, category: null })
+    );
     return resultFromRow(updated, outcome.kind === 'accepted' ? {} : { ok: false, error: outcome.error });
   }
 

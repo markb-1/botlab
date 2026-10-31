@@ -171,6 +171,12 @@ describe.skipIf(!sqliteAvailable)('ramp in the risk monitor', () => {
     h.db
       .prepare('UPDATE bots SET stage_changed_at = ?, last_started_at = ? WHERE id = ?')
       .run(new Date(T0 - 8 * DAY).toISOString(), new Date(T0 - 7.5 * DAY).toISOString(), 'pp');
+    // Ran on 3 distinct days: not enough (ceil(7 / 2) = 4)
+    for (const d of [7, 6, 5]) h.botRepo.recordRunDay('pp', new Date(T0 - d * DAY));
+    await h.monitor.runOnce();
+    expect(h.botRepo.findById('pp')!.stage).toBe('paper');
+    h.botRepo.recordRunDay('pp', new Date(T0 - 7 * DAY)); // same day again: still 3
+    h.botRepo.recordRunDay('pp', new Date(T0 - 2 * DAY));
 
     h.limits.approvals.new_template_live = true;
     await h.monitor.runOnce();
@@ -188,6 +194,7 @@ describe.skipIf(!sqliteAvailable)('ramp in the risk monitor', () => {
     h.db
       .prepare('UPDATE bots SET stage_changed_at = ?, last_started_at = ? WHERE id = ?')
       .run(new Date(T0 - 8 * DAY).toISOString(), new Date(T0 - 7.5 * DAY).toISOString(), 'pp');
+    for (const d of [7, 6, 5, 4]) h.botRepo.recordRunDay('pp', new Date(T0 - d * DAY));
     h.riskStateRepo.setHalted(GLOBAL_SCOPE, true, 'test');
     await h.monitor.runOnce();
     expect(h.botRepo.findById('pp')!.stage).toBe('paper');
@@ -216,8 +223,27 @@ describe.skipIf(!sqliteAvailable)('script versions', () => {
       [1, 'a', 'A', 'human'],
     ]);
 
+    // Bots on the script go back to paper (retired stays retired), audited per bot
+    for (const [id, stage] of [['full1', 'full'], ['prob1', 'probation'], ['ret1', 'retired'], ['pap1', 'paper']] as const) {
+      h.addBot(id, { stage });
+      h.db.prepare('UPDATE bots SET script_id = ? WHERE id = ?').run(s.id, id);
+    }
+    h.scriptRepo.update(s.id, { source: 'c' });
+    expect(['full1', 'prob1', 'ret1', 'pap1'].map((id) => h.botRepo.findById(id)!.stage)).toEqual(['paper', 'paper', 'retired', 'paper']);
+    const demotions = h.auditRepo.list({ action: 'bot.stage' });
+    expect(demotions.map((a) => a.target).sort()).toEqual(['full1', 'prob1']);
+    expect(demotions[0]).toMatchObject({ actor: 'human' });
+    expect(JSON.parse(demotions[0].payload!)).toMatchObject({ to: 'paper', reason: expect.stringMatching(/r2 → r3/) });
+    h.scriptRepo.update(s.id, { description: 'metadata only' });
+    expect(h.auditRepo.list({ action: 'bot.stage' })).toHaveLength(2);
+
     const builtin = h.scriptRepo.create({ name: 'tpl', source: 'x', isTemplate: true, origin: 'builtin' });
+    h.addBot('tplbot', { stage: 'full' });
+    h.db.prepare('UPDATE bots SET script_id = ? WHERE id = ?').run(builtin.id, 'tplbot');
     expect(builtin).toMatchObject({ trust: 'proven', kind: 'template', origin: 'builtin' });
     expect(h.scriptRepo.update(builtin.id, { source: 'y' }, 'system')).toMatchObject({ revision: 2, trust: 'proven' });
+    // Seeding a changed builtin template demotes its bots too
+    expect(h.botRepo.findById('tplbot')!.stage).toBe('paper');
+    expect(h.auditRepo.list({ action: 'bot.stage', target: 'tplbot' })[0]).toMatchObject({ actor: 'system' });
   });
 });

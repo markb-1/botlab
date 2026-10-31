@@ -217,6 +217,21 @@ export class BotManager extends EventEmitter {
     return this.riskEngine?.getConfig().limits ?? null;
   }
 
+  /** Why the bot may not run (bot or global halt), or null. */
+  private haltReason(botId: string): string | null {
+    const riskState = this.orderDeps?.riskStateRepo;
+    if (!riskState) return null;
+    const global = riskState.get(GLOBAL_SCOPE);
+    if (global?.halted === 1) {
+      return `Global halt active (${global.halted_reason ?? 'no reason'}); a human must clear it first`;
+    }
+    const own = riskState.get(botId);
+    if (own?.halted === 1) {
+      return `Bot is halted (${own.halted_reason ?? 'no reason'}); a human must clear the halt first`;
+    }
+    return null;
+  }
+
   setRecoveryInProgress(inProgress: boolean): void {
     this.recoveryInProgress = inProgress;
   }
@@ -435,17 +450,8 @@ export class BotManager extends EventEmitter {
     if (this.recoveryInProgress) {
       throw new Error('Startup recovery (orphan order cleanup) is still running; try again shortly');
     }
-    const riskState = this.orderDeps?.riskStateRepo;
-    if (riskState) {
-      const global = riskState.get(GLOBAL_SCOPE);
-      if (global?.halted === 1) {
-        throw new Error(`Global halt active (${global.halted_reason ?? 'no reason'}); a human must clear it first`);
-      }
-      const own = riskState.get(botId);
-      if (own?.halted === 1) {
-        throw new Error(`Bot is halted (${own.halted_reason ?? 'no reason'}); a human must clear the halt first`);
-      }
-    }
+    const halted = this.haltReason(botId);
+    if (halted) throw new Error(halted);
 
     // Check if already running
     const existingInstance = this.instances.get(botId);
@@ -507,6 +513,10 @@ export class BotManager extends EventEmitter {
       this.updateHeartbeat(botId);
     });
 
+    // A halt may have been set while the wallet/client were being prepared
+    const haltedBefore = this.haltReason(botId);
+    if (haltedBefore) throw new Error(haltedBefore);
+
     // Store instance
     this.instances.set(botId, instance);
 
@@ -518,6 +528,23 @@ export class BotManager extends EventEmitter {
       this.orderServices.delete(botId);
       throw err;
     }
+
+    // ...or while the worker was starting (a halt's stop pass may have run before the instance existed)
+    const haltedAfter = this.haltReason(botId);
+    if (haltedAfter) {
+      try {
+        await instance.stop();
+      } catch (err) {
+        logger.error(`Could not stop bot ${botId} after a halt during start: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        this.instances.delete(botId);
+        this.orderServices.delete(botId);
+        this.botRepo.update(botId, { status: 'stopped', lastStoppedAt: new Date().toISOString() });
+      }
+      this.orderDeps?.audit?.record('system', 'bot.stop', botId, { reason: `halted during start: ${haltedAfter}` }, 'ok');
+      throw new Error(haltedAfter);
+    }
+    this.botRepo.recordRunDay(botId);
 
     // Update database
     this.botRepo.update(botId, {

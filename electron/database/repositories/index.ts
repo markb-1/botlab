@@ -23,7 +23,7 @@ export { OrderRepository, OPEN_ORDER_STATUSES } from './OrderRepository';
 export type { OrderRow, OrderStatus } from './OrderRepository';
 
 export { RiskStateRepository, GLOBAL_SCOPE } from './RiskStateRepository';
-export type { RiskStateRow } from './RiskStateRepository';
+export type { RiskStateRow, LossBaseline } from './RiskStateRepository';
 
 export { AuditRepository } from './AuditRepository';
 export type { AuditRow, AuditActor, AuditEntry } from './AuditRepository';

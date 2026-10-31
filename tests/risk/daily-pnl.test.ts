@@ -96,17 +96,41 @@ describe('computeDailyPnl', () => {
     expect(r.totalPnl).toBeCloseTo(3.5);
   });
 
-  it('missing day-start mark for a position held at the day start: last known mark, flagged stale', () => {
+  it('missing day-start mark: cost basis at the day start, never the moving last-known mark', () => {
     const r = computeDailyPnl({
       fills: [fill('A', 'BUY', 100, 0.4, YESTERDAY)],
       dayStartMs: DAY_START,
       dayStartMarks: {},
       currentMarks: { 'polymarket:A': 0.3 },
-      lastKnownMarks: { 'polymarket:A': 0.5 },
+      lastKnownMarks: { 'polymarket:A': 0.3 },
     });
-    expect(r.totalPnl).toBeCloseTo(100 * (0.3 - 0.5));
-    expect(r.positions[0].markStartSource).toBe('last_known');
+    expect(r.totalPnl).toBeCloseTo(100 * (0.3 - 0.4));
+    expect(r.positions[0].markStartSource).toBe('cost');
     expect(r.staleMarks).toEqual(['polymarket:A']);
+  });
+
+  it('reviewer case: 1000 bought at 0.60, no mark at 00:00, now 0.30 ⇒ about −300', () => {
+    const r = computeDailyPnl({
+      fills: [fill('A', 'BUY', 1000, 0.6, YESTERDAY)],
+      dayStartMs: DAY_START,
+      dayStartMarks: {},
+      currentMarks: { 'polymarket:A': 0.3 },
+      lastKnownMarks: { 'polymarket:A': 0.3 },
+    });
+    expect(r.totalPnl).toBeCloseTo(-300);
+  });
+
+  it('selling more than the recorded holding: the excess contributes zero P&L', () => {
+    const r = computeDailyPnl({
+      fills: [fill('A', 'BUY', 10, 0.5, TODAY), fill('A', 'SELL', 30, 0.5, TODAY + 1)],
+      dayStartMs: DAY_START,
+      dayStartMarks: {},
+      currentMarks: {},
+      lastKnownMarks: {},
+    });
+    expect(r.totalPnl).toBeCloseTo(0);
+    expect(r.realizedPnl).toBeCloseTo(0);
+    expect(r.cumulativePnl).toBeCloseTo(0);
   });
 
   it('a pure price drop on a held position is a loss even with no trades today', () => {

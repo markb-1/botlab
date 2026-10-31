@@ -24,6 +24,19 @@ export interface RiskStateRow {
   ramp_since: string | null;
   ramp_pnl_peak: number | null;
   ramp_max_drawdown_usd: number | null;
+  /** Today's total P&L of live / paper fills (global row: live only) */
+  day_live_pnl: number | null;
+  day_paper_pnl: number | null;
+  /** JSON LossBaseline: P&L at the moment a human cleared a halt; the loss limit counts from there */
+  loss_baseline: string | null;
+}
+
+export interface LossBaseline {
+  /** ISO day start the baseline belongs to; ignored on other days */
+  day: string;
+  live: number;
+  paper: number;
+  at: string;
 }
 
 /**
@@ -89,6 +102,25 @@ export class RiskStateRepository {
     this.db.prepare(`UPDATE risk_state SET ${sets.join(', ')} WHERE scope = ?`).run(...values);
   }
 
+  setLossBaseline(scope: string, baseline: LossBaseline | null): void {
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope, updated_at) VALUES (?, ?)').run(scope, now);
+    this.db
+      .prepare('UPDATE risk_state SET loss_baseline = ?, updated_at = ? WHERE scope = ?')
+      .run(baseline ? JSON.stringify(baseline) : null, now, scope);
+  }
+
+  getLossBaseline(scope: string): LossBaseline | null {
+    const text = this.get(scope)?.loss_baseline;
+    if (!text) return null;
+    try {
+      const b = JSON.parse(text) as LossBaseline;
+      return typeof b.day === 'string' && Number.isFinite(b.live) && Number.isFinite(b.paper) ? b : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Bot rows: probation drawdown tracking. */
   setRampTracking(scope: string, data: { since: string | null; peak: number | null; maxDrawdownUsd: number | null }): void {
     const now = new Date().toISOString();
@@ -105,6 +137,8 @@ export class RiskStateRepository {
       dayRealizedPnl: number;
       dayUnrealizedPnl: number;
       ordersLastHour: number;
+      dayLivePnl: number;
+      dayPaperPnl: number;
     }>
   ): void {
     const now = new Date().toISOString();
@@ -116,6 +150,8 @@ export class RiskStateRepository {
     if (data.dayRealizedPnl !== undefined) { sets.push('day_realized_pnl = ?'); values.push(data.dayRealizedPnl); }
     if (data.dayUnrealizedPnl !== undefined) { sets.push('day_unrealized_pnl = ?'); values.push(data.dayUnrealizedPnl); }
     if (data.ordersLastHour !== undefined) { sets.push('orders_last_hour = ?'); values.push(data.ordersLastHour); }
+    if (data.dayLivePnl !== undefined) { sets.push('day_live_pnl = ?'); values.push(data.dayLivePnl); }
+    if (data.dayPaperPnl !== undefined) { sets.push('day_paper_pnl = ?'); values.push(data.dayPaperPnl); }
     if (sets.length === 0) return;
 
     sets.push('updated_at = ?');

@@ -1,5 +1,8 @@
 import type Database from 'better-sqlite3';
 import { generateId, sourceHash } from '../index';
+import { AuditRepository, type AuditActor } from './AuditRepository';
+import { lowerStage } from '../../risk/ramp';
+import type { BotStage } from '../../risk/types';
 
 export type ScriptOrigin = 'builtin' | 'human' | 'agent';
 export type ScriptTrust = 'new' | 'proven';
@@ -138,6 +141,28 @@ export class ScriptRepository {
       .all(scriptId) as ScriptVersionRow[];
   }
 
+  /**
+   * Changed code must re-earn its stage (spec §4.5): every bot on the script goes back to paper
+   * (retired stays retired), audited per bot. Runs inside the caller's transaction.
+   */
+  private demoteBots(scriptId: string, fromRevision: number, toRevision: number, changedBy: string): void {
+    const bots = this.db.prepare('SELECT id, stage FROM bots WHERE script_id = ?').all(scriptId) as Array<{ id: string; stage: BotStage }>;
+    const audit = new AuditRepository(this.db);
+    const now = new Date().toISOString();
+    const actor: AuditActor = changedBy === 'human' || changedBy === 'agent' ? changedBy : 'system';
+    for (const bot of bots) {
+      const to = lowerStage(bot.stage, 'paper');
+      if (to === bot.stage) continue;
+      this.db
+        .prepare("UPDATE bots SET stage = ?, stage_changed_at = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(to, now, bot.id);
+      audit.append(
+        { actor, action: 'bot.stage', target: bot.id, payload: { from: bot.stage, to, reason: `script ${scriptId} source changed (r${fromRevision} → r${toRevision})` } },
+        now
+      );
+    }
+  }
+
   setTrust(id: string, trust: ScriptTrust): void {
     this.db.prepare("UPDATE scripts SET trust = ?, updated_at = datetime('now') WHERE id = ?").run(trust, id);
   }
@@ -197,6 +222,7 @@ export class ScriptRepository {
       if (sourceChanged) {
         const compiled = data.compiled !== undefined ? data.compiled : null;
         this.insertVersion(id, revision, data.source!, compiled, newHash!, createdBy, new Date().toISOString());
+        this.demoteBots(id, existing.revision, revision, createdBy);
       }
     })();
 

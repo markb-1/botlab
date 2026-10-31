@@ -196,6 +196,18 @@ export class BotRepository {
     this.db
       .prepare("UPDATE bots SET last_heartbeat = datetime('now'), updated_at = datetime('now') WHERE id = ?")
       .run(id);
+    this.recordRunDay(id);
+  }
+
+  /** Mark that the bot was running on this UTC day (ramp: paper days actually run). */
+  recordRunDay(id: string, at: Date = new Date()): void {
+    this.db.prepare('INSERT OR IGNORE INTO bot_run_days (bot_id, day) VALUES (?, ?)').run(id, at.toISOString().slice(0, 10));
+  }
+
+  /** Distinct UTC days (YYYY-MM-DD ≥ fromDay) on which the bot was running. */
+  countRunDays(id: string, fromDay: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM bot_run_days WHERE bot_id = ? AND day >= ?').get(id, fromDay) as { n: number };
+    return row.n;
   }
 
   appendError(id: string, message: string, stack?: string): void {

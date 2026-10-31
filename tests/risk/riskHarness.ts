@@ -54,7 +54,7 @@ export const MARKET: MarketInfo = {
   question: 'Will CPI exceed 3%?',
   outcome: 'Yes',
   tokenIds: ['t1', 't2'],
-  endDate: '2026-12-01T00:00:00Z',
+  endDate: '2026-06-20T00:00:00Z', // within the 30-day horizon of the harness clock
   volume24hrUsd: 10_000,
   labels: ['Economics'],
   closed: false,
