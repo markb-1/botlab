@@ -23,7 +23,7 @@ export interface Bot {
   templateVersion?: number | null;
   scriptRevision?: number | null;
   scriptTrust?: string | null;
-  /** Standing builtin role: forecast-executor | position-manager */
+  /** Builtin role: forecast-executor | position-manager (standing) | consistency | resolution-rule (per opportunity) */
   role?: string | null;
   stageChangedAt?: string | null;
   lastStartedAt?: string | null;

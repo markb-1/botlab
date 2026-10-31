@@ -92,6 +92,52 @@ are seeded with trust \`new\`, so their bots start in paper and go through the r
   bought without a forecast (e.g. copy trading) only get the risk triggers; \`ignore_bot_ids\` leaves bots alone.
   Only this builtin template gets \`ctx.portfolio\`: a copy or fork of it does not (the server checks the script
   record), so do not try to write your own position manager.
+### Per-opportunity templates you create: Consistency and Resolution Rule (spec §9.3, §9.4)
+
+Unlike the standing roles, **you create these** (step 6 of the cycle), one bot per opportunity, paper only. They do
+not need forecasts or category rights (they trade in any allowed category from day one), but every market they buy
+must be **assessed for ambiguity first** (\`assess_market\` or a forecast; unassessed ⇒ the risk engine refuses the
+buys). The server checks on \`create_bot\` / \`update_bot_config\`: the strategy is in \`mandate.strategies.allow\`
+(\`consistency\`, \`resolution_rule\`), the config matches the template's configSchema, and **\`marketIds\` covers the
+market of every token in the config** (call \`get_market\` on each token first so the server knows its market).
+The bot itself refuses to start when a token is not the YES token of a binary market in its scope. Both retire
+themselves when their markets close; their positions are exited by the Position Manager on risk triggers only.
+
+**No shorting on Polymarket ⇒ complement token.** You cannot sell what you do not hold. "Sell the overpriced
+outcome" means **buy its NO token** (the other token of the binary market; \`get_market\` lists both). Buying
+YES at a and NO at b costs a + b and pays exactly 1, so the NO token is the short.
+
+- **Consistency** — a declared logical constraint between markets. Config: \`constraint\`, \`tokens\` (YES token ids,
+  in constraint order), \`min_gap\` (0.03, guaranteed profit per basket share **after taker fees on every leg at
+  the asks**), \`max_pair_usd\` (20), \`max_unhedged_usd\` (10), \`hedge_timeout_minutes\` (15), \`max_slippage\`
+  (0.02), \`flatten_unhedged\` (true), \`idle_days\` (7). Constraints:
+  - \`implies\`, tokens \`[A, B]\`: A implies B, so P(A) ≤ P(B) — e.g. A "Fed cuts ≥ 50 bp in March", B "Fed cuts in
+    March". If A trades above B it buys **B YES + A NO** (pays ≥ 1 whatever happens).
+  - \`date_ladder\`, tokens ordered by deadline, **earliest first** — e.g. "X by March 31", "X by June 30", "X by
+    Dec 31": prices must not fall with a later deadline; any inverted pair (earlier above later) is bought as
+    later YES + earlier NO. Ordering is checked against the markets' end dates.
+  - \`exclusive_sum\`, tokens = mutually exclusive outcomes (e.g. the candidates of one race, each its own binary
+    market), \`max_sum\` (1 = at most one wins): if the YES prices sum above \`max_sum\` it buys **NO on every leg**,
+    which pays ≥ n − max_sum; it trades only when Σ NO asks + fees ≤ (n − max_sum) − min_gap. If the YES prices sum
+    **below** 1 it does nothing unless you set \`exhaustive: true\` (exactly one outcome must win: no "Other", no
+    void, no tie — read the rules; most multi-outcome events are not safely exhaustive); then it buys YES on every
+    leg (pays exactly 1).
+  Execution: one basket at a time; legs rest post-only one tick inside the ask; a basket is sized so that the legs
+  that could fill without their hedge cost ≤ \`max_unhedged_usd\`. If some legs fill and others do not within
+  \`hedge_timeout_minutes\`, the missing legs are bought marketable up to their ask at opening + \`max_slippage\`
+  (only while the hedged basket still pays at least its cost); otherwise the basket is unhedged, no new baskets
+  open, and the bot sells its own unhedged excess (\`flatten_unhedged\`). The bot page shows the constraint and
+  the current gap.
+- **Resolution Rule** — one market where the resolution rules favour an outcome the price does not reflect (a
+  technicality, a resolution source, a date edge). Config: \`token_id\` (the outcome to buy, YES or NO token),
+  \`target_entry_price\`, \`max_size_usd\`, \`thesis\` (≤ 2000 chars, shown on the bot page: quote the rule and say
+  why it decides the outcome), optional \`forecast_id\`, \`invalidate_on_rules_change\` (true), \`max_ambiguity\`
+  (1), \`invalidate_before_end_minutes\` (120). It rests post-only bids at most at the target (one tick over the
+  best other bid), holds to resolution and never sells. It stops buying for good when the rules change, a dispute
+  is recorded, ambiguity rises above \`max_ambiguity\`, the linked forecast is withdrawn or falls below the
+  target, or you flag the position (\`flag_position_exit\`, which also makes the Position Manager exit it). To
+  abandon a thesis: flag the position (exit) or \`retire_bot\` (keeps the position).
+
 - \`kill_switch(reason)\` halts everything (all bots stopped, open orders cancelled). Only a human can clear it —
   use it for genuine emergencies only.
 
@@ -150,7 +196,10 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
   - \`ctx.buy(tokenId, amountUsd, opts?)\` / \`ctx.sell(tokenId, amountTokens, opts?)\` — marketable (FOK) orders,
     subject to slippage, spread and fee checks.
   - \`ctx.polymarket.cancel(orderId)\`, \`cancelAll()\`, \`getOpenOrders()\` (this bot's orders only),
-    \`getFee(tokenId)\` → \`{ takerRate, makerRate, formula, source }\`.
+    \`getOrderHistory(days?)\`, \`getFee(tokenId)\` → \`{ takerRate, makerRate, formula, source }\`.
+  - \`ctx.polymarket.getMarket(conditionIdOrTokenId)\` → the server's cached market: tokens, \`complementTokenId\`
+    (the NO token of a YES token), end date, closed, ambiguity, rules hash / change time, dispute, and \`inScope\`
+    (in this bot's market_ids).
 - Market data: \`ctx.getOrderBook\`, \`ctx.getMarketPrice\`, \`ctx.getMarkets\`, \`ctx.getEvent\`, \`ctx.getPositions\`,
   \`ctx.getBalance\` (USDC).
 - Ledger (read only): \`ctx.ledger.getActiveForecasts({ category?, tradeableOnly? })\`, \`ctx.ledger.getForecast(tokenId)\`
@@ -158,7 +207,10 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
   orders that act on a forecast (edge check against it; on the complement token the server uses 1 − p).
 - Events: \`ctx.events.on('forecast_changed' | 'rules_changed' | 'halt', handler)\` — pushed by the server as hints to
   re-check now; always re-read the current state (they are not replayed after a restart).
-- Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted.
+- Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted; \`ctx.risk.getExitFlags()\` → open
+  exit flags on this bot's positions.
+- \`ctx.requestRetire(reason)\` retires this bot (terminal; the server stops it right after) — for per-opportunity
+  bots whose opportunity is over.
 - Binance spot (USDT pairs only in paper): \`ctx.binance.buy(symbol, usdt)\`, \`sell(symbol, qty)\`, \`getPrice\`,
   \`getOrderBook\`, \`getBalance\`, \`getPositions\`.
 - \`ctx.fetch(url, init?)\` — https GET/POST to allowlisted hosts only (default: gamma-api / data-api /

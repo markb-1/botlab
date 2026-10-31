@@ -6,11 +6,18 @@ import { useOverview } from '../hooks/useRisk';
 import { Badge, ErrorBox, StageBadge } from '../components/ui';
 import { usd } from '../lib/format';
 
-/** Standing builtin roles (spec §9.1, §9.2): one running instance per mode */
-const ROLE_LABELS: Record<string, string> = { 'forecast-executor': 'executor', 'position-manager': 'position manager' };
+/** Builtin roles: standing (spec §9.1, §9.2; one running instance per mode) and per-opportunity strategies (§9.3, §9.4) */
+const ROLE_LABELS: Record<string, string> = {
+  'forecast-executor': 'executor',
+  'position-manager': 'position manager',
+  consistency: 'consistency',
+  'resolution-rule': 'resolution rule',
+};
 const ROLE_TITLES: Record<string, string> = {
   'forecast-executor': 'Standing forecast executor: bids on tradeable ledger forecasts (one per mode)',
   'position-manager': "Standing position manager: exits every bot's positions as risk exits (one per mode)",
+  consistency: 'Consistency bot: trades violations of a constraint between markets with hedged baskets',
+  'resolution-rule': 'Resolution-rule bot: bids up to a target on one outcome per its thesis, holds to resolution',
 };
 
 function StatusBadge({ status }: { status: Bot['status'] }) {
