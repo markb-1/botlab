@@ -46,7 +46,8 @@ import { seedTemplates, getBuiltinTemplates } from './db/seed';
 import { AuditService } from './audit/AuditService';
 import { OrderCanceller } from './orders/OrderCanceller';
 import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/MarketDataService';
-import { FeeService, FEE_CATEGORIES, type FeeCategory } from './orders/FeeService';
+import { FeeService } from './orders/FeeService';
+import type { FeeRates } from './orders/feeModel';
 import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
 import { LedgerService } from './ledger/LedgerService';
 import { defaultCategories } from './config/categoriesSchema';
@@ -243,11 +244,11 @@ export function createCore(options: CoreOptions): Core {
   // ── Config (hot reload) ───────────────────────────────────────────
   const configService = new ConfigService({ audit, historyDir: path.join(dataDir, 'config-history'), ...(options.configDir ? { configDir: options.configDir } : {}) });
 
-  /** Fee rates for a token from the live fee table and the market cache's fee category. */
-  function feeRatesFor(tokenId: string): { takerRate: number; makerRate: number } {
+  /** Fee rates for a token: the cached market's own Gamma schedule, else the live fee table by fee category. */
+  function feeRatesFor(tokenId: string): FeeRates {
     const fees = new FeeService(configService.getConfig()?.fees);
-    const cat = marketCache.getCachedByToken(tokenId)?.feeCategory ?? null;
-    return fees.getRates(cat && (FEE_CATEGORIES as readonly string[]).includes(cat) ? (cat as FeeCategory) : null);
+    const view = marketCache.getCachedByToken(tokenId);
+    return fees.ratesFor(view?.feeSchedule, FeeService.asFeeCategory(view?.feeCategory));
   }
 
   /** CLOB /time (seconds) → ms; falls back to Binance server time (ms). */

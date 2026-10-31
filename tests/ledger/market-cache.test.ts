@@ -81,6 +81,16 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     expect(audits[0].payload).toMatchObject({ heldBy: ['bot-1'] });
   });
 
+  it("stores the market's own Gamma fee schedule (absent ⇒ null, category table applies)", async () => {
+    h.gamma.set('m1', gammaMarket('m1', { feesEnabled: true, feeType: 'politics_fees', feeSchedule: { rate: 0.04, exponent: 1, takerOnly: true, rebateRate: 0.25 } }));
+    h.gamma.set('m2', gammaMarket('m2', { feesEnabled: false, feeType: 'zero_fees' }));
+    h.gamma.set('m3', gammaMarket('m3'));
+    expect((await h.cache.refresh('m1'))!.feeSchedule).toEqual({ feesEnabled: true, feeType: 'politics_fees', rate: 0.04, exponent: 1, takerOnly: true, rebateRate: 0.25, from: 'feeSchedule' });
+    expect((await h.cache.refresh('m2'))!.feeSchedule).toMatchObject({ rate: 0, from: 'zero' });
+    expect((await h.cache.refresh('m3'))!.feeSchedule).toBeNull();
+    expect(h.cache.getCachedByToken('m1-yes')!.feeSchedule!.rate).toBe(0.04);
+  });
+
   it('ambiguity: unassessed ⇒ null (buys rejected); assessed; auto-raised to 2 for 7 days after a rules change and on dispute', async () => {
     h.gamma.set('m1', gammaMarket('m1'));
     expect(await h.cache.get(info('m1'))).toEqual({ category: 'economics', ambiguityScore: null, rulesChangedAt: null });

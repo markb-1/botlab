@@ -28,8 +28,10 @@ export interface MarketSnapshot {
   /** USD size resting at the best bid / best ask */
   bestBidSizeUsd: number | null;
   bestAskSizeUsd: number | null;
-  /** Taker fee as a fraction of notional; makers pay 0 */
+  /** Taker fee rate (Polymarket `feeRate`); makers pay 0 */
   takerFeeRate: number;
+  /** How the rate applies (feeModel.ts): `price` = rate × p × (1 − p) per share; `notional` (default) = rate × p */
+  takerFeeFormula?: 'price' | 'notional';
 }
 
 /** Present only for ledger-driven orders. */

@@ -554,6 +554,8 @@ export function initializeDatabase(dbPath?: string): Database.Database {
       last_used_at TEXT,
       revoked_at TEXT
     )`,
+    // Mac test round: each market's own Gamma fee schedule (JSON; PROGRESS R125)
+    'ALTER TABLE market_cache ADD COLUMN fee_schedule TEXT',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

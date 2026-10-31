@@ -12,12 +12,9 @@
 
 import { OrderType, Side, type ClobClient } from '@polymarket/clob-client';
 
-/**
- * Polymarket applies a one-minute security threshold to GTD expirations: an order
- * meant to live N seconds must be sent with expiration = now + 60 + N (CLOB docs,
- * "GTD orders"). VERIFY against current docs before live trading.
- */
-export const GTD_SECURITY_BUFFER_SECONDS = 60;
+import { GTD_MIN_LIFETIME_SECONDS, GTD_MIN_TTL_MINUTES, GTD_SECURITY_BUFFER_SECONDS } from './gtd';
+
+export { GTD_MIN_LIFETIME_SECONDS, GTD_MIN_TTL_MINUTES, GTD_SECURITY_BUFFER_SECONDS };
 
 export type PostOrderOutcome =
   | {
@@ -115,6 +112,12 @@ export async function postLimitOrder(
   clob: ClobClient,
   args: { tokenId: string; side: 'buy' | 'sell'; price: number; size: number; expiresAtMs: number }
 ): Promise<PostOrderOutcome> {
+  const expiration = Math.floor(args.expiresAtMs / 1000) + GTD_SECURITY_BUFFER_SECONDS;
+  // Never send an expiration the CLOB would refuse (≥ 3 min ahead; definite rejection: nothing was sent).
+  // OrderService asks for ttl ≥ 3 min plus the 60 s buffer, which leaves a minute for latency.
+  if (expiration < Math.floor(Date.now() / 1000) + GTD_MIN_LIFETIME_SECONDS) {
+    return { kind: 'rejected', error: `GTD order must live at least ${GTD_MIN_TTL_MINUTES} minutes (Polymarket minimum)` };
+  }
   let signed;
   try {
     signed = await clob.createOrder({
@@ -122,7 +125,7 @@ export async function postLimitOrder(
       side: args.side === 'buy' ? Side.BUY : Side.SELL,
       price: args.price,
       size: args.size,
-      expiration: Math.floor(args.expiresAtMs / 1000) + GTD_SECURITY_BUFFER_SECONDS,
+      expiration,
     });
   } catch (err) {
     return { kind: 'rejected', error: `Could not build order: ${err instanceof Error ? err.message : String(err)}` };

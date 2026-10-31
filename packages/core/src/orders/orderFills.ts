@@ -11,6 +11,7 @@ import type { OrderRepository, OrderRow, OrderStatus } from '../db/repositories/
 import { OPEN_ORDER_STATUSES } from '../db/repositories/OrderRepository';
 import type { Exchange } from '../risk/types';
 import type { OrderFillEvent } from '../notify/events';
+import { appliedFeeUsd, type AppliedFee } from './feeModel';
 
 const QTY_EPS = 1e-9;
 
@@ -94,8 +95,8 @@ export interface ExchangeOrderState {
 export interface ApplyStateOptions {
   now: number;
   owner: FillOwner;
-  /** Taker/maker fee rate for the newly recorded part (default 0: resting fills are maker) */
-  feeRate?: number;
+  /** Fee model for the newly recorded part (default none: resting fills are maker, makers pay 0) */
+  fee?: AppliedFee | null;
   info?: FillInfo | null;
   /** Link the row to this exchange id (unknown-outcome order found on the exchange) */
   exchangeOrderId?: string | null;
@@ -153,7 +154,7 @@ export function applyExchangeOrderState(
           : null;
       // Resting fills happen at the order's price; a reported total notional is used when known
       const addNotional = totalNotional !== null ? Math.max(totalNotional - prevNotional, 0) : delta * row.price;
-      const fee = (opts.feeRate ?? 0) * addNotional;
+      const fee = appliedFeeUsd(opts.fee, delta, addNotional);
       const e = recordOrderFill(deps.tradeRepo, opts.owner, row, { size: delta, notional: addNotional }, fee, opts.info ?? null);
       if (e) events.push(e);
       deps.orderRepo.update(row.id, {
@@ -182,7 +183,7 @@ export interface PlacementResult {
   exchangeOrderId?: string | null;
   /** Total filled so far according to the answer */
   filled?: { size: number; notional: number } | null;
-  feeRate?: number;
+  fee?: AppliedFee | null;
   expiresAt?: string | null;
 }
 
@@ -216,7 +217,7 @@ export function applyPlacementResult(
     if (r.filled && delta > QTY_EPS) {
       const prevNotional = row.filled_size * (row.avg_fill_price ?? row.price);
       const addNotional = Math.max(r.filled.notional - prevNotional, 0);
-      const fee = (r.feeRate ?? 0) * addNotional;
+      const fee = appliedFeeUsd(r.fee, delta, addNotional);
       const e = recordOrderFill(deps.tradeRepo, opts.owner, row, { size: delta, notional: addNotional }, fee, opts.info ?? null);
       if (e) events.push(e);
       filledSize = total;

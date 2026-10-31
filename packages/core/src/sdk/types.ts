@@ -136,7 +136,7 @@ export interface TradeResult {
 export interface LimitOrderOpts {
   /** Reject instead of crossing the book (default true). Checked against the book before posting. */
   postOnly?: boolean;
-  /** Minutes until the order expires (GTD). Capped at limits.orders.resting_order_ttl_minutes. */
+  /** Minutes until the order expires (GTD), at least 3 (Polymarket minimum). Capped at limits.orders.resting_order_ttl_minutes. */
   ttlMinutes?: number;
   reason?: string;
   forecastId?: string;
@@ -174,9 +174,16 @@ export interface OpenOrder {
 }
 
 export interface FeeRates {
-  /** Fraction of notional charged when taking liquidity */
+  /** Polymarket fee rate for takers. Taker fee (USDC, on top) = shares × takerRate × p × (1 − p) when formula is 'price' */
   takerRate: number;
+  /** 0 on Polymarket (makers never pay) unless a market's schedule says otherwise */
   makerRate: number;
+  /** 'price': fee per share = rate × p × (1 − p); 'notional': rate × p (conservative, unusual fee schedules) */
+  formula: 'price' | 'notional';
+  /** 'market': the market's own fee schedule; 'category': fee table by category; 'unknown': highest table rate */
+  source: 'market' | 'category' | 'unknown';
+  /** Polymarket feeType when known, e.g. 'zero_fees' */
+  feeType?: string | null;
 }
 
 export interface PolymarketContext {

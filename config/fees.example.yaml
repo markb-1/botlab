@@ -1,9 +1,10 @@
 # Polymarket fee table (spec §4.4). Human-owned.
-# Taker rate = fraction of notional charged to orders that cross the book; makers pay maker_rate.
-# VERIFY these defaults against the current Polymarket fee docs before trading live.
+# Used only for markets whose Gamma data carries no fee schedule (a market's own feeSchedule wins).
+# Taker fee (USDC, on top) = shares × rate × p × (1 − p); makers pay maker_rate.
+# Defaults follow the Polymarket fee docs table (docs.polymarket.com/trading/fees, checked 2026-10-31).
 taker_rates:
   crypto: 0.07
-  sports: 0.03
+  sports: 0.05
   finance: 0.04
   politics: 0.04
   tech: 0.04

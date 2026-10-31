@@ -555,11 +555,11 @@ describe.skipIf(!sqliteAvailable)('Reconciler', () => {
     expect(h.orderRepo.firstLiveOrderAtForWallet('w1')).toBeNull();
   });
 
-  it('a local excess within 1 % of the position (fee possibly taken in shares) is not a mismatch', async () => {
-    h.addFill('b1', 't1', 'BUY', 100, 0.4, h.clock.now - 60_000);
-    positions = [position('t1', 99.2, 0.4)];
+  it('fees are charged in USDC (R79 amended): only a 0.01-token local excess is tolerated, not 1 %', async () => {
+    h.addFill('b1', 't1', 'BUY', 100, 0.9, h.clock.now - 60_000);
+    positions = [position('t1', 99.995, 0.9)];
     expect((await makeReconciler().runOnce()).mismatches).toEqual([]);
-    positions = [position('t1', 97, 0.4)];
+    positions = [position('t1', 99.2, 0.9)]; // within the old 1 % tolerance, worth $0.72 > dust
     expect((await makeReconciler().runOnce()).mismatches).toHaveLength(1);
   });
 });

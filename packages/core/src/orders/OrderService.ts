@@ -32,7 +32,9 @@ import type { BinanceTradeResult } from '../exchange/binance/client';
 import type { PaperTradingState } from '../runtime/PaperTradingState';
 import type { BinanceAdapter, PolymarketAdapter, PostOrderOutcome } from './ExchangeAdapter';
 import type { DbRiskStateProvider } from './DbRiskStateProvider';
-import type { FeeCategory, FeeService } from './FeeService';
+import type { FeeService } from './FeeService';
+import { GTD_MIN_TTL_MINUTES } from '../exchange/polymarket/gtd';
+import type { AppliedFee, FeeRates } from './feeModel';
 import type { MarketDataService, MarketInfo, MarketQualityProvider } from './MarketDataService';
 import type { AuditService } from '../audit/AuditService';
 import type { OrderEventSink, OrderFillEvent } from '../notify/events';
@@ -330,7 +332,8 @@ interface PolymarketContext {
   info: MarketInfo | null;
   market: MarketSnapshot | null;
   book: ClobBook | null;
-  feeCategory: FeeCategory | null;
+  /** The market's fee rates (its own Gamma schedule, else the category table) */
+  fees: FeeRates | null;
   category: string | null;
 }
 
@@ -372,9 +375,9 @@ export class OrderService {
       this.deps.getBook(tokenId).catch(() => null),
     ]);
     if (!info || !book || info.closed) {
-      return { info, market: null, book, feeCategory: null, category: null };
+      return { info, market: null, book, fees: null, category: null };
     }
-    const feeCategory = this.deps.fees.feeCategoryFor(info.labels);
+    const fees = this.deps.fees.ratesFor(info.feeSchedule, this.deps.fees.feeCategoryFor(info.labels));
     // Unknown quality ⇒ category/ambiguity null ⇒ buys rejected by the engine (fail closed); sells unaffected
     const quality = await this.deps.quality.get(info).catch((err: unknown) => {
       logger.warning(`[OrderService] Market quality unavailable for ${info.marketId}: ${err instanceof Error ? err.message : String(err)}`);
@@ -389,9 +392,10 @@ export class OrderService {
       rulesChangedAt: quality.rulesChangedAt,
       liquidityUsd: info.volume24hrUsd,
       ...bookTop(book),
-      takerFeeRate: this.deps.fees.getRates(feeCategory).takerRate,
+      takerFeeRate: fees.takerRate,
+      takerFeeFormula: fees.formula,
     };
-    return { info, market, book, feeCategory, category };
+    return { info, market, book, fees, category };
   }
 
   private isMarketable(order: { side: OrderSide; price: number; orderType: string }, market: MarketSnapshot | null): boolean {
@@ -457,14 +461,15 @@ export class OrderService {
     if (input.side !== 'buy' && input.side !== 'sell') return invalid('side must be buy or sell');
     if (!finite(input.price) || input.price <= 0 || input.price >= 1) return invalid('price must be between 0 and 1');
     if (!finite(input.size) || input.size <= 0) return invalid('size must be a positive number');
-    if (input.ttlMinutes !== undefined && (!finite(input.ttlMinutes) || input.ttlMinutes <= 0)) {
-      return invalid('ttlMinutes must be a positive number');
+    if (input.ttlMinutes !== undefined && (!finite(input.ttlMinutes) || input.ttlMinutes < GTD_MIN_TTL_MINUTES)) {
+      return invalid(`ttlMinutes must be at least ${GTD_MIN_TTL_MINUTES} (Polymarket refuses GTD orders expiring sooner)`);
     }
     const unavailable = this.polymarketUnavailable();
     if (unavailable) return invalid(unavailable);
 
     const maxTtl = this.deps.riskEngine.getConfig().limits.orders.resting_order_ttl_minutes;
-    const ttl = Math.min(input.ttlMinutes ?? maxTtl, maxTtl);
+    // The config minimum is GTD_MIN_TTL_MINUTES too; max() guards an older in-memory config
+    const ttl = Math.max(Math.min(input.ttlMinutes ?? maxTtl, maxTtl), GTD_MIN_TTL_MINUTES);
     const postOnly = input.postOnly !== false;
 
     await this.syncOpenOrders();
@@ -585,8 +590,7 @@ export class OrderService {
       preCheck = preDecision('market_data_unavailable', `Cannot check order: ${why}`, this.now());
     }
 
-    const rates = this.deps.fees.getRates(ctx.feeCategory);
-    const feeRate = this.isMarketable(order, ctx.market) ? rates.takerRate : rates.makerRate;
+    const fee: AppliedFee = { rates: ctx.fees ?? this.deps.fees.getRates(null), taker: this.isMarketable(order, ctx.market) };
 
     const row = await this.checkAndPersist(order, preCheck, shape.expiresAt, input);
     if (row.status === 'rejected_risk') {
@@ -600,7 +604,7 @@ export class OrderService {
     } catch (err) {
       outcome = { kind: 'unknown', error: err instanceof Error ? err.message : String(err) };
     }
-    const updated = await this.cancelIfHaltedAfterSubmit(this.applyOutcome(row, outcome, feeRate, ctx));
+    const updated = await this.cancelIfHaltedAfterSubmit(this.applyOutcome(row, outcome, fee, ctx));
     if (this.paper && ctx.info && updated.filled_size > 0) {
       this.bot.paperState?.updatePositionMeta(input.tokenId, ctx.info.question, ctx.info.outcome);
     }
@@ -745,9 +749,9 @@ export class OrderService {
 
   /**
    * Update the order row from the exchange outcome and record any fill, atomically.
-   * `feeRate`: taker rate if the order crossed the book at check time, else maker rate.
+   * `fee`: the market's rates, taker if the order crossed the book at check time (else maker).
    */
-  private applyOutcome(row: OrderRow, outcome: PostOrderOutcome, feeRate: number, ctx: PolymarketContext): OrderRow {
+  private applyOutcome(row: OrderRow, outcome: PostOrderOutcome, fee: AppliedFee | null, ctx: PolymarketContext): OrderRow {
     const side = row.side as OrderSide;
     const apply = (r: PlacementResult): OrderRow => {
       const res = applyPlacementResult(this.deps, row.id, r, {
@@ -807,7 +811,7 @@ export class OrderService {
     }
 
     // Expected fee on what actually filled (only the part not already recorded, e.g. by the Reconciler)
-    return apply({ status, exchangeOrderId: outcome.exchangeOrderId, filled: fill, feeRate, ...(expiresAt !== undefined ? { expiresAt } : {}) });
+    return apply({ status, exchangeOrderId: outcome.exchangeOrderId, filled: fill, fee, ...(expiresAt !== undefined ? { expiresAt } : {}) });
   }
 
   /** Fills recorded in the running transaction; emitted to the notifier only after it commits. */
@@ -909,7 +913,7 @@ export class OrderService {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // Thrown before any request (e.g. no credentials) ⇒ nothing was sent
-      const failed = this.applyOutcome(row, { kind: 'rejected', error: msg }, 0, { info: null, market: null, book: null, feeCategory: null, category: null });
+      const failed = this.applyOutcome(row, { kind: 'rejected', error: msg }, null, { info: null, market: null, book: null, fees: null, category: null });
       return resultFromRow(failed, { error: msg });
     }
 
@@ -926,12 +930,12 @@ export class OrderService {
       outcome = { kind: res.outcomeUnknown ? 'unknown' : 'rejected', error: res.error || 'Binance order failed' };
     }
     if (outcome.kind === 'accepted' && !(res.executedQty > QTY_EPS)) {
-      const r = this.applyOutcome(row, { ...outcome, status: 'unmatched' }, 0, { info: null, market: null, book: null, feeCategory: null, category: null });
+      const r = this.applyOutcome(row, { ...outcome, status: 'unmatched' }, null, { info: null, market: null, book: null, fees: null, category: null });
       return resultFromRow(r, r.status === 'cancelled' ? { ok: false, error: 'Order did not fill' } : {});
     }
     // Binance fees are charged in the traded asset/BNB; not modelled here (fee_usd = 0)
     const updated = await this.cancelIfHaltedAfterSubmit(
-      this.applyOutcome(row, outcome, 0, { info: null, market: null, book: null, feeCategory: null, category: null })
+      this.applyOutcome(row, outcome, null, { info: null, market: null, book: null, fees: null, category: null })
     );
     return resultFromRow(updated, outcome.kind === 'accepted' ? {} : { ok: false, error: outcome.error });
   }
@@ -1092,10 +1096,10 @@ export class OrderService {
     }));
   }
 
-  /** Taker/maker fee rates for a token (unknown market ⇒ highest taker rate). */
-  async getFee(tokenId: string): Promise<{ takerRate: number; makerRate: number }> {
+  /** Fee rates for a token: the market's own schedule, else its category (unknown market ⇒ highest taker rate). */
+  async getFee(tokenId: string): Promise<FeeRates> {
     const info = typeof tokenId === 'string' && tokenId ? await this.deps.marketData.getMarketInfo(tokenId) : null;
-    return this.deps.fees.getRates(info ? this.deps.fees.feeCategoryFor(info.labels) : null);
+    return info ? this.deps.fees.ratesFor(info.feeSchedule, this.deps.fees.feeCategoryFor(info.labels)) : this.deps.fees.getRates(null);
   }
 
   /** ctx.risk.getBudget(): what this bot can still add before limits bite. */

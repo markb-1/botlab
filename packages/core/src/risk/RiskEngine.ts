@@ -1,4 +1,5 @@
 import { LONG_HORIZON_DAYS, MAX_HORIZON_DAYS, type BotLabConfig } from '../config/schema';
+import { takerFeePerShare } from '../orders/feeModel';
 import type {
   BotRiskInfo,
   Exchange,
@@ -483,12 +484,12 @@ export class RiskEngine {
     if (order.forecast) {
       const p = order.forecast.probability;
       const minEdge = Math.max(order.forecast.minEdge ?? MIN_EDGE_FLOOR, MIN_EDGE_FLOOR);
-      // Makers pay no fee; a marketable order pays the taker rate on notional
+      // Makers pay no fee; a marketable order pays the taker fee per share (feeModel.ts)
       const takes =
         !!market &&
         (order.orderType === 'market' ||
           (isBuy ? market.bestAsk !== null && price >= market.bestAsk : market.bestBid !== null && price <= market.bestBid));
-      const feePerShare = takes ? market.takerFeeRate * price : 0;
+      const feePerShare = takes ? takerFeePerShare({ takerRate: market.takerFeeRate, formula: market.takerFeeFormula ?? 'notional' }, price) : 0;
       // Directional: buying only pays when p > price, selling when price > p
       const edge = (isBuy ? p - price : price - p) - feePerShare;
       const ok = !!market && edge + EPS >= minEdge;

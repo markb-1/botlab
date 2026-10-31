@@ -113,12 +113,14 @@ describe('snapshot backtest', () => {
   });
 
     it('resting orders expire after their TTL', () => {
-    const m = new SnapshotMarket(100, () => FEES, 1);
+    const m = new SnapshotMarket(100, () => FEES, 5);
     m.applyStep([snap('t1', 0, [[0.4, 50]], [[0.5, 50]])]);
-    m.placeLimit('t1', 'buy', 0.45, 10, { ttlMinutes: 30 }); // capped at 1 minute
-    m.applyStep([snap('t1', 61_000, [[0.4, 50]], [[0.44, 50]])]);
+    m.placeLimit('t1', 'buy', 0.45, 10, { ttlMinutes: 30 }); // capped at 5 minutes
+    m.applyStep([snap('t1', 301_000, [[0.4, 50]], [[0.44, 50]])]);
     expect(m.trades).toEqual([]);
     expect(m.freeCash()).toBe(100);
+    // Below the Polymarket GTD minimum (3 min) ⇒ refused, like live
+    expect(m.placeLimit('t1', 'buy', 0.45, 10, { ttlMinutes: 2 })).toMatchObject({ ok: false, status: 'invalid' });
   });
 
   it('marketable orders walk the recorded depth, fill-or-kill, and consume it within the step', () => {

@@ -252,6 +252,7 @@ const cases: Case[] = [
       { name: 'template min_edge below floor is raised to 0.03', order: { forecast: { forecastId: 'f', probability: 0.52, minEdge: 0.01 } }, state: rights, fails: 'edge' },
       { name: 'template min_edge above floor applies', order: { forecast: { forecastId: 'f', probability: 0.57, minEdge: 0.08 } }, state: rights, fails: 'edge' },
       { name: 'taker fee counts against marketable orders', order: { price: 0.52, notionalUsd: 10.4, forecast: { forecastId: 'f', probability: 0.56 } }, state: rights, fails: 'edge' },
+      { name: "Polymarket fee formula (rate × p × (1 − p)) leaves the same order above the floor", order: { price: 0.52, notionalUsd: 10.4, market: { takerFeeFormula: 'price' }, forecast: { forecastId: 'f', probability: 0.56 } }, state: rights, fails: null },
       { name: 'buying above the forecast is negative edge', order: { forecast: { forecastId: 'f', probability: 0.4 } }, state: rights, fails: 'edge' },
       { name: 'ledger-driven sell needs price above forecast', order: sell({ price: 0.5, notionalUsd: 10, forecast: { forecastId: 'f', probability: 0.45 } }), state: held(), fails: null },
     ] as Case[];

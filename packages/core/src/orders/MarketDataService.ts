@@ -7,6 +7,7 @@
 
 import type { CategoriesConfig } from '../config/categoriesSchema';
 import { categorize } from '../ledger/categorize';
+import { parseMarketFeeSchedule, type MarketFeeSchedule } from './feeModel';
 
 export const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 const INFO_TTL_MS = 5 * 60_000;
@@ -25,6 +26,8 @@ export interface MarketInfo {
   /** Gamma category and tag labels (raw) */
   labels: string[];
   closed: boolean;
+  /** The market's own fee schedule from Gamma; null ⇒ category fee table */
+  feeSchedule: MarketFeeSchedule | null;
 }
 
 export interface MarketQuality {
@@ -110,6 +113,7 @@ export function parseGammaMarket(m: unknown, tokenId: string): MarketInfo | null
     volume24hrUsd: parseNum(mkt.volume24hr) ?? parseNum(mkt.volume24hrClob),
     labels: [...new Set(labels)],
     closed: mkt.closed === true || mkt.active === false,
+    feeSchedule: parseMarketFeeSchedule(mkt),
   };
 }
 

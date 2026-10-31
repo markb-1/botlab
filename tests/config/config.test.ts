@@ -69,6 +69,11 @@ describe('config schema defaults', () => {
     expect(parseConfigYaml(ServerSchema, DEFAULT_SERVER_YAML, 'server')).toEqual(ServerSchema.parse({}));
   });
 
+  it('resting_order_ttl_minutes must be at least 3 (Polymarket GTD minimum)', () => {
+    expect(LimitsSchema.safeParse({ orders: { resting_order_ttl_minutes: 2 } }).success).toBe(false);
+    expect(LimitsSchema.safeParse({ orders: { resting_order_ttl_minutes: 3 } }).success).toBe(true);
+  });
+
   it('a partial file keeps defaults for missing fields', () => {
     write('limits.yaml', 'global:\n  max_total_exposure_usd: 200\n');
     const limits = loadLimits(dir);

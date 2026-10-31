@@ -23,6 +23,8 @@ export interface MarketCacheRow {
   /** JSON MarketToken[] */
   tokens: string;
   fee_category: string | null;
+  /** JSON MarketFeeSchedule (the market's own Gamma fee schedule); null ⇒ category fee table */
+  fee_schedule?: string | null;
   liquidity_usd: number | null;
   volume_24h_usd: number | null;
   active: number;
@@ -61,6 +63,7 @@ export interface MarketCacheUpsert {
   negRisk: boolean;
   tokens: MarketToken[];
   feeCategory: string | null;
+  feeSchedule?: unknown;
   liquidityUsd: number | null;
   volume24hUsd: number | null;
   active: boolean;
@@ -107,17 +110,17 @@ export class MarketCacheRepository {
     this.db
       .prepare(
         `INSERT INTO market_cache (market_id, event_id, event_title, slug, question, category, tags, rules_text, rules_hash,
-           rules_changed_at, end_date, resolution_source, neg_risk, tokens, fee_category, liquidity_usd, volume_24h_usd,
+           rules_changed_at, end_date, resolution_source, neg_risk, tokens, fee_category, fee_schedule, liquidity_usd, volume_24h_usd,
            active, closed, outcome_prices, uma_resolution_status, disputed, created_at, updated_at)
          VALUES (@marketId, @eventId, @eventTitle, @slug, @question, @category, @tags, @rulesText, @rulesHash,
-           @rulesChangedAt, @endDate, @resolutionSource, @negRisk, @tokens, @feeCategory, @liquidityUsd, @volume24hUsd,
+           @rulesChangedAt, @endDate, @resolutionSource, @negRisk, @tokens, @feeCategory, @feeSchedule, @liquidityUsd, @volume24hUsd,
            @active, @closed, @outcomePrices, @umaResolutionStatus, @disputed, @updatedAt, @updatedAt)
          ON CONFLICT(market_id) DO UPDATE SET
            event_id = excluded.event_id, event_title = excluded.event_title, slug = excluded.slug,
            question = excluded.question, category = excluded.category, tags = excluded.tags,
            rules_text = excluded.rules_text, rules_hash = excluded.rules_hash, rules_changed_at = excluded.rules_changed_at,
            end_date = excluded.end_date, resolution_source = excluded.resolution_source, neg_risk = excluded.neg_risk,
-           tokens = excluded.tokens, fee_category = excluded.fee_category, liquidity_usd = excluded.liquidity_usd,
+           tokens = excluded.tokens, fee_category = excluded.fee_category, fee_schedule = excluded.fee_schedule, liquidity_usd = excluded.liquidity_usd,
            volume_24h_usd = excluded.volume_24h_usd, active = excluded.active, closed = excluded.closed,
            outcome_prices = excluded.outcome_prices, uma_resolution_status = excluded.uma_resolution_status,
            disputed = excluded.disputed, updated_at = excluded.updated_at`
@@ -127,6 +130,7 @@ export class MarketCacheRepository {
         tags: JSON.stringify(m.tags),
         negRisk: m.negRisk ? 1 : 0,
         tokens: JSON.stringify(m.tokens),
+        feeSchedule: m.feeSchedule ? JSON.stringify(m.feeSchedule) : null,
         active: m.active ? 1 : 0,
         closed: m.closed ? 1 : 0,
         outcomePrices: m.outcomePrices ? JSON.stringify(m.outcomePrices) : null,

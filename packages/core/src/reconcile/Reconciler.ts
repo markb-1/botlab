@@ -46,6 +46,7 @@ import type { LimitsConfig } from '../config';
 import type { MarketView } from '../ledger/MarketCacheService';
 import { checkResolution } from '../ledger/scoring';
 import type { DataApiPosition, DataApiTrade } from './dataApi';
+import type { AppliedFee, FeeRates } from '../orders/feeModel';
 import logger from '../utils/logger';
 
 export const RECONCILE_INTERVAL_MS = 60_000;
@@ -63,8 +64,6 @@ export const RECONCILER_FAILURE_ALERT = 5;
 export const MISMATCH_RUNS_TO_HALT = 2;
 export const DUST_QTY = 0.01;
 export const DUST_USD = 0.5;
-/** Polymarket local_excess tolerance (fee possibly taken in shares; unverified) — fraction of the local position */
-export const LOCAL_EXCESS_FEE_TOLERANCE = 0.01;
 export const DEFAULT_MAX_UNEXPLAINED_USD = 10;
 /** Unknown-outcome search window around the order's submit time */
 const SEARCH_BEFORE_MS = 60_000;
@@ -99,7 +98,7 @@ export interface ReconcilerDeps {
   events?: OrderEventSink;
   marketCache?: Pick<{ getCached(id: string): MarketView | null; getCachedByToken(id: string): MarketView | null; setResolutionSeen(id: string, sig: string | null, at: string | null): void }, 'getCached' | 'getCachedByToken' | 'setResolutionSeen'>;
   /** Fee rates for a token (recovered marketable fills pay taker) */
-  getFeeRates: (tokenId: string) => { takerRate: number; makerRate: number };
+  getFeeRates: (tokenId: string) => FeeRates;
   /** The bot runs in live mode (its open live orders are its own); otherwise they are cancelled */
   isBotRunning: (botId: string) => boolean;
   /** Authenticated CLOB adapter for a wallet; null/throw ⇒ that wallet's orders cannot be checked this run */
@@ -484,13 +483,18 @@ export class Reconciler implements ClockSkewGuard {
     }
   }
 
+  /** Recovered Polymarket fills: market orders pay the taker fee, resting (limit) fills are maker. */
+  private recoveredFee(row: OrderRow): AppliedFee {
+    return { rates: this.deps.getFeeRates(row.token_id), taker: row.order_type === 'market' };
+  }
+
   /** Record a fill/status from the exchange via the shared path; emit fills after commit. */
-  private apply(row: OrderRow, state: ExchangeOrderState, opts: { exchangeOrderId?: string | null; feeRate?: number }): void {
+  private apply(row: OrderRow, state: ExchangeOrderState, opts: { exchangeOrderId?: string | null; fee?: AppliedFee | null }): void {
     const view = this.deps.marketCache?.getCachedByToken(row.token_id) ?? null;
     const r = applyExchangeOrderState(this.deps, row.id, state, {
       now: this.now(),
       owner: this.owner(row.bot_id),
-      feeRate: opts.feeRate,
+      fee: opts.fee,
       exchangeOrderId: opts.exchangeOrderId,
       info: view ? { question: view.question, outcome: view.tokens.find((t) => t.tokenId === row.token_id)?.outcome ?? null, category: view.category } : null,
     });
@@ -533,7 +537,7 @@ export class Reconciler implements ClockSkewGuard {
 
   private async syncPolymarketOrder(row: OrderRow, adapter: PolymarketAdapter, result: ReconcileRunResult): Promise<void> {
     const ex = await withTimeout(adapter.getOrder(row.exchange_order_id!), LOOKUP_TIMEOUT_MS, 'getOrder');
-    if (ex) this.apply(row, ex, { feeRate: row.order_type === 'market' ? this.deps.getFeeRates(row.token_id).takerRate : 0 });
+    if (ex) this.apply(row, ex, { fee: this.recoveredFee(row) });
     const exp = row.expires_at ? Date.parse(row.expires_at) : null;
     const now = this.now();
     if (exp !== null && (now >= exp + EXPIRY_GRACE_MS || (!ex && now >= exp))) {
@@ -548,7 +552,7 @@ export class Reconciler implements ClockSkewGuard {
       const state = outcome.state;
       this.apply(row, state, {
         exchangeOrderId: outcome.exchangeOrderId,
-        feeRate: row.order_type === 'market' ? this.deps.getFeeRates(row.token_id).takerRate : 0,
+        fee: this.recoveredFee(row),
       });
       // Linked even if nothing filled (a live resting order): later runs sync it by id
       const after = this.deps.orderRepo.findById(row.id);
@@ -630,7 +634,7 @@ export class Reconciler implements ClockSkewGuard {
     this.apply(
       row,
       { status: q.status, sizeMatched: q.executedQty, originalSize: q.origQty, filledNotional: q.cummulativeQuoteQty },
-      { exchangeOrderId: String(q.orderId), feeRate: 0 }
+      { exchangeOrderId: String(q.orderId), fee: null }
     );
     if (!before) {
       result.recovered.push(row.id);
@@ -813,9 +817,8 @@ export class Reconciler implements ClockSkewGuard {
       const exchangeQty = ex?.size ?? 0;
       const localQty = loc?.qty ?? 0;
       const diff = exchangeQty - localQty;
-      // Until verified whether the CLOB takes the taker fee in shares, local may exceed the exchange by up to 1 %
-      const tolerance = diff < 0 ? Math.max(DUST_QTY, LOCAL_EXCESS_FEE_TOLERANCE * localQty) : DUST_QTY;
-      if (Math.abs(diff) <= tolerance) continue;
+      // Polymarket fees are charged in USDC on top (shares are not reduced; R79 amended): only dust is tolerated
+      if (Math.abs(diff) <= DUST_QTY) continue;
       const markPrice = ex?.curPrice ?? (loc && loc.qty > 0 ? loc.cost / loc.qty : null);
       // Unknown price ⇒ valued at $1 per share (the most a share can be worth)
       const valueUsd = Math.abs(diff) * (markPrice ?? 1);

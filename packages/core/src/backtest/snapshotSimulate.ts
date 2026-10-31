@@ -8,7 +8,8 @@
  *   snapshots taken after the order was placed), then `onTick` runs.
  * - Marketable orders (ctx.buy / ctx.sell) are fill-or-kill against the visible book with depth, up to the
  *   worst price (maxPrice/minPrice or best ± maxSlippage); liquidity taken is removed from that book until
- *   the token's next snapshot. Taker fee = rate × filled notional (FeeService rates, R13).
+ *   the token's next snapshot. Taker fee per the market's fee model (feeModel.ts: shares × rate × p × (1 − p),
+ *   or rate × notional when `formula` is `notional` / absent; R125).
  * - Resting limit orders (ctx.polymarket.placeLimit): post-only by default (rejected if crossing). A
  *   resting buy fills in full at its price when a later snapshot's best ask ≤ its price; a resting sell
  *   when the best bid ≥ its price. Maker fee rate. GTD expiry after `ttlMinutes` (capped like live).
@@ -22,6 +23,8 @@ import { evaluateScript } from '../runtime/sandbox';
 import type { BotContext, OrderBook } from '../sdk/types';
 import type { BookSnapshot, Level } from '../recorder/snapshotCodec';
 import { InMemoryStorageRepo, type SimulatedTrade, type SimulationOutput } from './simulate';
+import { feeForFill, type FeeFormula, type FeeRates } from '../orders/feeModel';
+import { GTD_MIN_TTL_MINUTES } from '../exchange/polymarket/gtd';
 
 const EPS = 1e-9;
 export const DEFAULT_TTL_MINUTES = 240;
@@ -29,6 +32,12 @@ export const DEFAULT_TTL_MINUTES = 240;
 export interface FeeRatesInput {
   takerRate: number;
   makerRate: number;
+  /** Default `notional` (rate × notional, the conservative bound) */
+  formula?: FeeFormula;
+}
+
+function asRates(r: FeeRatesInput): FeeRates {
+  return { takerRate: r.takerRate, makerRate: r.makerRate, formula: r.formula ?? 'notional', source: 'market' };
 }
 
 export interface SnapshotSimulationInput {
@@ -129,7 +138,7 @@ export class SnapshotMarket {
       // The order fills in full at its price; the recorded liquidity at or through it is used up for this
       // step, so a marketable order in the same step cannot take it again
       this.take(o.tokenId, o.side, o.price, { qty }, true);
-      this.fill(o.tokenId, o.side, qty, qty * o.price, this.fees(o.tokenId).makerRate, s.ts);
+      this.fill(o.tokenId, o.side, qty, qty * o.price, this.fees(o.tokenId), false, s.ts);
       o.filled = o.size;
       o.status = 'filled';
     }
@@ -159,8 +168,8 @@ export class SnapshotMarket {
     return this.cash - this.reservedCash();
   }
 
-  private fill(tokenId: string, side: 'buy' | 'sell', qty: number, notional: number, feeRate: number, ts: number): number {
-    const fee = feeRate * notional;
+  private fill(tokenId: string, side: 'buy' | 'sell', qty: number, notional: number, rates: FeeRatesInput, taker: boolean, ts: number): number {
+    const fee = feeForFill(asRates(rates), qty, notional, taker);
     this.feesPaid += fee;
     const pos = this.positions.get(tokenId) ?? { size: 0, cost: 0 };
     if (side === 'buy') {
@@ -231,7 +240,7 @@ export class SnapshotMarket {
       const [q, n] = this.take(tokenId, 'buy', limit, { usd: amount }, false);
       if (n < amount - 1e-7) return fail('Not enough depth within the price limit (fill-or-kill)');
       this.take(tokenId, 'buy', limit, { usd: amount }, true);
-      this.fill(tokenId, 'buy', q, n, rate, this.simTime);
+      this.fill(tokenId, 'buy', q, n, this.fees(tokenId), true, this.simTime);
       return { success: true, executedAmount: n, price: n / q, tokenAmount: q, status: 'filled', orderId: `bt-${++this.seq}` };
     }
     const held = (this.positions.get(tokenId)?.size ?? 0) - this.reservedShares(tokenId);
@@ -239,7 +248,7 @@ export class SnapshotMarket {
     const [q, n] = this.take(tokenId, 'sell', limit, { qty: amount }, false);
     if (q < amount - EPS) return fail('Not enough depth within the price limit (fill-or-kill)');
     this.take(tokenId, 'sell', limit, { qty: amount }, true);
-    this.fill(tokenId, 'sell', q, n, rate, this.simTime);
+    this.fill(tokenId, 'sell', q, n, this.fees(tokenId), true, this.simTime);
     return { success: true, executedAmount: n, price: n / q, tokenAmount: q, status: 'filled', orderId: `bt-${++this.seq}` };
   }
 
@@ -259,6 +268,9 @@ export class SnapshotMarket {
     if (side !== 'buy' && side !== 'sell') return res(false, 'invalid', { error: 'side must be buy or sell' });
     if (!(price > 0 && price < 1)) return res(false, 'invalid', { error: 'price must be between 0 and 1' });
     if (!(size > 0) || !Number.isFinite(size)) return res(false, 'invalid', { error: 'size must be a positive number' });
+    if (opts.ttlMinutes !== undefined && !(opts.ttlMinutes >= GTD_MIN_TTL_MINUTES)) {
+      return res(false, 'invalid', { error: `ttlMinutes must be at least ${GTD_MIN_TTL_MINUTES} (Polymarket refuses GTD orders expiring sooner)` });
+    }
     const b = this.book(tokenId);
     const postOnly = opts.postOnly !== false;
     const crosses = side === 'buy' ? b.asks.length > 0 && price >= b.asks[0][0] - EPS : b.bids.length > 0 && price <= b.bids[0][0] + EPS;
@@ -269,7 +281,7 @@ export class SnapshotMarket {
     if (side === 'sell' && (this.positions.get(tokenId)?.size ?? 0) - this.reservedShares(tokenId) < size - EPS) {
       return res(false, 'rejected_risk', { error: 'Insufficient position' });
     }
-    const ttl = Math.min(opts.ttlMinutes && opts.ttlMinutes > 0 ? opts.ttlMinutes : this.maxTtlMinutes, this.maxTtlMinutes);
+    const ttl = Math.max(Math.min(opts.ttlMinutes ?? this.maxTtlMinutes, this.maxTtlMinutes), GTD_MIN_TTL_MINUTES);
     const order: RestingOrder = {
       orderId: `bt-${++this.seq}`,
       tokenId,
@@ -286,7 +298,7 @@ export class SnapshotMarket {
     if (crosses) {
       const [q, n] = this.take(tokenId, side, price, { qty: size }, true);
       if (q > EPS) {
-        feeUsd = this.fill(tokenId, side, q, n, rates.takerRate, this.simTime);
+        feeUsd = this.fill(tokenId, side, q, n, rates, true, this.simTime);
         order.filled = q;
         notional = n;
       }

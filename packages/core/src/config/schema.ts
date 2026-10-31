@@ -80,7 +80,8 @@ export const LimitsSchema = z.strictObject({
     .strictObject({
       default_type: z.enum(['limit', 'market']).default('limit'),
       allow_marketable: z.boolean().default(true),
-      resting_order_ttl_minutes: z.number().positive().default(240),
+      // ≥ 3: Polymarket refuses GTD orders expiring sooner (exchange/polymarket/orders.ts, R126)
+      resting_order_ttl_minutes: z.number().min(3).default(240),
     })
     .prefault({}),
   ramp: z

@@ -319,7 +319,7 @@ export function Scripts() {
                   <ApiMethod sig="ctx.polymarket.cancel(orderId)" ret="Promise<void>" desc="Cancel one of this bot's orders (throws if not found or not cancellable)" />
                   <ApiMethod sig="ctx.polymarket.cancelAll()" ret="Promise<{ cancelled, failed, unknownOutcome }>" desc="Cancel all of this bot's open orders; orders with an unknown outcome expire on their own" />
                   <ApiMethod sig="ctx.polymarket.getOpenOrders()" ret="Promise<OpenOrder[]>" desc="This bot's open orders" />
-                  <ApiMethod sig="ctx.polymarket.getFee(tokenId)" ret="Promise<{ takerRate, makerRate }>" desc="Fee rates assumed for the market (unknown market ⇒ highest taker rate)" />
+                  <ApiMethod sig="ctx.polymarket.getFee(tokenId)" ret="Promise<{ takerRate, makerRate, formula, source }>" desc="The market's fee schedule (taker fee = shares × rate × p × (1 − p), in USDC; makers 0); category table when the market has none, unknown market ⇒ highest rate" />
                 </div>
               </section>
 

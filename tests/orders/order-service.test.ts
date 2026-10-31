@@ -30,6 +30,7 @@ const MARKET: MarketInfo = {
   volume24hrUsd: 10_000,
   labels: ['Economics'],
   closed: false,
+  feeSchedule: null,
 };
 
 const BOOK: ClobBook = {
@@ -59,6 +60,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
   let binance: BinanceAdapter & Record<string, ReturnType<typeof vi.fn>>;
   let cash: () => Promise<number>;
   let clock = NOW;
+  let market: MarketInfo = MARKET;
 
   // Live trading is opt-in (3b); these tests exercise live orders
   const engine = new RiskEngine({ limits: LimitsSchema.parse({ live_trading: { enabled: true } }), mandate: MandateSchema.parse({}) });
@@ -92,7 +94,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
         riskEngine: engine,
         provider,
         fees: new FeeService(),
-        marketData: { getMarketInfo: async (tokenId: string) => (MARKET.tokenIds.includes(tokenId) ? MARKET : null) },
+        marketData: { getMarketInfo: async (tokenId: string) => (market.tokenIds.includes(tokenId) ? market : null) },
         quality: ASSESSED,
         getBook: async () => BOOK,
         getBinanceBook: async () => ({ bids: [{ price: '49990', quantity: '1' }], asks: [{ price: '50000', quantity: '1' }] }),
@@ -111,6 +113,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     } as never;
     cash = async () => 1000;
     clock = NOW;
+    market = MARKET;
     t.addBot('bot-1');
     t.addBot('bot-2');
   });
@@ -140,11 +143,24 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
 
     const row = t.orderRepo.findById(r.orderId!)!;
     expect(row).toMatchObject({ status: 'filled', exchange_order_id: 'ex-1', filled_size: 40, avg_fill_price: 0.5, market_id: 'm1', simulated: 0 });
-    expect(row.fee_usd).toBeCloseTo(0.05 * 20); // economics taker rate × notional
+    // No schedule on the market ⇒ economics table rate; fee = shares × rate × p × (1 − p)
+    expect(row.fee_usd).toBeCloseTo(40 * 0.05 * 0.5 * 0.5);
 
     const positions = t.tradeRepo.getRiskPositions({ simulated: false });
     expect(positions).toHaveLength(1);
     expect(positions[0]).toMatchObject({ bot_id: 'bot-1', symbol: 't1', condition_id: 'm1', net_quantity: 40, cost_basis: 20 });
+  });
+
+  it("uses the market's own fee schedule over the category table (zero_fees ⇒ 0, rate 0.07 ⇒ rate × p × (1 − p))", async () => {
+    market = { ...MARKET, feeSchedule: { feesEnabled: false, feeType: 'zero_fees', rate: 0, exponent: null, takerOnly: true, rebateRate: null, from: 'zero' } };
+    const svc = makeService('bot-1');
+    const a = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+    expect(t.orderRepo.findById(a.orderId!)!.fee_usd).toBe(0);
+    expect(await svc.getFee('t1')).toMatchObject({ takerRate: 0, source: 'market', feeType: 'zero_fees' });
+
+    market = { ...MARKET, feeSchedule: { feesEnabled: true, feeType: 'crypto_fees_v2', rate: 0.07, exponent: 1, takerOnly: true, rebateRate: 0.2, from: 'feeSchedule' } };
+    const b = await svc.placeMarketable({ tokenId: 't1', side: 'buy', amount: 20 });
+    expect(t.orderRepo.findById(b.orderId!)!.fee_usd).toBeCloseTo(40 * 0.07 * 0.5 * 0.5, 9);
   });
 
   it('live trading off (the default limits.yaml) ⇒ live orders rejected as live_disabled; paper unaffected', async () => {
@@ -218,12 +234,23 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
     expect(crossing).toMatchObject({ status: 'rejected_risk', failedCheck: 'post_only' });
     expect(poly.postLimitOrder).not.toHaveBeenCalled();
 
+    // Polymarket refuses GTD expirations under 3 minutes ahead: smaller TTLs are rejected up front (R126)
+    for (const ttlMinutes of [0, 1, 2.9, -5, Number.NaN]) {
+      const tooShort = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes });
+      expect(tooShort).toMatchObject({ ok: false, status: 'invalid' });
+      expect(tooShort.error).toMatch(/at least 3/);
+    }
+    expect(poly.postLimitOrder).not.toHaveBeenCalled();
+    const min = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.44, size: 20, ttlMinutes: 3 });
+    expect(min.expiresAt).toBe(new Date(NOW + 3 * 60_000).toISOString());
+    poly.postLimitOrder.mockClear();
+
     const r = await svc.placeLimit({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, ttlMinutes: 10_000 });
     expect(r).toMatchObject({ ok: true, status: 'open' });
     const ttl = engine.getConfig().limits.orders.resting_order_ttl_minutes; // ttl capped
     expect(poly.postLimitOrder).toHaveBeenCalledWith({ tokenId: 't1', side: 'buy', price: 0.45, size: 20, expiresAtMs: NOW + ttl * 60_000 });
     expect(r.expiresAt).toBe(new Date(NOW + ttl * 60_000).toISOString());
-    expect(t.orderRepo.sumOpenBuyNotional({ marketId: 'm1' })).toBeCloseTo(9);
+    expect(t.orderRepo.sumOpenBuyNotional({ marketId: 'm1' })).toBeCloseTo(9 + 0.44 * 20);
     expect(t.orderRepo.findById(r.orderId!)!.fee_usd).toBe(0); // maker
   });
 

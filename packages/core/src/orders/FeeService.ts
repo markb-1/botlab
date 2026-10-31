@@ -1,17 +1,15 @@
 import path from 'path';
 import { z } from 'zod';
 import { parseConfigYaml, readOrCreate, resolveConfigDir } from '../config';
+import { ratesFromSchedule, type FeeRates, type MarketFeeSchedule } from './feeModel';
 
 /**
- * FeeService — Polymarket fee table per fee category (spec §4.4).
+ * FeeService — Polymarket fee rates (spec §4.4, PROGRESS R13 / R125).
  *
- * Rates come from `config/fees.yaml` (created with the defaults below when missing).
- * Fees are a fraction of notional for takers; makers pay `maker_rate` (0).
- *
- * VERIFY: the default rates are a starting point and must be checked against the
- * current Polymarket fee documentation before live trading. Polymarket's published
- * taker formula may depend on price (e.g. scaled by min(p, 1 − p)); we charge
- * `rate × notional`, which is the larger (conservative) amount for the same rate.
+ * A market's own Gamma fee schedule (`feeModel.ts`, stored in market_cache) always wins. Only when a
+ * market carries none is the category table in `config/fees.yaml` used (created with the defaults
+ * below, which follow the Polymarket fee docs table, checked 2026-10-31). Taker fee =
+ * shares × rate × p × (1 − p), in USDC on top; makers pay `maker_rate` (0).
  */
 
 export const FEE_CATEGORIES = [
@@ -38,7 +36,7 @@ export const FeesSchema = z.strictObject({
   taker_rates: z
     .strictObject({
       crypto: rate.default(0.07),
-      sports: rate.default(0.03),
+      sports: rate.default(0.05),
       finance: rate.default(0.04),
       politics: rate.default(0.04),
       tech: rate.default(0.04),
@@ -56,11 +54,12 @@ export const FeesSchema = z.strictObject({
 export type FeesConfig = z.infer<typeof FeesSchema>;
 
 export const DEFAULT_FEES_YAML = `# Polymarket fee table (spec §4.4). Human-owned.
-# Taker rate = fraction of notional charged to orders that cross the book; makers pay maker_rate.
-# VERIFY these defaults against the current Polymarket fee docs before trading live.
+# Used only for markets whose Gamma data carries no fee schedule (a market's own feeSchedule wins).
+# Taker fee (USDC, on top) = shares × rate × p × (1 − p); makers pay maker_rate.
+# Defaults follow the Polymarket fee docs table (docs.polymarket.com/trading/fees, checked 2026-10-31).
 taker_rates:
   crypto: 0.07
-  sports: 0.03
+  sports: 0.05
   finance: 0.04
   politics: 0.04
   tech: 0.04
@@ -131,9 +130,19 @@ export class FeeService {
    * Rates for a fee category. Unknown category ⇒ the highest configured taker rate,
    * so edge and expected-fee calculations never understate fees.
    */
-  getRates(category: FeeCategory | null): { takerRate: number; makerRate: number } {
+  getRates(category: FeeCategory | null): FeeRates {
     const takerRate =
       category !== null ? this.config.taker_rates[category] : Math.max(...Object.values(this.config.taker_rates));
-    return { takerRate, makerRate: this.config.maker_rate };
+    return { takerRate, makerRate: this.config.maker_rate, formula: 'price', source: category !== null ? 'category' : 'unknown' };
+  }
+
+  /** Rates for a market: its own Gamma schedule when present, else the category table. */
+  ratesFor(schedule: MarketFeeSchedule | null | undefined, category: FeeCategory | null): FeeRates {
+    return schedule ? ratesFromSchedule(schedule) : this.getRates(category);
+  }
+
+  /** Category from free-form labels (null when unmapped / not a fee category). */
+  static asFeeCategory(cat: string | null | undefined): FeeCategory | null {
+    return cat && (FEE_CATEGORIES as readonly string[]).includes(cat) ? (cat as FeeCategory) : null;
   }
 }

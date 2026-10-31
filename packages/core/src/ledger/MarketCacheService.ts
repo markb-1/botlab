@@ -26,6 +26,7 @@ import type { CategoriesConfig } from '../config/categoriesSchema';
 import type { MarketCacheRepository, MarketCacheRow, MarketCacheUpsert, MarketToken } from '../db/repositories/MarketCacheRepository';
 import { parseTokens } from '../db/repositories/MarketCacheRepository';
 import { slugify } from '../orders/FeeService';
+import { parseMarketFeeSchedule, parseStoredFeeSchedule, type MarketFeeSchedule } from '../orders/feeModel';
 import { GAMMA_API_URL, type MarketInfo, type MarketQuality, type MarketQualityProvider } from '../orders/MarketDataService';
 import { autoRaiseReason, effectiveAmbiguity, rulesHash } from './ambiguity';
 import { categorize } from './categorize';
@@ -68,6 +69,8 @@ export interface MarketView {
   negRisk: boolean;
   tokens: MarketToken[];
   feeCategory: string | null;
+  /** The market's own Gamma fee schedule; null ⇒ the category fee table applies */
+  feeSchedule: MarketFeeSchedule | null;
   liquidityUsd: number | null;
   volume24hUsd: number | null;
   active: boolean;
@@ -154,6 +157,7 @@ export interface ParsedGammaMarket {
   outcomePrices: string[] | null;
   umaResolutionStatus: string | null;
   disputed: boolean;
+  feeSchedule: MarketFeeSchedule | null;
 }
 
 /**
@@ -208,6 +212,7 @@ export function parseGammaMarketFull(raw: unknown): ParsedGammaMarket | null {
     outcomePrices: parseList(m.outcomePrices),
     umaResolutionStatus: umaStatus,
     disputed,
+    feeSchedule: parseMarketFeeSchedule(m),
   };
 }
 
@@ -247,6 +252,7 @@ export function toMarketView(row: MarketCacheRow, now: number): MarketView {
     negRisk: row.neg_risk === 1,
     tokens: parseTokens(row),
     feeCategory: row.fee_category,
+    feeSchedule: parseStoredFeeSchedule(row.fee_schedule),
     liquidityUsd: row.liquidity_usd,
     volume24hUsd: row.volume_24h_usd,
     active: row.active === 1,
@@ -451,6 +457,7 @@ export class MarketCacheService extends EventEmitter implements MarketQualityPro
       negRisk: parsed.negRisk,
       tokens: parsed.tokens,
       feeCategory: this.deps.feeCategoryFor?.(parsed.tags) ?? null,
+      feeSchedule: parsed.feeSchedule,
       liquidityUsd: parsed.liquidityUsd,
       volume24hUsd: parsed.volume24hUsd,
       active: parsed.active,
