@@ -27,6 +27,7 @@ export const LIMITS_FILE = 'limits.yaml';
 export const MANDATE_FILE = 'mandate.yaml';
 export const FEES_FILE_NAME = 'fees.yaml';
 export const SERVER_FILE = 'server.yaml';
+export const CATEGORIES_FILE = 'categories.yaml';
 
 export class ConfigError extends Error {
   constructor(

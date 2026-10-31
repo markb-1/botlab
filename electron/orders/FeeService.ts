@@ -81,7 +81,8 @@ export function loadFees(configDir: string = resolveConfigDir()): FeesConfig {
 /**
  * Keyword → fee category, matched against the market's Gamma category and tag slugs.
  * Earlier entries win (geopolitics before politics, mentions before anything else).
- * TODO(chunk 2a): replace with market_cache.fee_category once the market cache exists.
+ * Also stored as market_cache.fee_category (MarketCacheService) for reporting; orders compute it from
+ * the same Gamma labels.
  */
 const FEE_CATEGORY_KEYWORDS: Array<[FeeCategory, string[]]> = [
   ['mentions', ['mentions']],

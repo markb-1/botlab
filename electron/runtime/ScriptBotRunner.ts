@@ -8,7 +8,7 @@ import { BaseBotRunner } from '../../src/core/BaseBotRunner';
 import type { BotRecord } from '../../src/core/types';
 import type { WalletManager } from '../../src/core/WalletManager';
 import { ScriptRunner } from './ScriptRunner';
-import type { RpcHandlerDeps } from './RpcHandler';
+import type { LedgerReader, RpcHandlerDeps } from './RpcHandler';
 import { PaperTradingState } from './PaperTradingState';
 import type { BotStorageRepository } from '../database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
@@ -42,6 +42,8 @@ export interface ScriptBotRunnerDeps {
   createOrderService?: OrderServiceFactory;
   /** Hosts ctx.fetch may reach (limits.yaml server.script_fetch_allowlist) */
   fetchAllowlist?: readonly string[] | (() => readonly string[] | undefined);
+  /** Forecast ledger, read-only for bots (ctx.ledger) */
+  ledger?: LedgerReader;
 }
 
 const DEFAULT_PAPER_BALANCE = 10_000;
@@ -82,6 +84,7 @@ export class ScriptBotRunner extends BaseBotRunner {
       binanceApiKey: this.deps.binanceApiKey,
       binanceApiSecret: this.deps.binanceApiSecret,
       fetchAllowlist: this.deps.fetchAllowlist,
+      ledger: this.deps.ledger,
     };
 
     // Create paper trading state if in paper mode

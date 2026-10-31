@@ -22,10 +22,11 @@ import YAML, { isMap, isScalar } from 'yaml';
 import type { z } from 'zod';
 import type { AuditActor, AuditService } from '../audit/AuditService';
 import { FeesSchema, DEFAULT_FEES_YAML } from '../orders/FeeService';
-import { ConfigError, FEES_FILE_NAME, LIMITS_FILE, MANDATE_FILE, SERVER_FILE, parseConfigYaml, resolveConfigDir } from './loader';
+import { CATEGORIES_FILE, ConfigError, FEES_FILE_NAME, LIMITS_FILE, MANDATE_FILE, SERVER_FILE, parseConfigYaml, resolveConfigDir } from './loader';
 import { DEFAULT_LIMITS_YAML, DEFAULT_MANDATE_YAML } from './defaults';
 import { LimitsSchema, MandateSchema, validateCrossFile } from './schema';
 import { DEFAULT_SERVER_YAML, ServerSchema } from './serverSchema';
+import { CategoriesSchema, DEFAULT_CATEGORIES_YAML } from './categoriesSchema';
 import {
   CONFIG_FILE_NAMES,
   REDACTED,
@@ -49,18 +50,21 @@ const FILE_NAMES: Record<ConfigFileName, string> = {
   mandate: MANDATE_FILE,
   fees: FEES_FILE_NAME,
   server: SERVER_FILE,
+  categories: CATEGORIES_FILE,
 };
 const SCHEMAS: Record<ConfigFileName, z.ZodType> = {
   limits: LimitsSchema,
   mandate: MandateSchema,
   fees: FeesSchema,
   server: ServerSchema,
+  categories: CategoriesSchema,
 };
 const DEFAULT_TEXT: Record<ConfigFileName, string> = {
   limits: DEFAULT_LIMITS_YAML,
   mandate: DEFAULT_MANDATE_YAML,
   fees: DEFAULT_FEES_YAML,
   server: DEFAULT_SERVER_YAML,
+  categories: DEFAULT_CATEGORIES_YAML,
 };
 
 /** Sections that must be present in a reloaded file (a truncated file must not fall back to defaults). */
@@ -70,6 +74,7 @@ const REQUIRED_SECTIONS: Record<ConfigFileName, readonly string[]> = {
   mandate: shapeKeys(MandateSchema).filter((k) => k !== 'notes'),
   fees: shapeKeys(FeesSchema),
   server: [],
+  categories: ['rules'],
 };
 
 export type ConfigSource = 'initial' | 'file' | 'write' | 'restore';
@@ -105,7 +110,7 @@ export interface ConfigServiceOptions {
 }
 
 function defaultConfig(): AppConfig {
-  return { limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}), fees: FeesSchema.parse({}), server: ServerSchema.parse({}) };
+  return { limits: LimitsSchema.parse({}), mandate: MandateSchema.parse({}), fees: FeesSchema.parse({}), server: ServerSchema.parse({}), categories: CategoriesSchema.parse({}) };
 }
 
 export type Unsubscribe = () => void;

@@ -84,7 +84,7 @@ interface ElectronAPI {
     clearHalt: (scope: string, reason: string) => Promise<IpcResponse>;
     killSwitch: (reason: string) => Promise<IpcResponse>;
   };
-  /** Config files (spec §3). Human only. `file` is 'limits' | 'mandate' | 'fees' | 'server'. */
+  /** Config files (spec §3). Human only. `file` is 'limits' | 'mandate' | 'fees' | 'server' | 'categories'. */
   config: {
     get: () => Promise<IpcResponse>;
     /** `expectedSha256`: the file's hash from `config.get().hashes`; the write is refused if the file changed since. */
@@ -92,6 +92,24 @@ interface ElectronAPI {
     history: (file: string) => Promise<IpcResponse>;
     restore: (file: string, versionId: string) => Promise<IpcResponse>;
   };
+  /**
+   * Forecast ledger (spec §6). Forecasts are human-submitted until the agent exists; the server
+   * captures market prices. `state` for setRightsState: shadow | trading | suspended | deprioritised | auto.
+   */
+  ledger: {
+    submitForecast: (input: { tokenId: string; probability: number; rationale: string; sources: string[]; ambiguityScore: number }) => Promise<IpcResponse>;
+    withdrawForecast: (id: string, reason: string) => Promise<IpcResponse>;
+    list: (filter?: Record<string, unknown>) => Promise<IpcResponse>;
+    stats: () => Promise<IpcResponse>;
+    setRightsState: (category: string, bucket: string, state: string, reason: string) => Promise<IpcResponse>;
+  };
+  /** Market cache. `setAmbiguity`: human assessment 0-3 (buys need an assessed market). */
+  markets: {
+    get: (marketId: string) => Promise<IpcResponse>;
+    setAmbiguity: (marketId: string, score: number, note?: string) => Promise<IpcResponse>;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onMarketRulesChanged: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onConfigChanged: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -6,16 +6,18 @@
 import type { LimitsConfig, MandateConfig } from './schema';
 import type { ServerConfig } from './serverSchema';
 import type { FeesConfig } from '../orders/FeeService';
+import type { CategoriesConfig } from './categoriesSchema';
 
 export interface AppConfig {
   limits: LimitsConfig;
   mandate: MandateConfig;
   fees: FeesConfig;
   server: ServerConfig;
+  categories: CategoriesConfig;
 }
 
 export type ConfigFileName = keyof AppConfig;
-export const CONFIG_FILE_NAMES: readonly ConfigFileName[] = ['limits', 'mandate', 'fees', 'server'];
+export const CONFIG_FILE_NAMES: readonly ConfigFileName[] = ['limits', 'mandate', 'fees', 'server', 'categories'];
 
 export type ChangeEffect = 'raises' | 'lowers' | 'neutral';
 
@@ -209,6 +211,9 @@ export function classifyKey(file: ConfigFileName, path: string, o: unknown, n: u
       if (path === 'notify.telegram.enabled') return o === true && n === false ? 'raises' : 'neutral';
       if (path === 'notify.telegram.chat_id' || path === 'notify.telegram.bot_token') return 'raises';
       return 'neutral';
+    case 'categories':
+      // Any remap can move markets into an allowed category; cannot tell cheaply, assume it raises
+      return 'raises';
   }
 }
 

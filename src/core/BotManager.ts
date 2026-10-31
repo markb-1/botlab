@@ -24,7 +24,10 @@ import type { RiskStateRepository } from '../../electron/database/repositories/R
 import { loadConfig, resolveConfigDir } from '../../electron/config';
 import { RiskEngine } from '../../electron/risk/RiskEngine';
 import { FeeService, loadFees } from '../../electron/orders/FeeService';
-import { MarketDataService, PlaceholderMarketQualityProvider } from '../../electron/orders/MarketDataService';
+import { MarketDataService, unassessedQualityProvider } from '../../electron/orders/MarketDataService';
+import { defaultCategories } from '../../electron/config/categoriesSchema';
+import type { MarketCacheService } from '../../electron/ledger/MarketCacheService';
+import type { LedgerService } from '../../electron/ledger/LedgerService';
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
 import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
 import { createBinanceAdapter, createPolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
@@ -50,6 +53,10 @@ export interface BotManagerOrderDeps {
   config?: ConfigService;
   /** Fill / rejection notifications (Telegram) */
   events?: OrderEventSink;
+  /** Market cache: category, ambiguity, rules change. Without it every buy is rejected (ambiguity unknown). */
+  marketCache?: MarketCacheService;
+  /** Forecast ledger: forecasts and category rights for ledger-driven orders, ctx.ledger reads */
+  ledger?: LedgerService;
 }
 
 /**
@@ -202,6 +209,7 @@ export class BotManager extends EventEmitter {
             return cash;
           },
       getEndDate: async (tokenId) => (await this.marketData.getMarketInfo(tokenId))?.endDate ?? null,
+      categoryRights: this.orderDeps.ledger,
       getPaperPositionSize: paper
         ? (exchange, tokenId) => {
             if (exchange === 'binance') {
@@ -224,7 +232,8 @@ export class BotManager extends EventEmitter {
         provider,
         fees: this.fees,
         marketData: this.marketData,
-        quality: PlaceholderMarketQualityProvider,
+        quality: this.orderDeps.marketCache ?? unassessedQualityProvider(() => this.orderDeps?.config?.getConfig()?.categories ?? defaultCategories()),
+        forecasts: this.orderDeps.ledger,
         getBook: (tokenId) => args.clobClient.getOrderBook(tokenId) as Promise<ClobBook>,
         getBinanceBook: (symbol) => getBinanceOrderBook(symbol),
       },
@@ -524,6 +533,7 @@ export class BotManager extends EventEmitter {
       binanceApiSecret: settings.binanceApiSecret,
       createOrderService: this.createOrderService,
       fetchAllowlist: () => this.getLimits()?.server.script_fetch_allowlist,
+      ledger: this.orderDeps?.ledger,
     });
 
     // Forward events

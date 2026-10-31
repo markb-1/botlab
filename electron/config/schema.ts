@@ -141,6 +141,10 @@ export const MandateSchema = z.strictObject({
     })
     .prefault({})
     .superRefine((cats, ctx) => {
+      // `other` = unmapped market (categories.yaml); it can never be allowed (fail closed)
+      if (cats.allow.includes('other')) {
+        ctx.addIssue({ code: 'custom', path: ['allow'], message: 'category "other" (unmapped markets) cannot be allowed' });
+      }
       // A category may appear in only one list
       const seen = new Map<string, string>();
       for (const list of ['allow', 'later', 'deny'] as const) {

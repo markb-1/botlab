@@ -1,12 +1,12 @@
 /**
  * Polymarket market metadata for the risk engine: Gamma API lookup by token id, cached.
  *
- * Ambiguity score and rules-change tracking arrive with the market cache in chunk 2a;
- * until then `PlaceholderMarketQualityProvider` supplies neutral values.
+ * Category, ambiguity and rules-change come from a `MarketQualityProvider`; in the app that is the
+ * market cache (`electron/ledger/MarketCacheService.ts`, chunk 2a).
  */
 
-import type { MandateConfig } from '../config';
-import { slugify } from './FeeService';
+import type { CategoriesConfig } from '../config/categoriesSchema';
+import { categorize } from '../ledger/categorize';
 
 export const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
 const INFO_TTL_MS = 5 * 60_000;
@@ -28,26 +28,28 @@ export interface MarketInfo {
 }
 
 export interface MarketQuality {
-  /** 0–3 (spec §7.4); null = not rated */
+  /** BotLab category (config/categories.yaml); `other` when unmapped */
+  category: string | null;
+  /** 0–3 after the server raise (spec §7.4); null = not assessed (buys rejected) */
   ambiguityScore: number | null;
   rulesChangedAt: string | null;
 }
 
 export interface MarketQualityProvider {
-  get(marketId: string): Promise<MarketQuality>;
+  get(info: MarketInfo): Promise<MarketQuality>;
 }
 
 /**
- * TODO(chunk 2a): replace with the market cache (agent-assigned ambiguity score,
- * rules_hash change tracking). Until then every market is treated as unambiguous with
- * no rules change, so the mandate's ambiguity and rules-changed checks are not enforced.
- * Recorded in docs/PROGRESS.md "Decisions to review".
+ * Without a market cache: category from the Gamma labels, ambiguity unknown (so every buy is
+ * rejected by the ambiguity check). Used when no MarketCacheService is wired.
  */
-export const PlaceholderMarketQualityProvider: MarketQualityProvider = {
-  async get(): Promise<MarketQuality> {
-    return { ambiguityScore: 0, rulesChangedAt: null };
-  },
-};
+export function unassessedQualityProvider(getCategories: () => CategoriesConfig): MarketQualityProvider {
+  return {
+    async get(info: MarketInfo): Promise<MarketQuality> {
+      return { category: categorize({ question: info.question, tags: info.labels }, getCategories()).category, ambiguityScore: null, rulesChangedAt: null };
+    },
+  };
+}
 
 function parseNum(v: unknown): number | null {
   const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
@@ -109,24 +111,6 @@ export function parseGammaMarket(m: unknown, tokenId: string): MarketInfo | null
     labels: [...new Set(labels)],
     closed: mkt.closed === true || mkt.active === false,
   };
-}
-
-/**
- * Mandate category for a market from its labels. Placeholder until `config/categories.yaml`
- * (chunk 2a): label slugs are compared with the mandate lists directly; a denied label wins
- * over an allowed one (fail closed). Unmatched ⇒ the first label, which no list contains,
- * so buys are rejected by the category check.
- */
-export function mandateCategory(labels: string[], mandate: MandateConfig): string | null {
-  const slugs = labels.map(slugify).filter((s) => s.length > 0);
-  const { allow, later, deny } = mandate.categories;
-  return (
-    slugs.find((s) => deny.includes(s)) ??
-    slugs.find((s) => later.includes(s)) ??
-    slugs.find((s) => allow.includes(s)) ??
-    slugs[0] ??
-    null
-  );
 }
 
 export class MarketDataService {
@@ -192,4 +176,18 @@ export async function fetchPolymarketMid(clobHttpUrl: string, tokenId: string, f
   if (!resp.ok) throw new Error(`CLOB book HTTP ${resp.status}`);
   const book = (await resp.json()) as { bids?: Array<{ price: string }>; asks?: Array<{ price: string }> };
   return bookMid(book.bids, book.asks);
+}
+
+/** Best bid / ask of a token from the public CLOB book endpoint (null side when empty). Throws on HTTP/network errors. */
+export async function fetchPolymarketTop(clobHttpUrl: string, tokenId: string, fetchFn: typeof fetch = globalThis.fetch): Promise<{ bestBid: number | null; bestAsk: number | null }> {
+  const resp = await fetchFn(`${clobHttpUrl.replace(/\/+$/, '')}/book?token_id=${encodeURIComponent(tokenId)}`, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`CLOB book HTTP ${resp.status}`);
+  const book = (await resp.json()) as { bids?: Array<{ price: string }>; asks?: Array<{ price: string }> };
+  const prices = (levels: Array<{ price: string }> | undefined) =>
+    (levels ?? []).map((l) => parseFloat(l.price)).filter((p) => Number.isFinite(p) && p > 0);
+  const b = prices(book.bids);
+  const a = prices(book.asks);
+  return { bestBid: b.length > 0 ? Math.max(...b) : null, bestAsk: a.length > 0 ? Math.min(...a) : null };
 }

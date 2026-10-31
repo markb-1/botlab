@@ -19,8 +19,18 @@ export {
   LIMITS_FILE,
   MANDATE_FILE,
   SERVER_FILE,
+  CATEGORIES_FILE,
   FEES_FILE_NAME,
 } from './loader';
 export { DEFAULT_LIMITS_YAML, DEFAULT_MANDATE_YAML } from './defaults';
 export { ServerSchema, DEFAULT_SERVER_YAML, DEFAULT_TIMEZONE, type ServerConfig } from './serverSchema';
 export * from './changes';
+export {
+  CategoriesSchema,
+  CategoryRuleSchema,
+  DEFAULT_CATEGORIES_YAML,
+  UNMAPPED_CATEGORY,
+  defaultCategories,
+  type CategoriesConfig,
+  type CategoryRule,
+} from './categoriesSchema';

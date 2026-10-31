@@ -65,6 +65,9 @@ export interface BotContext {
 
   // === Risk budget (read-only) ===
   risk: RiskContext;
+
+  // === Forecast ledger (read-only, spec §5.2) ===
+  ledger: LedgerContext;
 }
 
 /** ctx.fetch options (spec §5.1): GET or POST, string body, plain header object. */
@@ -199,6 +202,38 @@ export interface RiskBudget {
 
 export interface RiskContext {
   getBudget(): Promise<RiskBudget>;
+}
+
+/** A ledger forecast (probability of `tokenId` resolving YES), read-only for bots. */
+export interface BotForecast {
+  id: string;
+  /** Condition id */
+  marketId: string;
+  tokenId: string;
+  eventId: string;
+  category: string;
+  probability: number;
+  /** Mid captured by the server when the forecast was written */
+  marketPriceAtForecast: number;
+  bestBid: number | null;
+  bestAsk: number | null;
+  /** 0-3, after the server raise */
+  ambiguityScore: number;
+  /** The (category, horizon) bucket was trading when the forecast was written */
+  tradeable: boolean;
+  horizonBucket: 'short' | 'medium' | 'long';
+  daysToResolutionAtForecast: number;
+  status: string;
+  rationale: string;
+  sources: string[];
+  createdAt: string;
+}
+
+export interface LedgerContext {
+  /** Active forecasts, optionally one category / tradeable only */
+  getActiveForecasts(filter?: { category?: string; tradeableOnly?: boolean }): Promise<BotForecast[]>;
+  /** The active forecast on a token, or null */
+  getForecast(tokenId: string): Promise<BotForecast | null>;
 }
 
 export interface OrderBook {
@@ -481,6 +516,8 @@ export type RpcMethod =
   | 'polymarket:getOpenOrders'
   | 'polymarket:getFee'
   | 'risk:getBudget'
+  | 'ledger:getActiveForecasts'
+  | 'ledger:getForecast'
   | 'storage:get'
   | 'storage:set'
   | 'storage:delete'

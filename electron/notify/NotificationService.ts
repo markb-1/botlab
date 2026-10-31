@@ -7,6 +7,7 @@
  * - AuditService records (bot created / deleted / stage changes, new script versions, worker fatal)
  * - OrderService via `OrderEventSink` (live fills batched per 5 min, rejection storms)
  * - ConfigService (risk-raising edits, rejected edits)
+ * - Ledger / market cache audit records (category-rights changes, rules changed or UMA dispute on a held market)
  * - `reconciliationMismatch()` hook (reconciler arrives in chunk 2b)
  * - a daily digest at `digest_time` in `timezone` (server.yaml)
  *
@@ -224,6 +225,27 @@ export class NotificationService implements OrderEventSink {
       case 'script.update':
         if (p.sourceChanged === true) this.send(`New template version: ${String(p.name ?? target)} r${String(p.revision)} (bots on it are back in paper)`);
         break;
+      case 'category_rights.change':
+        this.send(
+          `Category rights ${String(p.category ?? target)}/${String(p.bucket ?? '?')}: ${String(p.from)} -> ${String(p.to)}` +
+            `${p.to === 'trading' ? ` (max allocation $${Number(p.maxAllocationUsd ?? 0).toFixed(0)})` : ''}` +
+            `${p.forced ? ` forced by ${entry.actor}` : ''}: ${short(String(p.reason ?? ''))}`,
+          { priority: p.to === 'suspended' ? 'high' : 'normal' }
+        );
+        break;
+      case 'market.rules_changed':
+      case 'market.disputed': {
+        // Spec §11: immediate for markets a bot holds; unheld markets are only audited
+        const heldBy = Array.isArray(p.heldBy) ? p.heldBy.map(String) : [];
+        if (heldBy.length === 0) break;
+        const what = entry.action === 'market.rules_changed' ? 'RULES CHANGED' : 'UMA DISPUTE';
+        this.send(
+          `[${what}] ${short(String(p.question ?? target), 150)} (${target}). Held by: ${heldBy.map((id) => this.botName(id)).join(', ')}. ` +
+            'Buys are blocked; review the position.',
+          { priority: 'high' }
+        );
+        break;
+      }
       case 'bot.error':
         this.send(`[BOT ERROR] ${this.botName(target)} stopped: ${short(String(p.message ?? p.reason ?? 'worker error'))}`, { priority: 'high' });
         break;

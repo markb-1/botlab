@@ -16,7 +16,10 @@ import { RiskEngine } from '../../electron/risk/RiskEngine';
 import { FeeService } from '../../electron/orders/FeeService';
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
 import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
-import { PlaceholderMarketQualityProvider, type MarketInfo } from '../../electron/orders/MarketDataService';
+import type { MarketInfo, MarketQualityProvider } from '../../electron/orders/MarketDataService';
+
+/** Market assessed as unambiguous economics (the market cache is tested separately) */
+const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economics', ambiguityScore: 0, rulesChangedAt: null }) };
 import type { PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
 
 export type FakePolymarket = PolymarketAdapter & Record<'cancelOrders' | 'getOrder' | 'postMarketOrder' | 'postLimitOrder', ReturnType<typeof vi.fn>>;
@@ -172,7 +175,7 @@ export function openRiskHarness(startMs: number): RiskHarness {
           provider,
           fees: new FeeService(),
           marketData: { getMarketInfo: async (tokenId: string) => (MARKET.tokenIds.includes(tokenId) ? MARKET : null) },
-          quality: PlaceholderMarketQualityProvider,
+          quality: ASSESSED,
           getBook: async () => BOOK,
           getBinanceBook: async () => ({ bids: [], asks: [] }),
           audit,

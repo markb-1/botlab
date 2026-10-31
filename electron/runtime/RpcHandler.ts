@@ -10,7 +10,9 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../database/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../database/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast } from '../sdk/types';
+import type { ForecastView } from '../ledger/LedgerService';
+import type { ForecastFilter } from '../database/repositories/ForecastRepository';
 import type { PaperTradingState } from './PaperTradingState';
 import {
   getOrderBook,
@@ -30,6 +32,35 @@ import { scriptFetch } from './scriptFetch';
 /** ctx.fetch requests a bot may have in flight; more are rejected at once (spec §5.1 hardening). */
 export const MAX_CONCURRENT_FETCHES = 6;
 import logger from '../../src/utils/logger';
+
+/** Read-only ledger access for bots (spec §5.2: bots may read ledger data, never write it). */
+export interface LedgerReader {
+  list(filter?: ForecastFilter): ForecastView[];
+  getActiveForToken(tokenId: string): ForecastView | null;
+}
+
+/** The forecast as a bot sees it. */
+export function toBotForecast(f: ForecastView): BotForecast {
+  return {
+    id: f.id,
+    marketId: f.marketId,
+    tokenId: f.tokenId,
+    eventId: f.eventId,
+    category: f.category,
+    probability: f.probability,
+    marketPriceAtForecast: f.marketPriceAtForecast,
+    bestBid: f.bestBid,
+    bestAsk: f.bestAsk,
+    ambiguityScore: f.ambiguityScore,
+    tradeable: f.tradeable,
+    horizonBucket: f.horizonBucket,
+    daysToResolutionAtForecast: f.daysToResolutionAtForecast,
+    status: f.status,
+    rationale: f.rationale,
+    sources: f.sources,
+    createdAt: f.createdAt,
+  };
+}
 
 export interface RpcHandlerDeps {
   clobClient: ClobClient;
@@ -54,6 +85,8 @@ export interface RpcHandlerDeps {
   fetchAllowlist?: readonly string[] | (() => readonly string[] | undefined);
   /** Test hook: replaces the global fetch used by ctx.fetch */
   fetchImpl?: typeof fetch;
+  /** Forecast ledger (ctx.ledger); missing ⇒ ledger calls fail */
+  ledger?: LedgerReader;
 }
 
 /** Legacy ctx.binance.buy/sell result from an OrderService result. */
@@ -100,6 +133,11 @@ export class RpcHandler {
     const creds = this.binanceCreds;
     if (!creds) throw new Error('Binance API credentials not configured. Set them in Settings.');
     return creds;
+  }
+
+  private get ledger(): LedgerReader {
+    if (!this.deps.ledger) throw new Error('Forecast ledger unavailable');
+    return this.deps.ledger;
   }
 
   private get orders(): OrderService {
@@ -185,6 +223,24 @@ export class RpcHandler {
 
       case 'risk:getBudget':
         return this.orders.getBudget();
+
+      case 'ledger:getActiveForecasts': {
+        const filter = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as { category?: unknown; tradeableOnly?: unknown };
+        return this.ledger
+          .list({
+            status: 'active',
+            ...(typeof filter.category === 'string' && filter.category ? { category: filter.category } : {}),
+            tradeableOnly: filter.tradeableOnly === true,
+          })
+          .map(toBotForecast);
+      }
+
+      case 'ledger:getForecast': {
+        const tokenId = args[0];
+        if (typeof tokenId !== 'string' || !tokenId) throw new Error('tokenId required');
+        const f = this.ledger.getActiveForToken(tokenId);
+        return f ? toBotForecast(f) : null;
+      }
 
       case 'polymarket:getOrderBook':
         return getOrderBook(

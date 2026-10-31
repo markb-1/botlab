@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { MandateSchema } from '../../electron/config';
-import { mandateCategory, parseGammaMarket } from '../../electron/orders/MarketDataService';
+import { parseGammaMarket } from '../../electron/orders/MarketDataService';
 
 describe('market metadata', () => {
   const gamma = {
@@ -26,15 +25,6 @@ describe('market metadata', () => {
     expect(parseGammaMarket({ ...gamma, conditionId: undefined }, '111')).toBeNull();
     expect(parseGammaMarket({ ...gamma, active: false }, '111')?.closed).toBe(true);
     expect(parseGammaMarket({ ...gamma, endDate: 'soon' }, '111')?.endDate).toBeNull();
-  });
-
-  it('mandate category: denied label wins over allowed (fail closed)', () => {
-    const mandate = MandateSchema.parse({});
-    expect(mandateCategory(['Economics'], mandate)).toBe('economics');
-    expect(mandateCategory(['Economics', 'Sports'], mandate)).toBe('sports');
-    expect(mandateCategory(['Geopolitics', 'Economics'], mandate)).toBe('geopolitics'); // "later" list
-    expect(mandateCategory(['Weather'], mandate)).toBe('weather'); // not in any list ⇒ rejected by the engine
-    expect(mandateCategory([], mandate)).toBeNull();
   });
 });
 

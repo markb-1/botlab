@@ -33,7 +33,7 @@ import type { PaperTradingState } from '../runtime/PaperTradingState';
 import type { BinanceAdapter, PolymarketAdapter, PostOrderOutcome } from './ExchangeAdapter';
 import type { DbRiskStateProvider } from './DbRiskStateProvider';
 import type { FeeCategory, FeeService } from './FeeService';
-import { mandateCategory, type MarketDataService, type MarketInfo, type MarketQualityProvider } from './MarketDataService';
+import type { MarketDataService, MarketInfo, MarketQualityProvider } from './MarketDataService';
 import type { AuditService } from '../audit/AuditService';
 import type { OrderEventSink, OrderFillEvent } from '../notify/events';
 import logger from '../../src/utils/logger';
@@ -143,7 +143,10 @@ export interface RiskBudget {
   halted: boolean;
 }
 
-/** Ledger lookup. TODO(chunk 2a): real ledger; until then no forecast resolves. */
+/**
+ * Ledger lookup (LedgerService.forecastSource). Resolves only an active, tradeable forecast for the
+ * order's token (or the complementary token of a binary market, as 1 − p); anything else ⇒ null.
+ */
 export interface ForecastSource {
   get(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null>;
 }
@@ -357,8 +360,12 @@ export class OrderService {
       return { info, market: null, book, feeCategory: null, category: null };
     }
     const feeCategory = this.deps.fees.feeCategoryFor(info.labels);
-    const category = mandateCategory(info.labels, this.deps.riskEngine.getConfig().mandate);
-    const quality = await this.deps.quality.get(info.marketId);
+    // Unknown quality ⇒ category/ambiguity null ⇒ buys rejected by the engine (fail closed); sells unaffected
+    const quality = await this.deps.quality.get(info).catch((err: unknown) => {
+      logger.warning(`[OrderService] Market quality unavailable for ${info.marketId}: ${err instanceof Error ? err.message : String(err)}`);
+      return { category: null, ambiguityScore: null, rulesChangedAt: null };
+    });
+    const category = quality.category;
     const market: MarketSnapshot = {
       tokenId,
       category,
@@ -556,7 +563,7 @@ export class OrderService {
 
     let preCheck = shape.preCheck ?? null;
     if (!preCheck && input.forecastId && !forecast) {
-      preCheck = preDecision('forecast_unavailable', `Forecast ${input.forecastId} not found for token ${input.tokenId}`, this.now());
+      preCheck = preDecision('forecast_unavailable', `Forecast ${input.forecastId} not found, not active or not tradeable for token ${input.tokenId}`, this.now());
     }
     if (!preCheck && !ctx.market) {
       const why = !ctx.info ? 'market metadata unavailable' : ctx.info.closed ? 'market closed' : 'order book unavailable';

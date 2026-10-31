@@ -23,7 +23,16 @@ import type { BotTradeRepository, RiskPositionRow } from '../database/repositori
 import type { OrderRepository, OrderRow } from '../database/repositories/OrderRepository';
 import { GLOBAL_SCOPE, type RiskStateRepository } from '../database/repositories/RiskStateRepository';
 import { daysToSettlement, isLongHorizon } from '../risk/RiskEngine';
-import type { BotRiskInfo, BotStage, Exchange, OrderRequest, RiskStateProvider, RiskStateSnapshot } from '../risk/types';
+import type {
+  BotRiskInfo,
+  BotStage,
+  CategoryRightsState,
+  Exchange,
+  HorizonBucket,
+  OrderRequest,
+  RiskStateProvider,
+  RiskStateSnapshot,
+} from '../risk/types';
 
 const HOUR_MS = 3_600_000;
 const DEFAULT_CASH_CACHE_MS = 30_000;
@@ -37,6 +46,14 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
     timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
   });
   return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Category rights for ledger-driven orders (LedgerService). */
+export interface CategoryBucketSource {
+  /** The forecast's (category, horizon bucket), fixed when it was written, and that bucket's current rights; null = unknown */
+  bucketForForecast(forecastId: string): { category: string; horizonBucket: HorizonBucket; state: CategoryRightsState; maxAllocationUsd: number } | null;
+  /** Ledger-driven buy orders in the bucket that filled something or are still open */
+  ledgerBuyOrders(category: string, bucket: HorizonBucket, simulated: boolean): Array<{ id: string; bot_id: string; token_id: string; filled_size: number }>;
 }
 
 export interface DbRiskStateProviderDeps {
@@ -57,6 +74,8 @@ export interface DbRiskStateProviderDeps {
   getPaperPositionSize?: (exchange: Exchange, tokenId: string) => number | null;
   /** Trust of the bot's script; anything but `proven` gets the new-template probation allocation */
   getScriptTrust?: (scriptId: string) => string | null;
+  /** Forecast ledger; without it ledger-driven buys get no category bucket and are rejected */
+  categoryRights?: CategoryBucketSource;
   now?: () => number;
   cashCacheMs?: number;
 }
@@ -254,6 +273,30 @@ export class DbRiskStateProvider implements RiskStateProvider {
     };
   }
 
+  /**
+   * Rights and exposure of the forecast's (category, horizon bucket). Exposure = cost basis of every
+   * position (in scope) that a ledger-driven buy in the bucket filled into — the whole position, even
+   * if part of it was bought without a forecast (conservative) — plus the unfilled notional of open
+   * ledger-driven buys in the bucket. null (⇒ rejected) when the forecast or bucket is unknown.
+   */
+  getCategoryBucket(forecastId: string, exposure: ExposureSummary): RiskStateSnapshot['categoryBucket'] {
+    const src = this.deps.categoryRights;
+    if (!src) return null;
+    const b = src.bucketForForecast(forecastId);
+    if (!b) return null;
+    const ledgerOrders = src.ledgerBuyOrders(b.category, b.horizonBucket, this.deps.simulated);
+    const positionKeys = new Set(ledgerOrders.filter((o) => o.filled_size > 0).map((o) => `${o.bot_id}|${o.token_id}`));
+    const orderIds = new Set(ledgerOrders.map((o) => o.id));
+    let exposureUsd = 0;
+    for (const p of exposure.positions) {
+      if (p.exchange === 'polymarket' && positionKeys.has(`${p.bot_id}|${p.symbol}`)) exposureUsd += p.cost_basis;
+    }
+    for (const o of exposure.openBuys) {
+      if (orderIds.has(o.id)) exposureUsd += unfilledNotional(o);
+    }
+    return { state: b.state, exposureUsd, maxAllocationUsd: b.maxAllocationUsd };
+  }
+
   async getSnapshot(order: OrderRequest): Promise<RiskStateSnapshot> {
     const { simulated, orderRepo } = this.deps;
     const now = this.now();
@@ -281,8 +324,7 @@ export class DbRiskStateProvider implements RiskStateProvider {
         totalUsd: exposure.totalUsd,
         longHorizonUsd,
       },
-      // TODO(chunk 2a): category rights from the forecast ledger. null ⇒ ledger-driven buys are rejected.
-      categoryBucket: null,
+      categoryBucket: order.forecast && order.side === 'buy' ? this.getCategoryBucket(order.forecast.forecastId, exposure) : null,
       botOrdersLastHour: orderRepo.countByBotSince(order.botId, new Date(now - HOUR_MS).toISOString(), simulated),
       openOrdersCount: simulated ? orderRepo.countOpen(true, order.botId) : orderRepo.countOpen(false),
       position: order.side === 'sell' ? this.getPosition(order, exposure.positions) : null,

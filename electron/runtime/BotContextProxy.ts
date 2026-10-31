@@ -27,6 +27,8 @@ import type {
   KellyContext,
   PolymarketContext,
   RiskContext,
+  BotForecast,
+  LedgerContext,
   LimitOrderOpts,
   OrderResult,
   OpenOrder,
@@ -243,6 +245,13 @@ export function createBotContext(params: {
     risk: {
       getBudget: () => rpcCall('risk:getBudget') as Promise<RiskBudget>,
     } as RiskContext,
+
+    // Forecast ledger: read-only
+    ledger: {
+      getActiveForecasts: (filter?: { category?: string; tradeableOnly?: boolean }) =>
+        rpcCall('ledger:getActiveForecasts', filter) as Promise<BotForecast[]>,
+      getForecast: (tokenId: string) => rpcCall('ledger:getForecast', tokenId) as Promise<BotForecast | null>,
+    } as LedgerContext,
 
     // Kelly Criterion (pure math, runs locally in worker)
     kelly: {

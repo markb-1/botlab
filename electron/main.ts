@@ -12,6 +12,9 @@ import {
   OrderRepository,
   RiskStateRepository,
   AuditRepository,
+  MarketCacheRepository,
+  ForecastRepository,
+  CategoryRightsRepository,
 } from './database/repositories/index';
 import type { Database } from './database/index';
 import { keyManager } from './security/keyManager';
@@ -29,7 +32,12 @@ import { registerRiskHandlers } from './ipc/handlers/riskHandlers';
 import { seedTemplates, getBuiltinTemplates } from './database/seed';
 import { AuditService } from './audit/AuditService';
 import { OrderCanceller } from './orders/OrderCanceller';
-import { fetchPolymarketMid, bookMid } from './orders/MarketDataService';
+import { fetchPolymarketMid, fetchPolymarketTop, bookMid } from './orders/MarketDataService';
+import { FeeService } from './orders/FeeService';
+import { MarketCacheService, MARKET_RULES_CHANGED_EVENT } from './ledger/MarketCacheService';
+import { LedgerService } from './ledger/LedgerService';
+import { registerLedgerHandlers } from './ipc/handlers/ledgerHandlers';
+import { defaultCategories } from './config/categoriesSchema';
 import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from './risk/HaltService';
 import { KillSwitch } from './risk/KillSwitch';
 import { RiskMonitor } from './risk/RiskMonitor';
@@ -73,6 +81,10 @@ let shutdownMarker: ShutdownMarker | null = null;
 let configService: ConfigService;
 let telegram: TelegramNotifier;
 let notifications: NotificationService;
+
+// Market cache and forecast ledger (no wallet keys needed: created before unlock)
+let marketCache: MarketCacheService | null = null;
+let ledger: LedgerService | null = null;
 
 const isDev = !app.isPackaged;
 
@@ -172,7 +184,7 @@ async function initializePhaseA(): Promise<void> {
   configService = new ConfigService({ audit, historyDir: path.join(getDataDir(), 'config-history') });
   try {
     configService.load();
-    audit.record('system', 'config.load', configService.configDir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml', 'server.yaml'], stage: 'startup' }, 'ok');
+    audit.record('system', 'config.load', configService.configDir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml', 'server.yaml', 'categories.yaml'], stage: 'startup' }, 'ok');
   } catch (err) {
     console.error('[Main] Could not read config at startup:', err);
     audit.record('system', 'config.load', configService.configDir, { stage: 'startup', error: err instanceof Error ? err.message : String(err) }, 'error');
@@ -217,6 +229,57 @@ async function initializePhaseA(): Promise<void> {
   notifications.attachConfig(configService);
   notifications.start();
   telegram.start();
+
+  // Market cache (category, rules hash, ambiguity) and forecast ledger (scorer hourly, refresh every 30 min)
+  const forecastRepo = new ForecastRepository(db);
+  const feeLabels = new FeeService();
+  const qty = 1e-9;
+  marketCache = new MarketCacheService({
+    repo: new MarketCacheRepository(db),
+    getCategories: () => configService.getConfig()?.categories ?? defaultCategories(),
+    feeCategoryFor: (labels) => feeLabels.feeCategoryFor(labels),
+    audit,
+    heldBy: (marketId) => [
+      ...new Set(
+        tradeRepo
+          .getRiskPositions({ simulated: false, exchange: 'polymarket' })
+          .filter((p) => p.condition_id === marketId && p.net_quantity > qty)
+          .map((p) => p.bot_id)
+      ),
+    ],
+    watchedMarketIds: () => [
+      ...[false, true].flatMap((simulated) =>
+        tradeRepo
+          .getRiskPositions({ simulated, exchange: 'polymarket' })
+          .filter((p) => p.net_quantity > qty && p.condition_id)
+          .map((p) => p.condition_id as string)
+      ),
+      ...[false, true].flatMap((simulated) => orderRepo.findOpen(undefined, simulated).filter((o) => o.exchange === 'polymarket').map((o) => o.market_id)),
+      ...forecastRepo.activeMarketIds(),
+    ],
+  });
+  marketCache.on(MARKET_RULES_CHANGED_EVENT, (payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(MARKET_RULES_CHANGED_EVENT, payload);
+  });
+  const cache = marketCache;
+  configService.onChange((e) => {
+    if (e.changes.some((c) => c.file === 'categories')) {
+      const n = cache.recategorizeAll();
+      console.log(`[Main] categories.yaml changed: ${n} cached market(s) re-categorized`);
+    }
+  });
+  ledger = new LedgerService({
+    forecastRepo,
+    rightsRepo: new CategoryRightsRepository(db),
+    marketCache,
+    audit,
+    getTopOfBook: (tokenId) => fetchPolymarketTop(settingsRepo.get().clob_http_url, tokenId),
+    getMid: (tokenId) => fetchPolymarketMid(settingsRepo.get().clob_http_url, tokenId),
+    getMandate: () => configService.getConfig()?.mandate ?? null,
+  });
+  registerLedgerHandlers(ledger, marketCache, (sender) => !!mainWindow && !mainWindow.isDestroyed() && sender.id === mainWindow.webContents.id);
+  marketCache.start();
+  ledger.start();
 
   // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
   const startHaltedAfterCrash: boolean | null = configService.getConfig()?.limits.server.start_halted_after_crash ?? null;
@@ -295,7 +358,7 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     scriptRepo,
     storageRepo,
     tradeRepo,
-    { db: database, orderRepo, riskStateRepo, audit, config: configService, events: notifications }
+    { db: database, orderRepo, riskStateRepo, audit, config: configService, events: notifications, marketCache: marketCache ?? undefined, ledger: ledger ?? undefined }
   );
   await botManager.initialize();
   console.log('[Main] BotManager initialized');
@@ -424,6 +487,8 @@ async function gracefulShutdown(): Promise<void> {
   if (botManager) {
     await botManager.shutdown();
   }
+  await ledger?.stop().catch((error) => console.error('[Main] Error stopping ledger scorer:', error));
+  await marketCache?.stop().catch((error) => console.error('[Main] Error stopping market cache:', error));
   if (shutdownTimedOut) return;
   await notifications?.stop().catch((error) => console.error('[Main] Error stopping notifications:', error));
   await telegram?.stop().catch((error) => console.error('[Main] Error stopping Telegram:', error));

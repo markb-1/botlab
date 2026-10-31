@@ -158,6 +158,32 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('config:restore', file, versionId),
   },
 
+  // === Forecast ledger and market cache (spec §6) ===
+  ledger: {
+    submitForecast: (input: { tokenId: string; probability: number; rationale: string; sources: string[]; ambiguityScore: number }) =>
+      ipcRenderer.invoke('ledger:submitForecast', input),
+    withdrawForecast: (id: string, reason: string) =>
+      ipcRenderer.invoke('ledger:withdrawForecast', id, reason),
+    list: (filter?: Record<string, unknown>) =>
+      ipcRenderer.invoke('ledger:list', filter),
+    stats: () =>
+      ipcRenderer.invoke('ledger:stats'),
+    setRightsState: (category: string, bucket: string, state: string, reason: string) =>
+      ipcRenderer.invoke('ledger:setRightsState', category, bucket, state, reason),
+  },
+  markets: {
+    get: (marketId: string) =>
+      ipcRenderer.invoke('markets:get', marketId),
+    setAmbiguity: (marketId: string, score: number, note?: string) =>
+      ipcRenderer.invoke('markets:setAmbiguity', marketId, score, note),
+  },
+
+  onMarketRulesChanged: (callback: (event: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('market:rulesChanged', listener);
+    return () => ipcRenderer.removeListener('market:rulesChanged', listener);
+  },
+
   // === Real-time Events (replaces Socket.io) ===
   onBotEvent: (callback: (event: any) => void) => {
     const listener = (_event: any, data: any) => callback(data);
@@ -269,6 +295,18 @@ declare global {
         history: (file: string) => Promise<any>;
         restore: (file: string, versionId: string) => Promise<any>;
       };
+      ledger: {
+        submitForecast: (input: { tokenId: string; probability: number; rationale: string; sources: string[]; ambiguityScore: number }) => Promise<any>;
+        withdrawForecast: (id: string, reason: string) => Promise<any>;
+        list: (filter?: Record<string, unknown>) => Promise<any>;
+        stats: () => Promise<any>;
+        setRightsState: (category: string, bucket: string, state: string, reason: string) => Promise<any>;
+      };
+      markets: {
+        get: (marketId: string) => Promise<any>;
+        setAmbiguity: (marketId: string, score: number, note?: string) => Promise<any>;
+      };
+      onMarketRulesChanged: (callback: (event: any) => void) => () => void;
       onConfigChanged: (callback: (event: any) => void) => () => void;
       onBotEvent: (callback: (event: any) => void) => () => void;
       onBotLog: (callback: (log: any) => void) => () => void;

@@ -10,7 +10,10 @@ import { RiskEngine } from '../../electron/risk/RiskEngine';
 import { FeeService } from '../../electron/orders/FeeService';
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
 import { OrderService, type BotOrderContext, type ClobBook } from '../../electron/orders/OrderService';
-import { PlaceholderMarketQualityProvider, type MarketInfo } from '../../electron/orders/MarketDataService';
+import type { MarketInfo, MarketQualityProvider } from '../../electron/orders/MarketDataService';
+
+/** Market assessed as unambiguous economics (the market cache is tested separately) */
+const ASSESSED: MarketQualityProvider = { get: async () => ({ category: 'economics', ambiguityScore: 0, rulesChangedAt: null }) };
 import type { PolymarketAdapter, BinanceAdapter } from '../../electron/orders/ExchangeAdapter';
 import { PaperTradingState } from '../../electron/runtime/PaperTradingState';
 import type { RiskDecision } from '../../electron/risk/types';
@@ -89,7 +92,7 @@ describe.skipIf(!sqliteAvailable)('OrderService', () => {
         provider,
         fees: new FeeService(),
         marketData: { getMarketInfo: async (tokenId: string) => (MARKET.tokenIds.includes(tokenId) ? MARKET : null) },
-        quality: PlaceholderMarketQualityProvider,
+        quality: ASSESSED,
         getBook: async () => BOOK,
         getBinanceBook: async () => ({ bids: [{ price: '49990', quantity: '1' }], asks: [{ price: '50000', quantity: '1' }] }),
         now: () => clock,

@@ -27,3 +27,12 @@ export type { RiskStateRow, LossBaseline } from './RiskStateRepository';
 
 export { AuditRepository } from './AuditRepository';
 export type { AuditRow, AuditActor, AuditEntry } from './AuditRepository';
+
+export { MarketCacheRepository, parseTokens } from './MarketCacheRepository';
+export type { MarketCacheRow, MarketCacheUpsert, MarketToken } from './MarketCacheRepository';
+
+export { ForecastRepository } from './ForecastRepository';
+export type { ForecastRow, ForecastStatus, ForecastInsert, ForecastFilter } from './ForecastRepository';
+
+export { CategoryRightsRepository } from './CategoryRightsRepository';
+export type { CategoryRightsRow } from './CategoryRightsRepository';
