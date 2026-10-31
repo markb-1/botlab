@@ -45,9 +45,12 @@ rules:
     keywords: [temperature, highest temperature, lowest temperature, hottest, coldest, rainfall, snowfall, hurricane, named storm, named storms, tropical storm, heat wave]
     exclude_keywords: [bitcoin, ethereum]
   - name: economics
-    tags: [economy, economics, inflation, cpi, gdp, jobs-report, unemployment, interest-rates, central-banks, ecb, boe, boj, rba, boc, recession, macro, pce, nfp, payrolls]
-    keywords: [cpi, inflation, gdp, unemployment rate, nonfarm payrolls, jobs report, interest rate, rate cut, rate hike, central bank, ecb, bank of england, bank of japan, recession, pce]
-    when_tags: [finance, business, economy, world]
+    # Strong tags are specific macro topics. The broad economy / economics / finance / business tags are
+    # weak (when_tags): Gamma puts them on company markets too ("Will Apple be the largest company…" is
+    # tagged economy + finance + business), so they count only with an economics keyword.
+    tags: [inflation, cpi, gdp, jobs-report, unemployment, interest-rates, central-banks, ecb, boe, boj, rba, boc, recession, pce, nfp, payrolls]
+    keywords: [cpi, inflation, consumer price index, core pce, pce, ppi, gdp, recession, unemployment, unemployment rate, jobless claims, jobs report, nonfarm payrolls, payrolls, retail sales, interest rate, interest rates, rate decision, rate cut, rate cuts, rate hike, rate hikes, central bank, ecb, european central bank, bank of england, boe, bank of japan, boj, bank of canada, reserve bank, rba, rbnz, snb, swiss national bank, pboc, riksbank, norges bank, rbi]
+    when_tags: [economy, economics, macro, finance, business, world]
   - name: science-tech
     tags: [tech, technology, ai, science, space, spacex, nasa, openai, anthropic, google, apple, fda, biotech, big-tech]
   - name: politics-non-us

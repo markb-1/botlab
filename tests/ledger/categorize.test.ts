@@ -48,6 +48,17 @@ describe('categorize (config/categories.yaml)', () => {
     ['generic "US" only on political markets', { question: 'US CPI above 3%?', tags: ['economy'] }, 'economics'],
     ['sports keyword, no tags', { question: 'Who wins the Super Bowl?', tags: [] }, 'sports'],
     ['mentions keyword, economy tag', { question: 'Will Lagarde say "tariff" at the press conference?', tags: ['economy'] }, 'mentions'],
+    // Live samples from docs/TEST-REPORT-MAC.md (Gamma, 2026-10-31)
+    ['Apple market cap (economy/finance/business are weak tags)', { question: 'Will Apple be the largest company in the world by market cap on December 31?', tags: ['tech', 'economy', 'finance', 'big-tech', 'business'] }, 'science-tech'],
+    ['company market, weak economy tags only ⇒ other', { question: "Will Nvidia's market cap exceed $6T by December 31?", tags: ['economy', 'finance', 'business'] }, 'other'],
+    ['Bank of Canada rate decision', { question: 'Bank of Canada decreases interest rates by 25 bps after the December meeting?', tags: ['economy', 'finance'] }, 'economics'],
+    ['non-Fed central bank keyword, economy tag', { question: 'Will the Reserve Bank of Australia hike in February?', tags: ['economy'] }, 'economics'],
+    ['jobs data, economy tag', { question: 'Will the UK unemployment rate be above 5%?', tags: ['economy'] }, 'economics'],
+    ['Bulgarian presidential election', { question: 'Will Iliana Iotova win the next Bulgarian presidential election?', tags: ['politics', 'elections', 'world-elections'] }, 'politics-non-us'],
+    ['US midterms', { question: 'Will Democrats win the House in the 2026 midterms?', tags: ['politics', 'midterms', 'elections'] }, 'us-elections-headline'],
+    ['Musk tweet counts', { question: 'Elon Musk # of tweets November 1 - November 7?', tags: ['tech', 'elon-musk'] }, 'mentions'],
+    ['Fed hike', { question: 'Fed hikes rates after the December 2026 meeting?', tags: ['economy', 'fed-rates', 'finance'] }, 'fed-headline'],
+    ['AI IPO with climate-science + economy tags', { question: 'Anthropic IPO before 2027?', tags: ['climate-science', 'economy', 'business'] }, 'other'],
     // Fail closed
     ['generic election, no country', { question: 'Who will win the presidential election?', tags: ['politics', 'elections'] }, 'other'],
     ['no tags, no keyword', { question: 'Will it happen?', tags: [] }, 'other'],
