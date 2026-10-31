@@ -86,6 +86,13 @@ export class OrderRepository {
       .all(sim) as OrderRow[];
   }
 
+  /** Bots with orders that may still fill (live or paper). */
+  findBotIdsWithOpenOrders(): string[] {
+    return (this.db.prepare(`SELECT DISTINCT bot_id FROM orders WHERE status IN ${OPEN_IN}`).all() as Array<{ bot_id: string }>).map(
+      (r) => r.bot_id
+    );
+  }
+
   create(data: {
     id?: string;
     botId: string;

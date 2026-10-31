@@ -55,6 +55,8 @@ export interface DbRiskStateProviderDeps {
    * for the token (positions opened before OrderService existed). null = none.
    */
   getPaperPositionSize?: (exchange: Exchange, tokenId: string) => number | null;
+  /** Trust of the bot's script; anything but `proven` gets the new-template probation allocation */
+  getScriptTrust?: (scriptId: string) => string | null;
   now?: () => number;
   cashCacheMs?: number;
 }
@@ -122,6 +124,7 @@ export class DbRiskStateProvider implements RiskStateProvider {
       halted: halt?.halted === 1,
       haltReason: halt?.halted_reason ?? null,
       strategy: row.strategy ?? null,
+      ...(this.deps.getScriptTrust ? { newTemplate: this.deps.getScriptTrust(row.script_id) !== 'proven' } : {}),
     };
   }
 

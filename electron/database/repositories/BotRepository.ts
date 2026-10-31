@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { generateId } from '../index';
+import type { BotStage } from '../../risk/types';
 
 export interface BotRow {
   id: string;
@@ -22,6 +23,14 @@ export interface BotRow {
   strategy: string | null;
   paused_by: string | null;
   retire_reason: string | null;
+  /** scripts.revision the bot was created on */
+  template_version: number | null;
+  /** When the current stage was entered (null for pre-1c bots: use created_at) */
+  stage_changed_at: string | null;
+  /** Last runtime error from the bot's worker (ISO) */
+  last_error_at: string | null;
+  /** Set when the ramp promoted the bot to full (counts toward its template becoming proven) */
+  reached_full_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -78,14 +87,18 @@ export class BotRepository {
     config?: Record<string, unknown>;
     enabled?: boolean;
     mode?: 'live' | 'paper';
+    /** Ramp stage (spec §4.5); callers derive it from the script's trust. Default paper (fail closed). */
+    stage?: BotStage;
+    templateVersion?: number | null;
   }): BotRow {
     const id = generateId();
     const now = new Date().toISOString();
 
     this.db
       .prepare(
-        `INSERT INTO bots (id, name, script_id, wallet_id, config, enabled, mode, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO bots (id, name, script_id, wallet_id, config, enabled, mode, stage, template_version,
+           stage_changed_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -95,6 +108,9 @@ export class BotRepository {
         JSON.stringify(data.config || {}),
         data.enabled !== false ? 1 : 0,
         data.mode || 'live',
+        data.stage ?? 'paper',
+        data.templateVersion ?? null,
+        now,
         now,
         now
       );
@@ -139,6 +155,35 @@ export class BotRepository {
     this.db.prepare(`UPDATE bots SET ${sets.join(', ')} WHERE id = ?`).run(...values);
 
     return this.findById(id);
+  }
+
+  /** Change the ramp stage (resets stage_changed_at). `reachedFull` marks a ramp promotion to full. */
+  setStage(id: string, stage: BotStage, opts: { reachedFull?: boolean } = {}): BotRow | undefined {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE bots SET stage = ?, stage_changed_at = ?,
+           reached_full_at = CASE WHEN ? THEN ? ELSE reached_full_at END,
+           updated_at = datetime('now') WHERE id = ?`
+      )
+      .run(stage, now, opts.reachedFull ? 1 : 0, now, id);
+    return this.findById(id);
+  }
+
+  /** Bots of a script (current revision) that the ramp promoted to full. */
+  countReachedFull(scriptId: string, templateVersion: number): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS n FROM bots WHERE script_id = ? AND template_version = ? AND reached_full_at IS NOT NULL')
+      .get(scriptId, templateVersion) as { n: number };
+    return row.n;
+  }
+
+  setTemplateVersion(id: string, templateVersion: number | null): void {
+    this.db.prepare('UPDATE bots SET template_version = ? WHERE id = ?').run(templateVersion, id);
+  }
+
+  recordRuntimeError(id: string, at: string = new Date().toISOString()): void {
+    this.db.prepare('UPDATE bots SET last_error_at = ? WHERE id = ?').run(at, id);
   }
 
   updateStatus(id: string, status: string): void {

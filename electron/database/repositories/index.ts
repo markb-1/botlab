@@ -24,3 +24,6 @@ export type { OrderRow, OrderStatus } from './OrderRepository';
 
 export { RiskStateRepository, GLOBAL_SCOPE } from './RiskStateRepository';
 export type { RiskStateRow } from './RiskStateRepository';
+
+export { AuditRepository } from './AuditRepository';
+export type { AuditRow, AuditActor, AuditEntry } from './AuditRepository';

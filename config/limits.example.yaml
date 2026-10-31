@@ -40,3 +40,5 @@ binance:
   enabled: true
   max_order_usd: 25
   allocation_usd: 100
+server:
+  start_halted_after_crash: true     # after an unclean shutdown, start with a global halt (clear it by hand)

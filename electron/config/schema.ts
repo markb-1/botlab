@@ -94,6 +94,12 @@ export const LimitsSchema = z.strictObject({
       allocation_usd: usd.default(100),
     })
     .prefault({}),
+  server: z
+    .strictObject({
+      // Spec §4.3 puts this in server.yaml; kept here until that file exists
+      start_halted_after_crash: z.boolean().default(true),
+    })
+    .prefault({}),
 });
 
 export type LimitsConfig = z.infer<typeof LimitsSchema>;

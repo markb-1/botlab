@@ -22,6 +22,8 @@ export interface IpcBot {
   status: string;
   enabled: boolean;
   mode: 'live' | 'paper';
+  /** Ramp stage (spec §4.5) */
+  stage?: string;
   lastStartedAt?: string | null;
   lastStoppedAt?: string | null;
   lastHeartbeat?: string | null;
@@ -76,6 +78,11 @@ export interface IpcScript {
   source: string;
   configSchema: Record<string, unknown>;
   isTemplate: boolean;
+  origin?: string;
+  /** Integer source version (spec §2.1) */
+  revision?: number;
+  /** Ramp trust: new | proven */
+  trust?: string;
   createdAt: string;
   updatedAt: string;
 }

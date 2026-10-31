@@ -136,6 +136,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('backtest:delete', runId),
   },
 
+  // === Risk (halts, kill switch) ===
+  risk: {
+    getState: () =>
+      ipcRenderer.invoke('risk:getState'),
+    clearHalt: (scope: string, reason: string) =>
+      ipcRenderer.invoke('risk:clearHalt', scope, reason),
+    killSwitch: (reason: string) =>
+      ipcRenderer.invoke('risk:killSwitch', reason),
+  },
+
   // === Real-time Events (replaces Socket.io) ===
   onBotEvent: (callback: (event: any) => void) => {
     const listener = (_event: any, data: any) => callback(data);
@@ -148,6 +158,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event: any, data: any) => callback(data);
     ipcRenderer.on('bot:log', listener);
     return () => ipcRenderer.removeListener('bot:log', listener);
+  },
+
+  onRiskHalt: (callback: (event: any) => void) => {
+    const listener = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('risk:halt', listener);
+    return () => ipcRenderer.removeListener('risk:halt', listener);
   },
 
   // === App Info ===
@@ -224,8 +240,14 @@ declare global {
         get: (runId: string) => Promise<any>;
         delete: (runId: string) => Promise<any>;
       };
+      risk: {
+        getState: () => Promise<any>;
+        clearHalt: (scope: string, reason: string) => Promise<any>;
+        killSwitch: (reason: string) => Promise<any>;
+      };
       onBotEvent: (callback: (event: any) => void) => () => void;
       onBotLog: (callback: (log: any) => void) => () => void;
+      onRiskHalt: (callback: (event: any) => void) => () => void;
       getAppVersion: () => Promise<string>;
       getAppPath: () => Promise<string>;
     };

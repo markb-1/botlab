@@ -8,6 +8,9 @@ import type { SettingsRepository } from '../../database/repositories/SettingsRep
 import type { BotManager } from '../../../src/core/BotManager';
 import type { WalletManager } from '../../../src/core/WalletManager';
 import type { IpcBot, IpcBotTrade } from '../types';
+import type { AuditService } from '../../audit/AuditService';
+import { initialStage, lowerStage } from '../../risk/ramp';
+import type { BotStage } from '../../risk/types';
 import logger from '../../../src/utils/logger';
 
 // Module-level cache for token → market info resolution (static data)
@@ -150,6 +153,7 @@ function botRowToIpc(
     status: row.status,
     enabled: row.enabled === 1,
     mode: (row.mode as 'live' | 'paper') || 'live',
+    stage: row.stage,
     lastStartedAt: row.last_started_at,
     lastStoppedAt: row.last_stopped_at,
     lastHeartbeat: row.last_heartbeat,
@@ -190,7 +194,8 @@ export function registerBotHandlers(
   botManager: BotManager,
   walletManager: WalletManager,
   storageRepo: BotStorageRepository,
-  settingsRepo: SettingsRepository
+  settingsRepo: SettingsRepository,
+  audit?: AuditService
 ): void {
   // List all bots
   ipcMain.handle('bots:list', async (_event, filter?: { scriptId?: string; status?: string }) => {
@@ -244,6 +249,9 @@ export function registerBotHandlers(
         return { success: false, error: 'Wallet is required for live bots' };
       }
 
+      // Ramp (spec §4.5): new template ⇒ paper, proven template ⇒ probation
+      const script = scriptRepo.findById(data.scriptId);
+      const stage = initialStage(script?.trust);
       const row = botRepo.create({
         name: data.name,
         scriptId: data.scriptId,
@@ -251,6 +259,16 @@ export function registerBotHandlers(
         config: data.config,
         enabled: data.enabled,
         mode: data.mode,
+        stage,
+        templateVersion: script?.revision ?? null,
+      });
+      audit?.record('human', 'bot.create', row.id, {
+        name: data.name,
+        scriptId: data.scriptId,
+        templateVersion: script?.revision ?? null,
+        trust: script?.trust ?? null,
+        mode: data.mode ?? 'live',
+        stage,
       });
       return {
         success: true,
@@ -270,11 +288,31 @@ export function registerBotHandlers(
     enabled?: boolean;
   }) => {
     try {
+      const before = botRepo.findById(id);
+      if (!before) return { success: false, error: 'Bot not found' };
       const row = botRepo.update(id, data);
       if (!row) return { success: false, error: 'Bot not found' };
+      audit?.record('human', 'bot.update', id, {
+        fields: Object.keys(data),
+        ...(data.scriptId !== undefined && data.scriptId !== before.script_id ? { scriptId: { from: before.script_id, to: data.scriptId } } : {}),
+        ...(data.walletId !== undefined && data.walletId !== before.wallet_id ? { walletId: { from: before.wallet_id, to: data.walletId } } : {}),
+        ...(data.enabled !== undefined ? { enabled: data.enabled } : {}),
+      });
+      // Switching to another script can only lower the stage (the new code must earn trust)
+      if (data.scriptId !== undefined && data.scriptId !== before.script_id) {
+        const script = scriptRepo.findById(data.scriptId);
+        const from = (row.stage || 'full') as BotStage;
+        const to = lowerStage(from, initialStage(script?.trust));
+        if (to !== from) {
+          botRepo.setStage(id, to);
+          audit?.record('system', 'bot.stage', id, { from, to, reason: `script changed to ${data.scriptId} (trust ${script?.trust ?? 'unknown'})` });
+        }
+        botRepo.setTemplateVersion(id, script?.revision ?? null);
+      }
+      const fresh = botRepo.findById(id) ?? row;
       return {
         success: true,
-        data: botRowToIpc(row, walletRepo, scriptRepo),
+        data: botRowToIpc(fresh, walletRepo, scriptRepo),
       };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -292,6 +330,7 @@ export function registerBotHandlers(
 
       const deleted = botRepo.delete(id);
       if (!deleted) return { success: false, error: 'Bot not found or cannot be deleted (must be stopped)' };
+      audit?.record('human', 'bot.delete', id, { name: botRow?.name, scriptId: botRow?.script_id, stage: botRow?.stage });
 
       // Clean up auto-generated paper wallet
       if (isPaperWallet && paperWalletId) {
@@ -307,7 +346,7 @@ export function registerBotHandlers(
   // Start bot
   ipcMain.handle('bots:start', async (_event, id: string) => {
     try {
-      await botManager.startBot(id);
+      await botManager.startBot(id, 'human');
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -317,7 +356,7 @@ export function registerBotHandlers(
   // Stop bot
   ipcMain.handle('bots:stop', async (_event, id: string) => {
     try {
-      await botManager.stopBot(id);
+      await botManager.stopBot(id, 'human');
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -327,7 +366,7 @@ export function registerBotHandlers(
   // Restart bot
   ipcMain.handle('bots:restart', async (_event, id: string) => {
     try {
-      await botManager.restartBot(id);
+      await botManager.restartBot(id, 'human');
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };

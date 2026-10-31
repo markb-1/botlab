@@ -2,6 +2,7 @@ import { ipcMain, dialog, BrowserWindow } from 'electron';
 import * as fs from 'fs';
 import type { ScriptRepository } from '../../database/repositories/ScriptRepository';
 import type { IpcScript } from '../types';
+import type { AuditService } from '../../audit/AuditService';
 
 /**
  * Compile TypeScript source to JavaScript using esbuild.
@@ -45,14 +46,21 @@ function scriptRowToIpc(row: any): IpcScript {
     source: row.source,
     configSchema: JSON.parse(row.config_schema || '{}'),
     isTemplate: row.is_template === 1,
+    origin: row.origin,
+    revision: row.revision,
+    trust: row.trust,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
 export function registerScriptHandlers(
-  scriptRepo: ScriptRepository
+  scriptRepo: ScriptRepository,
+  audit?: AuditService
 ): void {
+  const auditScript = (action: string, row: { id: string; name: string; revision: number; trust: string; source_hash: string | null }, extra: Record<string, unknown> = {}) =>
+    audit?.record('human', action, row.id, { name: row.name, revision: row.revision, trust: row.trust, sourceHash: row.source_hash, ...extra });
+
   // List all scripts
   ipcMain.handle('scripts:list', async () => {
     try {
@@ -120,6 +128,7 @@ export function registerScriptHandlers(
         configSchema: data.configSchema,
         isTemplate: false,
       });
+      auditScript('script.create', row, { compiled: compiled !== undefined });
       return {
         success: true,
         data: scriptRowToIpc(row),
@@ -169,6 +178,12 @@ export function registerScriptHandlers(
 
       const row = scriptRepo.update(id, { ...data, ...(compiled !== undefined ? { compiled } : {}) });
       if (!row) return { success: false, error: 'Script not found' };
+      auditScript('script.update', row, {
+        fields: Object.keys(data),
+        sourceChanged: row.revision !== existing.revision,
+        previousRevision: existing.revision,
+        previousTrust: existing.trust,
+      });
       return {
         success: true,
         data: scriptRowToIpc(row),
@@ -183,6 +198,7 @@ export function registerScriptHandlers(
     try {
       const deleted = scriptRepo.delete(id);
       if (!deleted) return { success: false, error: 'Script not found, is a template, or has bots using it' };
+      audit?.record('human', 'script.delete', id);
       return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
@@ -226,6 +242,7 @@ export function registerScriptHandlers(
         configSchema: original.config_schema,
         isTemplate: false,
       });
+      auditScript('script.create', forkedRow, { forkedFrom: original.id, forkedRevision: original.revision });
 
       return {
         success: true,
@@ -348,6 +365,7 @@ export function registerScriptHandlers(
             configSchema: parsed.configSchema || {},
             isTemplate: false,
           });
+          auditScript('script.create', row, { importedFrom: filePath });
 
           imported.push(scriptRowToIpc(row));
         } catch (fileErr: any) {

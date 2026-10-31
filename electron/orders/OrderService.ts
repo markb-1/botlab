@@ -34,6 +34,7 @@ import type { BinanceAdapter, PolymarketAdapter, PostOrderOutcome } from './Exch
 import type { DbRiskStateProvider } from './DbRiskStateProvider';
 import type { FeeCategory, FeeService } from './FeeService';
 import { mandateCategory, type MarketDataService, type MarketInfo, type MarketQualityProvider } from './MarketDataService';
+import type { AuditService } from '../audit/AuditService';
 import logger from '../../src/utils/logger';
 
 const MS_PER_MINUTE = 60_000;
@@ -165,6 +166,8 @@ export interface OrderServiceDeps {
   /** Polymarket order book for a token (public endpoint) */
   getBook: (tokenId: string) => Promise<ClobBook>;
   getBinanceBook: (symbol: string) => Promise<BinanceOrderBook>;
+  /** Risk rejections are recorded here (actor bot:<id>) */
+  audit?: AuditService;
   now?: () => number;
 }
 
@@ -625,6 +628,23 @@ export class OrderService {
       if (!decision.allowed) {
         logger.warning(
           `[OrderService] ${this.bot.botName}: ${order.side} ${order.tokenId} rejected (${decision.failedCheck}): ${decision.reason}`
+        );
+        this.deps.audit?.record(
+          `bot:${order.botId}`,
+          'order.rejected',
+          row.id,
+          {
+            exchange: order.exchange,
+            marketId: order.marketId,
+            tokenId: order.tokenId,
+            side: order.side,
+            orderType: order.orderType,
+            notionalUsd: dbNum(order.notionalUsd),
+            failedCheck: decision.failedCheck,
+            reason: decision.reason,
+            simulated: this.paper,
+          },
+          'rejected_risk'
         );
       }
       return row;

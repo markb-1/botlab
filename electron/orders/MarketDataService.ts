@@ -165,3 +165,31 @@ export class MarketDataService {
     }
   }
 }
+
+/**
+ * Mark price for daily P&L from top of book (spec §4.2: mid). Positions are long-only, so a book
+ * without asks is marked at the best bid and one without bids at half the best ask (bid taken as 0).
+ * null when the book is empty or unusable.
+ */
+export function bookMid(bids: Array<{ price: string }> | undefined, asks: Array<{ price: string }> | undefined): number | null {
+  const prices = (levels: Array<{ price: string }> | undefined) =>
+    (levels ?? []).map((l) => parseFloat(l.price)).filter((p) => Number.isFinite(p) && p > 0);
+  const b = prices(bids);
+  const a = prices(asks);
+  const bid = b.length > 0 ? Math.max(...b) : null;
+  const ask = a.length > 0 ? Math.min(...a) : null;
+  if (bid !== null && ask !== null) return bid <= ask ? (bid + ask) / 2 : null;
+  if (bid !== null) return bid;
+  if (ask !== null) return ask / 2;
+  return null;
+}
+
+/** Polymarket mid for a token from the public CLOB book endpoint; null when unavailable. */
+export async function fetchPolymarketMid(clobHttpUrl: string, tokenId: string, fetchFn: typeof fetch = globalThis.fetch): Promise<number | null> {
+  const resp = await fetchFn(`${clobHttpUrl.replace(/\/+$/, '')}/book?token_id=${encodeURIComponent(tokenId)}`, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!resp.ok) throw new Error(`CLOB book HTTP ${resp.status}`);
+  const book = (await resp.json()) as { bids?: Array<{ price: string }>; asks?: Array<{ price: string }> };
+  return bookMid(book.bids, book.asks);
+}

@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain } from 'electron';
 import path from 'path';
-import { initializeDatabase, closeDatabase } from './database/index';
+import { initializeDatabase, closeDatabase, getDataDir } from './database/index';
 import {
   BotRepository,
   WalletRepository,
@@ -11,6 +11,7 @@ import {
   BacktestRepository,
   OrderRepository,
   RiskStateRepository,
+  AuditRepository,
 } from './database/repositories/index';
 import type { Database } from './database/index';
 import { keyManager } from './security/keyManager';
@@ -23,7 +24,17 @@ import { registerSettingsHandlers } from './ipc/handlers/settingsHandlers';
 import { registerScriptHandlers } from './ipc/handlers/scriptHandlers';
 import { registerAiHandlers } from './ipc/handlers/aiHandlers';
 import { registerBacktestHandlers } from './ipc/handlers/backtestHandlers';
+import { registerRiskHandlers } from './ipc/handlers/riskHandlers';
 import { seedTemplates, getBuiltinTemplates } from './database/seed';
+import { AuditService } from './audit/AuditService';
+import { OrderCanceller } from './orders/OrderCanceller';
+import { fetchPolymarketMid, bookMid } from './orders/MarketDataService';
+import { HaltService, RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT, type BotControl } from './risk/HaltService';
+import { KillSwitch } from './risk/KillSwitch';
+import { RiskMonitor } from './risk/RiskMonitor';
+import { ShutdownMarker, applyStartupHalt, recoverOpenOrders } from './risk/StartupRecovery';
+import { loadLimits, resolveConfigDir } from './config';
+import { getBinanceOrderBook } from './sdk/binance';
 
 // Load environment variables
 import dotenv from 'dotenv';
@@ -43,6 +54,14 @@ let backtestRepo: BacktestRepository;
 let orderRepo: OrderRepository;
 let riskStateRepo: RiskStateRepository;
 let database: Database.Database;
+
+// Risk controls (created in Phase A so halts and the kill switch exist before unlock)
+let audit: AuditService;
+let halts: HaltService;
+let killSwitch: KillSwitch;
+let canceller: OrderCanceller;
+let riskMonitor: RiskMonitor | null = null;
+let shutdownMarker: ShutdownMarker | null = null;
 
 const isDev = !app.isPackaged;
 
@@ -104,6 +123,44 @@ async function initializePhaseA(): Promise<void> {
   orderRepo = new OrderRepository(db);
   riskStateRepo = new RiskStateRepository(db);
   database = db;
+  audit = new AuditService(new AuditRepository(db));
+
+  // Halts / kill switch. Before unlock there is no BotManager: no bot runs, and live orders
+  // cannot be cancelled (wallet keys locked) — such failures are reported, the halt still applies.
+  const botControl: BotControl = {
+    stopBot: async (id, actor) => {
+      if (botManager) await botManager.stopBot(id, actor);
+    },
+    runningBotIds: () => botManager?.runningBotIds() ?? [],
+  };
+  canceller = new OrderCanceller({
+    db,
+    orderRepo,
+    tradeRepo,
+    getRunningService: (id, simulated) => botManager?.getRunningOrderService(id, simulated) ?? null,
+    getPolymarketAdapter: async (id) => {
+      if (!botManager) throw new Error('app locked: wallet keys unavailable');
+      return botManager.getPolymarketAdapterForBot(id);
+    },
+  });
+  halts = new HaltService({ riskStateRepo, botRepo, audit, canceller, bots: botControl });
+  killSwitch = new KillSwitch(halts);
+  for (const evt of [RISK_HALT_EVENT, RISK_HALT_CLEARED_EVENT]) {
+    halts.on(evt, (payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(evt, payload);
+    });
+  }
+
+  // Unclean previous shutdown ⇒ global halt (spec §4.3). Unreadable config ⇒ treated as true.
+  let startHaltedAfterCrash: boolean | null = null;
+  try {
+    startHaltedAfterCrash = loadLimits(resolveConfigDir()).server.start_halted_after_crash;
+  } catch (err) {
+    console.error('[Main] Could not read limits config for startup:', err);
+    audit.record('system', 'config.load', resolveConfigDir(), { stage: 'startup', error: err instanceof Error ? err.message : String(err) }, 'error');
+  }
+  shutdownMarker = new ShutdownMarker(getDataDir());
+  applyStartupHalt({ marker: shutdownMarker, startHaltedAfterCrash, halts, audit });
 
   // 3. Seed script templates (compiles with esbuild)
   const templates = getBuiltinTemplates();
@@ -118,7 +175,7 @@ async function initializePhaseA(): Promise<void> {
   registerAuthHandlers(settingsRepo, initializeProtectedServices);
 
   // 5. Register script handlers (not dependent on encryption key)
-  registerScriptHandlers(scriptRepo);
+  registerScriptHandlers(scriptRepo, audit);
 
   // 6. Register settings handlers (read-only access doesn't need key)
   registerSettingsHandlers(settingsRepo);
@@ -129,7 +186,10 @@ async function initializePhaseA(): Promise<void> {
   // 8. Register backtest handlers (no encryption key needed)
   registerBacktestHandlers(db, scriptRepo, backtestRepo);
 
-  // 9. App info handlers
+  // 9. Risk handlers (halts, kill switch) — available before unlock
+  registerRiskHandlers(halts, killSwitch, botRepo);
+
+  // 10. App info handlers
   ipcMain.handle('app:version', () => app.getVersion());
   ipcMain.handle('app:path', () => app.getPath('userData'));
 
@@ -163,10 +223,41 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
     scriptRepo,
     storageRepo,
     tradeRepo,
-    { db: database, orderRepo, riskStateRepo }
+    { db: database, orderRepo, riskStateRepo, audit }
   );
   await botManager.initialize();
   console.log('[Main] BotManager initialized');
+
+  // 3. Startup recovery: sync and cancel orphaned open orders (no bot runs yet; starts are
+  //    refused until this finishes). Runs in the background so unlocking is not blocked.
+  const manager = botManager;
+  manager.setRecoveryInProgress(true);
+  recoverOpenOrders({ botRepo, canceller, audit, isBotRunning: (id) => manager.isRunning(id) })
+    .catch((err) => {
+      console.error('[Main] Startup order recovery failed:', err);
+      audit.record('system', 'startup.orphan_orders', null, { error: String(err) }, 'error');
+    })
+    .finally(() => manager.setRecoveryInProgress(false));
+
+  // Daily P&L, loss limits and ramp promotions every 60 s
+  riskMonitor = new RiskMonitor({
+    botRepo,
+    scriptRepo,
+    tradeRepo,
+    riskStateRepo,
+    audit,
+    halts,
+    killSwitch,
+    getLimits: () => manager.getLimits(),
+    getMark: async (exchange, symbol) => {
+      if (exchange === 'binance') {
+        const book = await getBinanceOrderBook(symbol, 5);
+        return bookMid(book.bids, book.asks);
+      }
+      return fetchPolymarketMid(settingsRepo.get().clob_http_url, symbol);
+    },
+  });
+  riskMonitor.start();
 
   // 4. Forward bot events to renderer
   botManager.on('bot:event', (event) => {
@@ -186,7 +277,7 @@ async function initializeProtectedServices(encryptionKey: string): Promise<void>
   });
 
   // 5. Register protected IPC handlers (bots + wallets need encryption key)
-  registerBotHandlers(botRepo, walletRepo, scriptRepo, tradeRepo, botManager, walletManager, storageRepo, settingsRepo);
+  registerBotHandlers(botRepo, walletRepo, scriptRepo, tradeRepo, botManager, walletManager, storageRepo, settingsRepo, audit);
   registerWalletHandlers(walletRepo, walletManager, settingsRepo);
 
   console.log('[Main] Phase B complete — all services ready');
@@ -219,22 +310,60 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', async () => {
+/**
+ * Graceful shutdown: stop the risk monitor, stop all bots, then write the clean-shutdown marker
+ * (spec §4.3). Electron does not await async listeners, so the quit is deferred until this
+ * finishes; if it takes too long the app exits without the marker (next start is "unclean").
+ */
+const SHUTDOWN_TIMEOUT_MS = 20_000;
+let shutdownStarted = false;
+let shutdownDone = false;
+let shutdownTimedOut = false;
+
+async function gracefulShutdown(): Promise<void> {
   console.log('[Main] Shutting down...');
-
-  // Gracefully stop all bots
-  if (botManager) {
-    try {
-      await botManager.shutdown();
-    } catch (error) {
-      console.error('[Main] Error during bot shutdown:', error);
-    }
+  if (riskMonitor) {
+    await riskMonitor.stop().catch((error) => console.error('[Main] Error stopping risk monitor:', error));
   }
+  if (botManager) {
+    await botManager.shutdown();
+  }
+  if (shutdownTimedOut) return;
+  try {
+    shutdownMarker?.markClean();
+    audit?.record('system', 'app.shutdown', null, undefined, 'clean');
+  } catch (error) {
+    console.error('[Main] Could not write clean-shutdown marker:', error);
+  }
+}
 
-  // Close database
-  closeDatabase();
-  console.log('[Main] Shutdown complete');
+app.on('before-quit', (event) => {
+  if (shutdownDone) return;
+  event.preventDefault();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+
+  const timeout = new Promise<void>((resolve) =>
+    setTimeout(() => {
+      console.error('[Main] Shutdown timed out; exiting without clean marker');
+      shutdownTimedOut = true;
+      resolve();
+    }, SHUTDOWN_TIMEOUT_MS)
+  );
+  Promise.race([gracefulShutdown(), timeout])
+    .catch((error) => console.error('[Main] Error during shutdown:', error))
+    .finally(() => {
+      closeDatabase();
+      console.log('[Main] Shutdown complete');
+      shutdownDone = true;
+      app.quit();
+    });
 });
+
+// Ctrl+C / service stop / Windows console close: quit gracefully (spec §15.2)
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK'] as const) {
+  process.on(signal, () => app.quit());
+}
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {

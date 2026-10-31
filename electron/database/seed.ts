@@ -98,7 +98,7 @@ export async function seedTemplates(
       if (sourceChanged || !existing.compiled) {
         const compiled = await compileSource(source);
         if (compiled) {
-          scriptRepo.update(existing.id, { source, compiled });
+          scriptRepo.update(existing.id, { source, compiled }, 'system');
           console.log(`[Seed] Updated template: ${name} v${version}${sourceChanged ? ' (source changed)' : ' (compiled)'}`);
         }
       }
@@ -117,6 +117,7 @@ export async function seedTemplates(
       compiled: compiled || undefined,
       configSchema: meta.configSchema || {},
       isTemplate: true,
+      origin: 'builtin', // seeded as trust=proven (spec §4.5)
     });
 
     seeded++;

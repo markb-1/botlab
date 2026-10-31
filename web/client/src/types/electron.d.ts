@@ -78,6 +78,14 @@ interface ElectronAPI {
     get: (runId: string) => Promise<IpcResponse>;
     delete: (runId: string) => Promise<IpcResponse>;
   };
+  /** Halts and kill switch (spec §4.2–4.3). `scope` is 'global' or a bot id. */
+  risk: {
+    getState: () => Promise<IpcResponse>;
+    clearHalt: (scope: string, reason: string) => Promise<IpcResponse>;
+    killSwitch: (reason: string) => Promise<IpcResponse>;
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onRiskHalt: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onBotEvent: (callback: (event: any) => void) => () => void;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -45,6 +45,8 @@ binance:
   enabled: true
   max_order_usd: 25
   allocation_usd: 100
+server:
+  start_halted_after_crash: true     # after an unclean shutdown, start with a global halt (clear it by hand)
 `;
 
 export const DEFAULT_MANDATE_YAML = `# BotLab agent mandate (spec §3.2). Human-owned: the agent can read but never write this file.

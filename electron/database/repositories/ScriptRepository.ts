@@ -1,5 +1,9 @@
 import type Database from 'better-sqlite3';
-import { generateId } from '../index';
+import { generateId, sourceHash } from '../index';
+
+export type ScriptOrigin = 'builtin' | 'human' | 'agent';
+export type ScriptTrust = 'new' | 'proven';
+export type ScriptKind = 'template' | 'custom';
 
 export interface ScriptRow {
   id: string;
@@ -11,8 +15,26 @@ export interface ScriptRow {
   compiled: string | null;
   config_schema: string; // JSON string
   is_template: number; // SQLite boolean (0/1)
+  // v3 ramp columns (spec §2.1)
+  kind: ScriptKind;
+  origin: ScriptOrigin;
+  /** Integer source version; +1 on every source change (the `version` column is legacy semver text) */
+  revision: number;
+  trust: ScriptTrust;
+  source_hash: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ScriptVersionRow {
+  id: string;
+  script_id: string;
+  version: number;
+  source: string;
+  compiled: string | null;
+  source_hash: string;
+  created_at: string;
+  created_by: string;
 }
 
 export class ScriptRepository {
@@ -53,6 +75,12 @@ export class ScriptRepository {
     compiled?: string;
     configSchema?: Record<string, unknown> | string;
     isTemplate?: boolean;
+    /** Default `human`. Builtin scripts are seeded as proven templates. */
+    origin?: ScriptOrigin;
+    /** Default: proven for builtin, new otherwise */
+    trust?: ScriptTrust;
+    /** Recorded on the script_versions row (default derived from origin) */
+    createdBy?: string;
   }): ScriptRow {
     const id = generateId();
     const now = new Date().toISOString();
@@ -60,27 +88,58 @@ export class ScriptRepository {
       typeof data.configSchema === 'string'
         ? data.configSchema
         : JSON.stringify(data.configSchema || {});
+    const origin: ScriptOrigin = data.origin ?? 'human';
+    const trust: ScriptTrust = data.trust ?? (origin === 'builtin' ? 'proven' : 'new');
+    const kind: ScriptKind = data.isTemplate ? 'template' : 'custom';
+    const hash = sourceHash(data.source);
 
-    this.db
-      .prepare(
-        `INSERT INTO scripts (id, name, description, version, author, source, compiled, config_schema, is_template, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        id,
-        data.name,
-        data.description || '',
-        data.version || '1.0.0',
-        data.author || '',
-        data.source,
-        data.compiled || null,
-        configSchema,
-        data.isTemplate ? 1 : 0,
-        now,
-        now
-      );
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO scripts (id, name, description, version, author, source, compiled, config_schema, is_template,
+             kind, origin, revision, trust, source_hash, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+        )
+        .run(
+          id,
+          data.name,
+          data.description || '',
+          data.version || '1.0.0',
+          data.author || '',
+          data.source,
+          data.compiled || null,
+          configSchema,
+          data.isTemplate ? 1 : 0,
+          kind,
+          origin,
+          trust,
+          hash,
+          now,
+          now
+        );
+      this.insertVersion(id, 1, data.source, data.compiled || null, hash, data.createdBy ?? defaultCreatedBy(origin), now);
+    })();
 
     return this.findById(id)!;
+  }
+
+  private insertVersion(scriptId: string, version: number, source: string, compiled: string | null, hash: string, createdBy: string, at: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO script_versions (id, script_id, version, source, compiled, source_hash, created_at, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(generateId(), scriptId, version, source, compiled, hash, at, createdBy);
+  }
+
+  findVersions(scriptId: string): ScriptVersionRow[] {
+    return this.db
+      .prepare('SELECT * FROM script_versions WHERE script_id = ? ORDER BY version DESC')
+      .all(scriptId) as ScriptVersionRow[];
+  }
+
+  setTrust(id: string, trust: ScriptTrust): void {
+    this.db.prepare("UPDATE scripts SET trust = ?, updated_at = datetime('now') WHERE id = ?").run(trust, id);
   }
 
   update(
@@ -93,10 +152,25 @@ export class ScriptRepository {
       source: string;
       compiled: string | null;
       configSchema: Record<string, unknown> | string;
-    }>
+    }>,
+    /** Who changed it (script_versions.created_by), default human */
+    createdBy = 'human'
   ): ScriptRow | undefined {
+    const existing = this.findById(id);
+    if (!existing) return undefined;
     const sets: string[] = [];
     const values: unknown[] = [];
+
+    // A source change is a new version: bump revision, store the version row, and (except for
+    // builtin templates) the changed code must earn trust again.
+    const newHash = data.source !== undefined ? sourceHash(data.source) : null;
+    const sourceChanged = newHash !== null && newHash !== existing.source_hash;
+    const revision = sourceChanged ? existing.revision + 1 : existing.revision;
+    if (sourceChanged) {
+      sets.push('revision = ?', 'source_hash = ?');
+      values.push(revision, newHash);
+      if (existing.origin !== 'builtin') { sets.push("trust = 'new'"); }
+    }
 
     if (data.name !== undefined) { sets.push('name = ?'); values.push(data.name); }
     if (data.description !== undefined) { sets.push('description = ?'); values.push(data.description); }
@@ -118,7 +192,13 @@ export class ScriptRepository {
     sets.push("updated_at = datetime('now')");
     values.push(id);
 
-    this.db.prepare(`UPDATE scripts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+    this.db.transaction(() => {
+      this.db.prepare(`UPDATE scripts SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+      if (sourceChanged) {
+        const compiled = data.compiled !== undefined ? data.compiled : null;
+        this.insertVersion(id, revision, data.source!, compiled, newHash!, createdBy, new Date().toISOString());
+      }
+    })();
 
     return this.findById(id);
   }
@@ -137,4 +217,8 @@ export class ScriptRepository {
     const result = this.db.prepare('DELETE FROM scripts WHERE id = ? AND is_template = 0').run(id);
     return result.changes > 0;
   }
+}
+
+function defaultCreatedBy(origin: ScriptOrigin): string {
+  return origin === 'builtin' ? 'system' : origin;
 }

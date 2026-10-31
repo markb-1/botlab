@@ -28,6 +28,10 @@ import { MarketDataService, PlaceholderMarketQualityProvider } from '../../elect
 import { DbRiskStateProvider } from '../../electron/orders/DbRiskStateProvider';
 import { OrderService, type ClobBook } from '../../electron/orders/OrderService';
 import { createBinanceAdapter, createPolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import type { PolymarketAdapter } from '../../electron/orders/ExchangeAdapter';
+import type { AuditActor, AuditService } from '../../electron/audit/AuditService';
+import { GLOBAL_SCOPE } from '../../electron/database/repositories/RiskStateRepository';
+import type { LimitsConfig } from '../../electron/config';
 import { getBalance } from '../../electron/sdk/trading';
 import { getBinanceBalance, getBinanceOrderBook } from '../../electron/sdk/binance';
 import CryptoJS from 'crypto-js';
@@ -39,6 +43,7 @@ export interface BotManagerOrderDeps {
   db: Database.Database;
   orderRepo: OrderRepository;
   riskStateRepo: RiskStateRepository;
+  audit?: AuditService;
 }
 
 /**
@@ -61,6 +66,10 @@ export class BotManager extends EventEmitter {
   private fees: FeeService | null = null;
   private configError: string | null = 'not loaded';
   private marketData = new MarketDataService();
+  /** Running bots' OrderServices (used to cancel their orders on a halt) */
+  private orderServices: Map<string, { service: OrderService; simulated: boolean }> = new Map();
+  /** Startup orphan-order recovery running: bots may not start until it finishes */
+  private recoveryInProgress = false;
 
   constructor(
     walletManager: WalletManager,
@@ -95,11 +104,13 @@ export class BotManager extends EventEmitter {
       this.fees = new FeeService(loadFees(dir));
       this.configError = null;
       logger.info(`Risk config loaded from ${dir}`);
+      this.orderDeps?.audit?.record('system', 'config.load', dir, { files: ['limits.yaml', 'mandate.yaml', 'fees.yaml'] }, 'ok');
     } catch (err) {
       this.riskEngine = null;
       this.fees = null;
       this.configError = err instanceof Error ? err.message : String(err);
       logger.error(`Risk config failed to load; bots cannot be started: ${this.configError}`);
+      this.orderDeps?.audit?.record('system', 'config.load', resolveConfigDir(), { error: this.configError }, 'error');
     }
     this.warnUnlinkedPositions();
     logger.info('BotManager initialized');
@@ -148,6 +159,7 @@ export class BotManager extends EventEmitter {
 
     const provider = new DbRiskStateProvider({
       botRepo: this.botRepo,
+      getScriptTrust: (scriptId) => this.scriptRepo.findById(scriptId)?.trust ?? null,
       orderRepo,
       tradeRepo: this.tradeRepo,
       riskStateRepo,
@@ -172,11 +184,12 @@ export class BotManager extends EventEmitter {
         : undefined,
     });
 
-    return new OrderService(
+    const service = new OrderService(
       {
         db,
         orderRepo,
         tradeRepo: this.tradeRepo,
+        audit: this.orderDeps.audit,
         riskEngine: this.riskEngine,
         provider,
         fees: this.fees,
@@ -195,7 +208,59 @@ export class BotManager extends EventEmitter {
         paperState: ps ?? null,
       }
     );
+    this.orderServices.set(args.botId, { service, simulated: paper });
+    return service;
   };
+
+  /** Limits currently in force; null when the config failed to load. */
+  getLimits(): LimitsConfig | null {
+    return this.riskEngine?.getConfig().limits ?? null;
+  }
+
+  setRecoveryInProgress(inProgress: boolean): void {
+    this.recoveryInProgress = inProgress;
+  }
+
+  isRunning(botId: string): boolean {
+    return this.instances.has(botId);
+  }
+
+  runningBotIds(): string[] {
+    return [...this.instances.keys()];
+  }
+
+  /** The running bot's OrderService if it trades in this mode. */
+  getRunningOrderService(botId: string, simulated: boolean): OrderService | null {
+    const entry = this.instances.has(botId) ? this.orderServices.get(botId) : undefined;
+    return entry && entry.simulated === simulated ? entry.service : null;
+  }
+
+  /** Authenticated Polymarket adapter for a bot's wallet (to cancel orders of a bot that is not running). */
+  async getPolymarketAdapterForBot(botId: string): Promise<PolymarketAdapter | null> {
+    const row = this.botRepo.findById(botId);
+    if (!row) return null;
+    const creds = await this.walletManager.getWallet(row.wallet_id);
+    return createPolymarketAdapter(await this.getClobClient(creds, false));
+  }
+
+  /** CLOB client per wallet; paper clients are unauthenticated and cached separately. */
+  private async getClobClient(
+    creds: { address: string; privateKey: string; proxyAddress?: string },
+    paper: boolean
+  ): Promise<ClobClient> {
+    const cacheKey = `${paper ? 'paper' : 'live'}:${creds.proxyAddress || creds.address}`;
+    let clobClient = this.clobClients.get(cacheKey);
+    if (clobClient) return clobClient;
+    if (paper) {
+      // Read-only endpoints (orderbook, prices) work without auth; trades are simulated.
+      const settings = this.getSettings();
+      clobClient = new ClobClient(settings.clobHttpUrl, 137, new ethers.Wallet(creds.privateKey));
+    } else {
+      clobClient = await this.createClobClientForWallet(creds.address, creds.privateKey, creds.proxyAddress);
+    }
+    this.clobClients.set(cacheKey, clobClient);
+    return clobClient;
+  }
 
   /**
    * Get current settings from database
@@ -340,9 +405,20 @@ export class BotManager extends EventEmitter {
   }
 
   /**
-   * Start a specific bot by ID
+   * Start a specific bot by ID. Refused while halted (bot or global), during startup recovery,
+   * or for a retired bot. A bot at stage `paper` runs in paper mode whatever its `mode` (§4.5).
    */
-  async startBot(botId: string): Promise<void> {
+  async startBot(botId: string, actor: AuditActor = 'system'): Promise<void> {
+    try {
+      await this.startBotUnaudited(botId);
+      this.orderDeps?.audit?.record(actor, 'bot.start', botId, undefined, 'ok');
+    } catch (err) {
+      this.orderDeps?.audit?.record(actor, 'bot.start', botId, undefined, `error: ${err instanceof Error ? err.message : err}`);
+      throw err;
+    }
+  }
+
+  private async startBotUnaudited(botId: string): Promise<void> {
     const botRow = this.botRepo.findById(botId);
     if (!botRow) {
       throw new Error(`Bot not found: ${botId}`);
@@ -353,6 +429,23 @@ export class BotManager extends EventEmitter {
     if (!bot.enabled) {
       throw new Error(`Bot ${botId} is disabled`);
     }
+    if (botRow.stage === 'retired') {
+      throw new Error(`Bot ${botId} is retired`);
+    }
+    if (this.recoveryInProgress) {
+      throw new Error('Startup recovery (orphan order cleanup) is still running; try again shortly');
+    }
+    const riskState = this.orderDeps?.riskStateRepo;
+    if (riskState) {
+      const global = riskState.get(GLOBAL_SCOPE);
+      if (global?.halted === 1) {
+        throw new Error(`Global halt active (${global.halted_reason ?? 'no reason'}); a human must clear it first`);
+      }
+      const own = riskState.get(botId);
+      if (own?.halted === 1) {
+        throw new Error(`Bot is halted (${own.halted_reason ?? 'no reason'}); a human must clear the halt first`);
+      }
+    }
 
     // Check if already running
     const existingInstance = this.instances.get(botId);
@@ -361,30 +454,15 @@ export class BotManager extends EventEmitter {
       return;
     }
 
-    // Get wallet credentials
-    const walletCredentials = await this.walletManager.getWallet(bot.walletId);
-
-    // Create or get CLOB client for this wallet
-    const cacheKey = walletCredentials.proxyAddress || walletCredentials.address;
-    let clobClient = this.clobClients.get(cacheKey);
-    if (!clobClient) {
-      if (bot.mode === 'paper') {
-        // Paper mode: create unauthenticated CLOB client (no API key needed).
-        // Read-only endpoints (orderbook, prices) work without auth.
-        // Trades are simulated by PaperTradingState, not sent to the API.
-        const settings = this.getSettings();
-        const wallet = new ethers.Wallet(walletCredentials.privateKey);
-        clobClient = new ClobClient(settings.clobHttpUrl, 137, wallet);
-        logger.info(`Paper mode: created unauthenticated CLOB client for bot ${botId}`);
-      } else {
-        clobClient = await this.createClobClientForWallet(
-          walletCredentials.address,
-          walletCredentials.privateKey,
-          walletCredentials.proxyAddress
-        );
-      }
-      this.clobClients.set(cacheKey, clobClient);
+    // Paper stage ⇒ paper trading regardless of the bot's mode
+    const mode: 'live' | 'paper' = botRow.stage === 'paper' || bot.mode === 'paper' ? 'paper' : 'live';
+    if (mode === 'paper' && bot.mode !== 'paper') {
+      logger.info(`Bot ${bot.name} is at stage paper: running in paper mode`);
     }
+
+    // Get wallet credentials and the CLOB client for this wallet
+    const walletCredentials = await this.walletManager.getWallet(bot.walletId);
+    const clobClient = await this.getClobClient(walletCredentials, mode === 'paper');
 
     // Look up the script
     const script = this.scriptRepo.findById(bot.scriptId);
@@ -397,7 +475,7 @@ export class BotManager extends EventEmitter {
     }
 
     const settings = this.getSettings();
-    const instance: BaseBotRunner = new ScriptBotRunner(bot, this.walletManager, clobClient, {
+    const instance: BaseBotRunner = new ScriptBotRunner({ ...bot, mode }, this.walletManager, clobClient, {
       compiledCode: script.compiled,
       scriptName: script.name,
       storageRepo: this.storageRepo,
@@ -405,7 +483,7 @@ export class BotManager extends EventEmitter {
       rpcUrl: settings.rpcUrl,
       usdcContractAddress: settings.usdcContractAddress,
       clobHttpUrl: settings.clobHttpUrl,
-      mode: bot.mode || 'live',
+      mode,
       binanceApiKey: settings.binanceApiKey,
       binanceApiSecret: settings.binanceApiSecret,
       createOrderService: this.createOrderService,
@@ -413,6 +491,14 @@ export class BotManager extends EventEmitter {
 
     // Forward events
     instance.on('bot:event', (event: BotEvent) => {
+      // Runtime errors block paper → probation promotion (§4.5)
+      if (event.type === 'error') {
+        try {
+          this.botRepo.recordRuntimeError(botId);
+        } catch {
+          /* best effort */
+        }
+      }
       this.emit('bot:event', event);
     });
 
@@ -425,7 +511,13 @@ export class BotManager extends EventEmitter {
     this.instances.set(botId, instance);
 
     // Start the bot
-    await instance.start();
+    try {
+      await instance.start();
+    } catch (err) {
+      this.instances.delete(botId);
+      this.orderServices.delete(botId);
+      throw err;
+    }
 
     // Update database
     this.botRepo.update(botId, {
@@ -434,13 +526,13 @@ export class BotManager extends EventEmitter {
       errorLogs: [],
     });
 
-    logger.info(`Bot ${bot.name} (${botId}) started`);
+    logger.info(`Bot ${bot.name} (${botId}) started (${mode})`);
   }
 
   /**
    * Stop a specific bot by ID
    */
-  async stopBot(botId: string): Promise<void> {
+  async stopBot(botId: string, actor: AuditActor = 'system'): Promise<void> {
     const instance = this.instances.get(botId);
     if (!instance) {
       // Check if bot exists and update its status
@@ -450,20 +542,25 @@ export class BotManager extends EventEmitter {
           status: 'stopped',
           lastStoppedAt: new Date().toISOString(),
         });
+        this.orderDeps?.audit?.record(actor, 'bot.stop', botId, { wasRunning: false }, 'ok');
       }
       return;
     }
 
-    await instance.stop();
+    try {
+      await instance.stop();
+    } finally {
+      // Update database
+      this.botRepo.update(botId, {
+        status: 'stopped',
+        lastStoppedAt: new Date().toISOString(),
+      });
 
-    // Update database
-    this.botRepo.update(botId, {
-      status: 'stopped',
-      lastStoppedAt: new Date().toISOString(),
-    });
-
-    // Remove instance
-    this.instances.delete(botId);
+      // Remove instance
+      this.instances.delete(botId);
+      this.orderServices.delete(botId);
+    }
+    this.orderDeps?.audit?.record(actor, 'bot.stop', botId, { wasRunning: true }, 'ok');
 
     logger.info(`Bot ${botId} stopped`);
   }
@@ -471,9 +568,9 @@ export class BotManager extends EventEmitter {
   /**
    * Restart a specific bot
    */
-  async restartBot(botId: string): Promise<void> {
-    await this.stopBot(botId);
-    await this.startBot(botId);
+  async restartBot(botId: string, actor: AuditActor = 'system'): Promise<void> {
+    await this.stopBot(botId, actor);
+    await this.startBot(botId, actor);
   }
 
   /**

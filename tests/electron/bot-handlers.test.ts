@@ -229,7 +229,7 @@ describe('botHandlers', () => {
     it('should delegate to botManager.startBot', async () => {
       const result = await invoke('bots:start', 'bot-1');
       expect(result.success).toBe(true);
-      expect(mockBotManager.startBot).toHaveBeenCalledWith('bot-1');
+      expect(mockBotManager.startBot).toHaveBeenCalledWith('bot-1', 'human');
     });
 
     it('should return error on failure', async () => {
@@ -244,7 +244,7 @@ describe('botHandlers', () => {
     it('should delegate to botManager.stopBot', async () => {
       const result = await invoke('bots:stop', 'bot-1');
       expect(result.success).toBe(true);
-      expect(mockBotManager.stopBot).toHaveBeenCalledWith('bot-1');
+      expect(mockBotManager.stopBot).toHaveBeenCalledWith('bot-1', 'human');
     });
   });
 
@@ -252,7 +252,7 @@ describe('botHandlers', () => {
     it('should delegate to botManager.restartBot', async () => {
       const result = await invoke('bots:restart', 'bot-1');
       expect(result.success).toBe(true);
-      expect(mockBotManager.restartBot).toHaveBeenCalledWith('bot-1');
+      expect(mockBotManager.restartBot).toHaveBeenCalledWith('bot-1', 'human');
     });
   });
 

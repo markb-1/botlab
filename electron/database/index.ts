@@ -1,9 +1,11 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 
 let db: Database.Database | null = null;
+let dbFilePath: string | null = null;
 
 /**
  * Get the database file path.
@@ -24,6 +26,36 @@ function getDbPath(): string {
     }
     return path.join(dataDir, 'botlab.db');
   }
+}
+
+/** Directory holding the database (and the shutdown marker). */
+export function getDataDir(): string {
+  return path.dirname(dbFilePath && dbFilePath !== ':memory:' ? dbFilePath : getDbPath());
+}
+
+/** SHA-256 of a script's source (scripts.source_hash). */
+export function sourceHash(source: string): string {
+  return crypto.createHash('sha256').update(source, 'utf8').digest('hex');
+}
+
+/** Give pre-1c scripts a source hash and a version-1 row in script_versions. */
+function backfillScriptVersions(database: Database.Database): void {
+  const rows = database
+    .prepare('SELECT id, source, compiled, revision, origin, created_at FROM scripts WHERE source_hash IS NULL')
+    .all() as Array<{ id: string; source: string; compiled: string | null; revision: number; origin: string; created_at: string }>;
+  if (rows.length === 0) return;
+  const setHash = database.prepare('UPDATE scripts SET source_hash = ? WHERE id = ?');
+  const addVersion = database.prepare(
+    `INSERT OR IGNORE INTO script_versions (id, script_id, version, source, compiled, source_hash, created_at, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  database.transaction(() => {
+    for (const r of rows) {
+      const hash = sourceHash(r.source);
+      setHash.run(hash, r.id);
+      addVersion.run(uuidv4(), r.id, r.revision, r.source, r.compiled, hash, r.created_at, r.origin === 'builtin' ? 'system' : 'human');
+    }
+  })();
 }
 
 /**
@@ -146,6 +178,7 @@ export function initializeDatabase(dbPath?: string): Database.Database {
   if (db) return db;
 
   const resolvedPath = dbPath || getDbPath();
+  dbFilePath = resolvedPath;
   console.log(`[Database] Initializing SQLite at: ${resolvedPath}`);
 
   db = new Database(resolvedPath);
@@ -280,10 +313,61 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     'ALTER TABLE bot_trades ADD COLUMN fee_usd REAL',
     'ALTER TABLE bot_trades ADD COLUMN category TEXT',
     'CREATE INDEX IF NOT EXISTS idx_trades_order ON bot_trades(order_id)',
+    // Chunk 1c: append-only audit log (spec §2.2). Triggers make UPDATE/DELETE fail for any caller.
+    `CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      payload TEXT,
+      result TEXT
+    )`,
+    'CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)',
+    'CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target, ts)',
+    `CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+     BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END`,
+    `CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+     BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END`,
+    // Chunk 1c: daily P&L state. Marks are JSON maps "exchange:symbol" → price (global row only).
+    'ALTER TABLE risk_state ADD COLUMN day_start TEXT',
+    'ALTER TABLE risk_state ADD COLUMN day_start_marks TEXT',
+    'ALTER TABLE risk_state ADD COLUMN last_marks TEXT',
+    'ALTER TABLE risk_state ADD COLUMN last_halted_at TEXT',
+    // Probation drawdown tracking (per bot): peak cumulative live P&L and worst drop from it since ramp_since
+    'ALTER TABLE risk_state ADD COLUMN ramp_since TEXT',
+    'ALTER TABLE risk_state ADD COLUMN ramp_pnl_peak REAL',
+    'ALTER TABLE risk_state ADD COLUMN ramp_max_drawdown_usd REAL',
+    // Chunk 1c: ramp (spec §2.1, §4.5). scripts.version is the legacy semver text, so the
+    // integer source version is `revision`.
+    "ALTER TABLE scripts ADD COLUMN kind TEXT NOT NULL DEFAULT 'custom' CHECK(kind IN ('template','custom'))",
+    "ALTER TABLE scripts ADD COLUMN origin TEXT NOT NULL DEFAULT 'human' CHECK(origin IN ('builtin','human','agent'))",
+    'ALTER TABLE scripts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1',
+    "ALTER TABLE scripts ADD COLUMN trust TEXT NOT NULL DEFAULT 'new' CHECK(trust IN ('new','proven'))",
+    'ALTER TABLE scripts ADD COLUMN source_hash TEXT',
+    `CREATE TABLE IF NOT EXISTS script_versions (
+      id TEXT PRIMARY KEY,
+      script_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      compiled TEXT,
+      source_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      UNIQUE(script_id, version)
+    )`,
+    'ALTER TABLE bots ADD COLUMN template_version INTEGER',
+    'ALTER TABLE bots ADD COLUMN stage_changed_at TEXT',
+    'ALTER TABLE bots ADD COLUMN last_error_at TEXT',
+    'ALTER TABLE bots ADD COLUMN reached_full_at TEXT',
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
   }
+
+  // Built-in templates (pre-1c rows) are proven builtin templates; idempotent.
+  db.exec("UPDATE scripts SET kind = 'template', origin = 'builtin', trust = 'proven' WHERE is_template = 1 AND origin <> 'builtin'");
+  backfillScriptVersions(db);
 
   console.log('[Database] Schema initialized successfully');
 

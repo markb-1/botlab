@@ -52,6 +52,18 @@ export interface RiskPositionRow {
   cost_basis: number;
 }
 
+export interface PnlFillRow {
+  bot_id: string;
+  exchange: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  quantity: number | null;
+  quote_amount: number | null;
+  fee_usd: number | null;
+  executed_at: string;
+  simulated: number;
+}
+
 export class BotTradeRepository {
   private db: Database.Database;
 
@@ -232,6 +244,16 @@ export class BotTradeRepository {
       )
       WHERE net_quantity > 1e-9
     `).all(...values) as RiskPositionRow[];
+  }
+
+  /** All OrderService fills (live and paper) for daily P&L and the ramp; oldest first. */
+  findPnlFills(): PnlFillRow[] {
+    return this.db.prepare(`
+      SELECT bot_id, exchange, symbol, side, quantity, quote_amount, fee_usd, executed_at, COALESCE(simulated, 0) AS simulated
+      FROM bot_trades
+      WHERE order_id IS NOT NULL AND exchange IS NOT NULL AND symbol IS NOT NULL AND side IN ('BUY', 'SELL')
+      ORDER BY executed_at, created_at
+    `).all() as PnlFillRow[];
   }
 
   /**

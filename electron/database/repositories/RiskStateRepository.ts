@@ -12,6 +12,18 @@ export interface RiskStateRow {
   day_unrealized_pnl: number;
   orders_last_hour: number;
   updated_at: string; // ISO
+  /** Global row: ISO start (00:00 UTC) of the day the marks below belong to */
+  day_start: string | null;
+  /** Global row: JSON { "exchange:symbol": mid } captured at the first monitor run of the day */
+  day_start_marks: string | null;
+  /** Global row: JSON { "exchange:symbol": { price, at } } last mid seen per symbol */
+  last_marks: string | null;
+  /** Last time a halt was set (kept when the halt is cleared; used by the ramp) */
+  last_halted_at: string | null;
+  /** Bot rows: probation drawdown tracking since this stage change (bots.stage_changed_at) */
+  ramp_since: string | null;
+  ramp_pnl_peak: number | null;
+  ramp_max_drawdown_usd: number | null;
 }
 
 /**
@@ -37,20 +49,53 @@ export class RiskStateRepository {
     return this.get(scope)?.halted === 1;
   }
 
-  /** Set or clear a halt. Clearing is a human-only action (enforced by callers). */
+  all(): RiskStateRow[] {
+    return this.db.prepare('SELECT * FROM risk_state').all() as RiskStateRow[];
+  }
+
+  /**
+   * Set or clear a halt. Clearing is a human-only action (enforced by HaltService).
+   * Setting a halt on an already halted scope keeps the original reason and time.
+   */
   setHalted(scope: string, halted: boolean, reason: string | null = null): void {
     const now = new Date().toISOString();
+    if (halted && this.isHalted(scope)) return;
     this.db
       .prepare(
-        `INSERT INTO risk_state (scope, halted, halted_reason, halted_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO risk_state (scope, halted, halted_reason, halted_at, last_halted_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(scope) DO UPDATE SET
            halted = excluded.halted,
            halted_reason = excluded.halted_reason,
            halted_at = excluded.halted_at,
+           last_halted_at = COALESCE(excluded.last_halted_at, risk_state.last_halted_at),
            updated_at = excluded.updated_at`
       )
-      .run(scope, halted ? 1 : 0, halted ? reason : null, halted ? now : null, now);
+      .run(scope, halted ? 1 : 0, halted ? reason : null, halted ? now : null, halted ? now : null, now);
+  }
+
+  /** Global row: mark maps for the daily P&L (see RiskMonitor). */
+  setMarks(data: Partial<{ dayStart: string; dayStartMarks: Record<string, number>; lastMarks: Record<string, { price: number; at: string }> }>): void {
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope, updated_at) VALUES (?, ?)').run(GLOBAL_SCOPE, now);
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    if (data.dayStart !== undefined) { sets.push('day_start = ?'); values.push(data.dayStart); }
+    if (data.dayStartMarks !== undefined) { sets.push('day_start_marks = ?'); values.push(JSON.stringify(data.dayStartMarks)); }
+    if (data.lastMarks !== undefined) { sets.push('last_marks = ?'); values.push(JSON.stringify(data.lastMarks)); }
+    if (sets.length === 0) return;
+    sets.push('updated_at = ?');
+    values.push(now, GLOBAL_SCOPE);
+    this.db.prepare(`UPDATE risk_state SET ${sets.join(', ')} WHERE scope = ?`).run(...values);
+  }
+
+  /** Bot rows: probation drawdown tracking. */
+  setRampTracking(scope: string, data: { since: string | null; peak: number | null; maxDrawdownUsd: number | null }): void {
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT OR IGNORE INTO risk_state (scope, updated_at) VALUES (?, ?)').run(scope, now);
+    this.db
+      .prepare('UPDATE risk_state SET ramp_since = ?, ramp_pnl_peak = ?, ramp_max_drawdown_usd = ?, updated_at = ? WHERE scope = ?')
+      .run(data.since, data.peak, data.maxDrawdownUsd, now, scope);
   }
 
   updateDaily(
