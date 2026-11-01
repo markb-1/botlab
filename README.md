@@ -7,6 +7,71 @@ it from a browser.
 
 Runs natively on **macOS, Windows and Linux** (Node 22), or in **Docker** on a home server.
 
+![BotLab: paper bots running on live Binance and Polymarket data](docs/screenshots/bots.png)
+
+---
+
+## A quick tour
+
+Screenshots from a fresh install with the default config plus one custom script: paper bots only, real
+market data, no exchange credentials.
+
+### Bots run your scripts, every order goes through the risk engine
+
+A bot is a script plus a config, running in its own worker thread. Here the **ETH Mean Reversion** bot (a
+custom script, shown further down) buys a dip under a short EMA on live Binance prices. The **Logs** tab is the
+script's own `ctx.log` output:
+
+![Bot logs: a paper buy, then take-profit sells refused by the risk engine](docs/screenshots/bot-logs.png)
+
+**Orders** lists every order the bot attempted, including the ones the risk engine refused. Paper orders go
+through the same checks as live ones, so the take-profit sells come back `rejected_risk`: the position is
+younger than the 30-minute minimum hold (`limits.yaml` `per_bot_defaults.min_hold_minutes`). The script
+backs off and tries again five minutes later.
+
+![Bot orders: one filled buy, four sells rejected on hold_time](docs/screenshots/bot-orders.png)
+
+### Write scripts in the browser, start from templates
+
+Scripts are TypeScript with typings for the whole `ctx` API. `meta.configSchema` becomes the bot's config
+form, and **Backtest** replays Binance klines or recorded Polymarket order books. Or start from a built-in template: the Polymarket
+forecast executor and position manager, per-opportunity strategies, copy trading, Binance spot.
+
+| Script editor | New bot from a template |
+|---|---|
+| ![Script editor](docs/screenshots/script-editor.png) | ![Create bot from a template](docs/screenshots/create-bot.png) |
+
+### Markets, forecasts and the ledger
+
+Search live Polymarket markets with their category (from `categories.yaml`), fee rate and ambiguity score.
+Forecasts go into the **ledger** (from you or the AI agent) and are scored as their markets resolve. A
+category's forecasts become tradeable once it has earned trading rights (or you grant them by hand); the
+Forecast Executor bot then rests post-only bids on the ones with enough edge after fees.
+
+| Live Polymarket search | Forecast ledger |
+|---|---|
+| ![Markets](docs/screenshots/markets.png) | ![Ledger](docs/screenshots/ledger.png) |
+
+### Human-owned limits, an AI agent that can't touch them
+
+Limits, mandate, categories and fees are YAML files with a validated form editor (risk raises are flagged,
+every change is kept with a diff and restore). The optional Claude agent works only through MCP: paper bots,
+forecasts and notes, on a schedule and a monthly budget. It can never change limits, wallets or credentials.
+
+| Risk limits | Agent |
+|---|---|
+| ![Risk limits editor](docs/screenshots/risk.png) | ![Agent schedule and budget](docs/screenshots/agent.png) |
+
+### Dashboard, and your phone
+
+The dashboard has the kill switch, live exposure, daily P&L, reconciliation and every bot at a glance.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+The UI works at phone width too, for checking on bots over Tailscale:
+
+<p align="center"><img src="docs/screenshots/mobile.png" alt="A bot's orders on a phone" width="300"></p>
+
 ---
 
 ## Quick start
