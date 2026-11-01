@@ -144,6 +144,16 @@ describe.skipIf(!sqliteAvailable)('LedgerService', () => {
       await expect(h.ledger.submitForecast(valid('m1-yes'), 'human')).rejects.toThrow(/Mandate unavailable/);
     });
 
+    it('mandate min_forecast_volume_usd lowers the 24h-volume floor for forecasts only', async () => {
+      market('thin', { volume24hr: 1500 });
+      await expect(h.ledger.submitForecast(valid('thin-yes'), 'human')).rejects.toThrow(/liquidity 1500 \(24h volume\) < 5000/);
+      h.mandate.value = MandateSchema.parse({ markets: { min_forecast_volume_usd: 1000 } });
+      const f = await h.ledger.submitForecast(valid('thin-yes'), 'human');
+      expect(f.status).toBe('active');
+      market('thinner', { volume24hr: 999 });
+      await expect(h.ledger.submitForecast(valid('thinner-yes'), 'human')).rejects.toThrow(/999 \(24h volume\) < 1000 \(min_forecast_volume_usd\)/);
+    });
+
     it('a human assessment wins over forecasts; forecasts can only raise a forecast-sourced score', async () => {
       market('m2');
       await h.ledger.submitForecast(valid('m1-yes', { ambiguityScore: 1 }), 'human');

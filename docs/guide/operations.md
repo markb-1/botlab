@@ -63,6 +63,12 @@ markets.min_liquidity_usd` (default 5000; the larger applies) are compared with 
 within 90 days) cleared $5,000 of 24 h volume, so most forecasts and bids in those categories were refused. If you
 want BotLab to trade more of them, consider lowering `min_liquidity_usd` (your call; the agent cannot change it).
 
+**A lower floor for forecasts only.** To build the forecast track record in thin categories without loosening live
+orders, set `markets.min_forecast_volume_usd` in `mandate.yaml` (Risk → Mandate; at most `min_liquidity_usd`,
+e.g. 1000). Forecasts then need only that much 24 h volume; every order still needs `min_liquidity_usd`. Markets
+between the two are forecast-only: they are scored and count toward category rights, but the Forecast Executor
+does not bid on them. Leave it unset to keep one floor for both.
+
 ## Access, API and tokens
 
 - **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days

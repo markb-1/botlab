@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { MarketService, SEARCH_CACHE_MS } from '../../packages/core/src/services/MarketService';
 import { GammaHttpError, type MarketCacheService } from '../../packages/core/src/ledger/MarketCacheService';
 import { ServiceError } from '../../packages/core/src/services/errors';
+import { LimitsSchema, MandateSchema } from '../../packages/core/src/config';
 
 function setup() {
   const clock = { now: 1_000_000 };
@@ -75,5 +76,40 @@ describe('MarketService.searchLive: category fan-out (Mac test F6 review)', () =
     expect(svc.searchCost({ q: 'cpi', category: 'economics' })).toBe(1);
     expect(svc.searchCost({ category: 'economics' })).toBe(6);
     expect(svc.searchCost({})).toBe(1);
+  });
+});
+
+describe('MarketService.searchForAgent: 24h volume flags (R209)', () => {
+  const NOW = Date.parse('2026-06-01T00:00:00Z');
+  const hit = (marketId: string, volume24hUsd: number) => ({
+    marketId,
+    category: 'economics',
+    endDate: new Date(NOW + 10 * 86_400_000).toISOString(),
+    outcomePrices: ['0.5', '0.5'],
+    volume24hUsd,
+    ambiguityScore: null,
+  });
+  function search(mandate: Record<string, unknown>) {
+    const searchGamma = vi.fn(async () => [hit('thick', 6000), hit('mid', 2000), hit('thin', 500)]);
+    const svc = new MarketService({ searchGamma } as unknown as MarketCacheService, () => NOW, {
+      getMandate: () => MandateSchema.parse({ categories: { allow: ['economics'] }, ...mandate }),
+      getLimits: () => LimitsSchema.parse({}),
+    });
+    return svc.searchForAgent({ q: 'cpi' });
+  }
+
+  it('without min_forecast_volume_usd every market under the trading floor is flagged as before', async () => {
+    const flags = Object.fromEntries((await search({})).map((h) => [h.marketId, h.flags]));
+    expect(flags.thick).toEqual([]);
+    expect(flags.mid).toEqual(['24h volume 2000 < 5000']);
+    expect(flags.thin).toEqual(['24h volume 500 < 5000']);
+  });
+
+  it('between the floors: forecast only; below the forecast floor: no forecast either', async () => {
+    const hits = await search({ markets: { min_forecast_volume_usd: 1000 } });
+    const flags = Object.fromEntries(hits.map((h) => [h.marketId, h.flags]));
+    expect(flags.thick).toEqual([]);
+    expect(flags.mid).toEqual(['24h volume 2000 < 5000: forecast only (orders need min_liquidity_usd)']);
+    expect(flags.thin).toEqual(['24h volume 500 < 1000 (min_forecast_volume_usd): no forecast either']);
   });
 });

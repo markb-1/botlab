@@ -541,7 +541,7 @@ function SubmitForecast() {
     <Card title="Submit a forecast (human)">
       <form onSubmit={submit} className="space-y-3 max-w-2xl">
         <p className="text-sm text-gray-400">
-          The probability that the token resolves YES. The server captures the market price, checks spread, 24 h volume (min_liquidity_usd) and UMA status, and files the forecast in
+          The probability that the token resolves YES. The server captures the market price, checks spread, 24 h volume (mandate min_forecast_volume_usd if set, else min_liquidity_usd) and UMA status, and files the forecast in
           its (category, horizon) bucket. A token’s active forecast can be superseded after 6 hours.
         </p>
         <label className="block text-sm text-gray-400">

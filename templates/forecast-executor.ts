@@ -489,8 +489,23 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
     }
   }
 
+  // Markets under the trading floor (24h volume < min_liquidity_usd): the risk engine would refuse the bid. Forecasts
+  // may be recorded below it (mandate min_forecast_volume_usd, R209), so skip them instead of collecting rejections.
+  // Unknown volume is left to the risk engine; without these calls (backtests) nothing is skipped
+  const thinMarkets = new Set<string>();
+  if (typeof ctx.risk.getMandateSummary === 'function' && typeof ctx.polymarket.getMarket === 'function') {
+    const mandate = await ctx.risk.getMandateSummary();
+    if (mandate) {
+      for (const marketId of new Set(forecasts.map((f) => f.marketId))) {
+        const volume = (await ctx.polymarket.getMarket(marketId))?.volume24hUsd;
+        if (typeof volume === 'number' && volume < mandate.minLiquidityUsd) thinMarkets.add(marketId);
+      }
+    }
+  }
+
   const quotes: Quote[] = [];
   for (const f of forecasts) {
+    if (thinMarkets.has(f.marketId)) continue;
     if (flaggedMarkets.has(f.marketId) || flaggedTokens.has(f.tokenId) || (f.complementTokenId && flaggedTokens.has(f.complementTokenId))) continue;
     const sides: Array<{ tokenId: string; fair: number }> = [{ tokenId: f.tokenId, fair: f.probability }];
     if (f.complementTokenId) sides.push({ tokenId: f.complementTokenId, fair: 1 - f.probability });
