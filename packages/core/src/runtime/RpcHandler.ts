@@ -10,7 +10,7 @@
 import type { ClobClient } from '@polymarket/clob-client';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
-import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail, MandateSummary, CopyLeaderStatus, CopyOrderTag } from '../sdk/types';
+import type { RpcRequest, RpcResponse, RpcMethod, OrderOpts, LimitOrderOpts, BinanceTradeResult, BotForecast, BotExitFlag, ExitPolicy, MarketDetail, MandateSummary, FlaggedToken, CopyLeaderStatus, CopyOrderTag } from '../sdk/types';
 import type { MarketView } from '../ledger/MarketCacheService';
 import type { ForecastView } from '../ledger/LedgerService';
 import type { PaperTradingState } from './PaperTradingState';
@@ -113,6 +113,8 @@ export interface RpcHandlerDeps {
   eventMarketIds?: (eventId: string) => Promise<string[] | null>;
   /** Retire this bot (ctx.requestRetire): BotManager runs it after the reply, outside the RPC */
   requestRetire?: (reason: string) => void;
+  /** Tokens with an open exit flag on any bot's position in this bot's mode (ctx.risk.getFlaggedTokens) */
+  flaggedTokens?: () => FlaggedToken[];
   /** The mandate's market filters (ctx.risk.getMandateSummary); null = config invalid */
   mandateSummary?: () => MandateSummary | null;
   /** Copy-trading leaders (5c): given only to the builtin Copy Trading template; missing ⇒ ctx.copy fails, orders are not attributed */
@@ -157,6 +159,7 @@ export function toMarketDetail(m: MarketView, askedFor: string, scope: string[] 
     umaResolutionStatus: m.umaResolutionStatus,
     inScope: scope === null || scope.includes(m.marketId),
     liquidityUsd: m.liquidityUsd,
+    volume24hUsd: m.volume24hUsd,
     updatedAt: m.updatedAt,
   };
 }
@@ -335,6 +338,15 @@ export class RpcHandler {
 
       case 'risk:getMandateSummary':
         return this.deps.mandateSummary ? this.deps.mandateSummary() : null;
+
+      case 'risk:getFlaggedTokens':
+        return this.deps.flaggedTokens ? this.deps.flaggedTokens() : [];
+
+      case 'risk:getRecentStops': {
+        const tokenId = args[0];
+        if (tokenId !== undefined && tokenId !== null && (typeof tokenId !== 'string' || tokenId.length > 100)) throw new Error('getRecentStops: token id must be a string');
+        return this.orders.getRecentStops(typeof tokenId === 'string' && tokenId.trim() ? tokenId.trim() : undefined);
+      }
 
       case 'copy:getLeaders':
         if (!this.deps.copy) throw new Error('ctx.copy is only available to bots running the builtin Copy Trading template');

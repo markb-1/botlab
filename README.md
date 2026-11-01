@@ -67,7 +67,7 @@ Docker, the Windows service, the master key and Node version details are in [Ins
 
 | Guide | What's in it |
 |---|---|
-| [Install and run](docs/guide/install.md) | Node 22, dev and production mode, data dirs, Docker, master key, upgrading, Windows service |
+| [Install and run](docs/guide/install.md) | Node 22, dev and production mode, data dirs, Docker, master key, upgrading, Windows service, hosting on a VPS |
 | [Operating BotLab](docs/guide/operations.md) | First run and going live, limits, dashboard, environment variables, access and API tokens, security |
 | [Bots and scripts](docs/guide/scripting.md) | How bots run, writing scripts, the `ctx` API reference, config schemas, built-in templates |
 | [Strategies](docs/guide/strategies.md) | Markets and the forecast ledger, Forecast Executor, Position Manager, Consistency, Resolution Rule, Copy Trading |

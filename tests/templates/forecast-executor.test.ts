@@ -14,6 +14,8 @@ import {
   kellyFraction,
   quoteFor,
   runExecutorCycle,
+  sustainableMarkets,
+  effectiveBidTtl,
   type Quote,
 } from '../../templates/forecast-executor';
 import { typecheckScript } from '../../packages/core/src/runtime/typecheckScript';
@@ -57,11 +59,14 @@ function fakeCtx(opts: {
   forecasts: ReturnType<typeof forecast>[];
   books: Record<string, ReturnType<typeof book>>;
   open?: Array<Record<string, unknown>>;
-  budget?: { remainingAllocation: number; remainingMarket: Record<string, number>; halted: boolean };
+  budget?: { remainingAllocation: number; remainingMarket: Record<string, number>; halted: boolean; ordersPerHour?: number | null; ordersRemainingThisHour?: number | null };
   positions?: Array<Record<string, unknown>>;
   config?: Record<string, unknown>;
   fee?: Record<string, unknown>;
   history?: Array<Record<string, unknown>>;
+  /** Server-side mode-wide reads (ctx.risk.getFlaggedTokens / getRecentStops); missing ⇒ the calls are absent */
+  flagged?: Array<{ tokenId: string; marketId: string | null; flaggedAt: string }>;
+  stops?: Array<{ tokenId: string; stoppedAt: string }>;
 }) {
   const placeLimit = vi.fn().mockResolvedValue({ ok: true, status: 'open', orderId: 'new' });
   const cancel = vi.fn().mockResolvedValue(undefined);
@@ -73,7 +78,11 @@ function fakeCtx(opts: {
     getPositions: vi.fn().mockResolvedValue(opts.positions ?? []),
     getOrderBook: vi.fn(async (t: string) => opts.books[t] ?? book(0.01, 0.99)),
     ledger: { getActiveForecasts: vi.fn().mockResolvedValue(opts.forecasts) },
-    risk: { getBudget: vi.fn().mockResolvedValue(opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }) },
+    risk: {
+      getBudget: vi.fn().mockResolvedValue(opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }),
+      ...(opts.flagged ? { getFlaggedTokens: vi.fn().mockResolvedValue(opts.flagged) } : {}),
+      ...(opts.stops ? { getRecentStops: vi.fn().mockResolvedValue(opts.stops) } : {}),
+    },
     polymarket: {
       getOpenOrders: vi.fn().mockResolvedValue(opts.open ?? []),
       getOrderHistory: vi.fn().mockResolvedValue(opts.history ?? []),
@@ -307,6 +316,90 @@ describe('forecast executor: cycle', () => {
     };
     expect((await runManagerCycle(pm as never)).exits).toEqual([]);
     expect(exit).not.toHaveBeenCalled();
+  });
+
+  describe('Mac test follow-ups', () => {
+    const books = { yes1: book(0.49, 0.52), no1: book(0.45, 0.47) };
+
+    it('F1: bids rest bid_ttl_minutes (default 60) and are kept until ≤ 5 min remain', async () => {
+      expect(executorConfig({})).toMatchObject({ bidTtlMinutes: 60 });
+      expect(executorConfig({ bid_ttl_minutes: 1 })).toMatchObject({ bidTtlMinutes: 3 });
+      let f = fakeCtx({ forecasts: [forecast()], books });
+      await runExecutorCycle(f.ctx);
+      expect(f.placeLimit.mock.calls[0][4]).toMatchObject({ ttlMinutes: 60, postOnly: true });
+      // 6 minutes of life left: kept (the old rule re-placed at requote_minutes + 1 = 11)
+      f = fakeCtx({ forecasts: [forecast()], books, open: [liveBid({ expiresAt: new Date(NOW + 6 * 60_000).toISOString() })] });
+      const kept = await runExecutorCycle(f.ctx);
+      expect(kept).toMatchObject({ kept: 1, placed: 0, cancelled: 0 });
+      expect(kept.refreshAt).toBe(NOW + 60_000); // the next cycle is due when it enters the 5-minute window
+      // 4 minutes left: re-placed
+      f = fakeCtx({ forecasts: [forecast()], books, open: [liveBid({ expiresAt: new Date(NOW + 4 * 60_000).toISOString() })] });
+      expect(await runExecutorCycle(f.ctx)).toMatchObject({ kept: 0, cancelled: 1, placed: 1 });
+    });
+
+    it('F1: quotes no more markets than the hourly order rate sustains and places at most the orders left', async () => {
+      expect(sustainableMarkets({ bidTtlMinutes: 60 }, 20)).toBe(9);
+      expect(sustainableMarkets({ bidTtlMinutes: 30 }, 20)).toBe(5);
+      expect(sustainableMarkets({ bidTtlMinutes: 10 }, 20)).toBe(1);
+      expect(sustainableMarkets({ bidTtlMinutes: 60 }, null)).toBe(Infinity);
+      const fs3 = ['a', 'b', 'c'].map((k, i) =>
+        forecast({ id: `f${k}`, marketId: `m${k}`, tokenId: `y${k}`, complementTokenId: `n${k}`, endDate: new Date(NOW + (2 + i) * DAY).toISOString() })
+      );
+      const bk = { ya: book(0.49, 0.52), yb: book(0.49, 0.52), yc: book(0.49, 0.52) };
+      // Rate 4/h with 60-min bids ⇒ 1 market (4 / (60/55 + 1) = 1.9)
+      let f = fakeCtx({ forecasts: fs3, books: bk, budget: { remainingAllocation: 1000, remainingMarket: {}, halted: false, ordersPerHour: 4, ordersRemainingThisHour: 4 } });
+      let r = await runExecutorCycle(f.ctx);
+      expect(r.planned.map((p) => p.tokenId)).toEqual(['ya']);
+      // Rate 20/h but only 2 orders left this hour: the two best ranked are placed, the third deferred
+      f = fakeCtx({ forecasts: fs3, books: bk, budget: { remainingAllocation: 1000, remainingMarket: {}, halted: false, ordersPerHour: 20, ordersRemainingThisHour: 2 } });
+      r = await runExecutorCycle(f.ctx);
+      expect(r).toMatchObject({ placed: 2, deferred: 1 });
+      expect(f.placeLimit.mock.calls.map((c) => c[0])).toEqual(['ya', 'yb']);
+    });
+
+    it('review: the server TTL cap (resting_order_ttl_minutes 30) sets the bid lifetime, refresh time and market count', async () => {
+      expect(effectiveBidTtl({ bidTtlMinutes: 60 }, 30)).toBe(30);
+      expect(effectiveBidTtl({ bidTtlMinutes: 60 }, null)).toBe(60);
+      const budget = { remainingAllocation: 1000, remainingMarket: {}, halted: false, ordersPerHour: 20, ordersRemainingThisHour: 20, maxRestingTtlMinutes: 30 };
+      const fs7 = Array.from({ length: 7 }, (_, i) =>
+        forecast({ id: `f${i}`, marketId: `m${i}`, tokenId: `y${i}`, complementTokenId: `n${i}`, endDate: new Date(NOW + (2 + i) * DAY).toISOString() })
+      );
+      const bk = Object.fromEntries(fs7.map((f) => [f.tokenId, book(0.49, 0.52)]));
+      const f = fakeCtx({ forecasts: fs7, books: bk, budget, config: { bid_ttl_minutes: 60 } });
+      // The server answers with its own (capped) expiry
+      f.placeLimit.mockResolvedValue({ ok: true, status: 'open', orderId: 'new', expiresAt: new Date(NOW + 30 * 60_000).toISOString() });
+      const r = await runExecutorCycle(f.ctx);
+      // 20 / (60 / 25 + 1) = 5.9 ⇒ 5 markets (with 60-minute bids it would have been 9)
+      expect(r.planned).toHaveLength(5);
+      expect(f.placeLimit.mock.calls[0][4]).toMatchObject({ ttlMinutes: 30 });
+      expect(r.refreshAt).toBe(NOW + 25 * 60_000);
+    });
+
+    it('F3: skips a forecast whose token or complement has an open exit flag on any bot, and cancels its bids there', async () => {
+      const flaggedAt = new Date(NOW - 60_000).toISOString();
+      for (const flagged of [
+        [{ tokenId: 'no1', marketId: null, flaggedAt }],
+        [{ tokenId: 'yes1', marketId: null, flaggedAt }],
+        [{ tokenId: 'other', marketId: 'm1', flaggedAt }],
+      ]) {
+        const f = fakeCtx({ forecasts: [forecast()], books, open: [liveBid()], flagged });
+        const r = await runExecutorCycle(f.ctx);
+        expect(r.planned).toEqual([]);
+        expect(f.cancel).toHaveBeenCalledWith('o1');
+      }
+      const f = fakeCtx({ forecasts: [forecast()], books, flagged: [{ tokenId: 'elsewhere', marketId: 'm9', flaggedAt }] });
+      expect((await runExecutorCycle(f.ctx)).planned).toHaveLength(1);
+    });
+
+    it("F4: a stop on another executor's position (server-side, any bot in the mode) blocks until the forecast is renewed", async () => {
+      // Executor B's own history is empty: the stop was on executor A's position
+      const stops = [{ tokenId: 'yes1', stoppedAt: new Date(NOW - 3600_000).toISOString() }];
+      let f = fakeCtx({ forecasts: [forecast()], books, history: [], stops });
+      expect((await runExecutorCycle(f.ctx)).planned).toEqual([]);
+      expect((f.ctx as any).polymarket.getOrderHistory).not.toHaveBeenCalled();
+      f = fakeCtx({ forecasts: [forecast({ id: 'f2', createdAt: new Date(NOW - 60_000).toISOString() })], books, history: [], stops });
+      expect((await runExecutorCycle(f.ctx)).planned).toHaveLength(1);
+    });
   });
 
   it('typechecks against botlab-sdk.d.ts (the agent can fork it)', () => {

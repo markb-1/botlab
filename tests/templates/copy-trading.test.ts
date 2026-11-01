@@ -62,6 +62,7 @@ function market(over: Record<string, unknown> = {}) {
     umaResolutionStatus: null,
     inScope: true,
     liquidityUsd: 20_000,
+    volume24hUsd: 20_000,
     updatedAt: new Date(NOW).toISOString(),
     ...over,
   };
@@ -374,7 +375,11 @@ describe('copy trading v2: cycle', () => {
     const t = NOW;
     expect(marketSkipReason(market() as any, MANDATE, POLICY, t)).toBeNull();
     expect(marketSkipReason(market({ category: 'sports' }) as any, MANDATE, POLICY, t)).toMatch(/category sports/);
-    expect(marketSkipReason(market({ liquidityUsd: 100 }) as any, MANDATE, POLICY, t)).toMatch(/liquidity/);
+    expect(marketSkipReason(market({ volume24hUsd: 100 }) as any, MANDATE, POLICY, t)).toMatch(/24h volume 100 </);
+    // Same measure as the risk engine (F5): deep book liquidity does not stand in for 24h volume, and vice versa
+    expect(marketSkipReason(market({ liquidityUsd: 1_000_000, volume24hUsd: 100 }) as any, MANDATE, POLICY, t)).toMatch(/24h volume/);
+    expect(marketSkipReason(market({ liquidityUsd: 100, volume24hUsd: 20_000 }) as any, MANDATE, POLICY, t)).toBeNull();
+    expect(marketSkipReason(market({ volume24hUsd: null }) as any, MANDATE, POLICY, t)).toMatch(/24h volume unknown/);
     expect(marketSkipReason(market({ ambiguityScore: null }) as any, MANDATE, POLICY, t)).toMatch(/not assessed/);
     expect(marketSkipReason(market({ ambiguityScore: 2 }) as any, { ...MANDATE, maxAmbiguityScore: 3 }, POLICY, t)).toMatch(/exit score/);
     expect(marketSkipReason(market({ endDate: new Date(t + 60 * DAY).toISOString() }) as any, { ...MANDATE, longHorizonDays: [30, 45] }, POLICY, t)).toMatch(

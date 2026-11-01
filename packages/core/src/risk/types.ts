@@ -167,6 +167,8 @@ export type RiskCheckName =
   | 'clock_skew'
   // No successful exchange clock check for 3 minutes (2b review)
   | 'clock_unverified'
+  // The bot's own submissions are paused after a burst of risk rejections (Mac test F1)
+  | 'rejection_cooldown'
   // limits.yaml live_trading.enabled is false (3b: paper-only until a human enables live trading)
   | 'live_disabled';
 

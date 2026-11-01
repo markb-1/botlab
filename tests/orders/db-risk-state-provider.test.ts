@@ -155,9 +155,13 @@ describe.skipIf(!sqliteAvailable)('DbRiskStateProvider', () => {
     expect((await provider().getSnapshot(order({ botId: 'nope' }))).bot).toBeNull();
   });
 
-  it('counts this bot\'s attempts in the last hour, including rejections', async () => {
+  it('counts the orders this bot submitted in the last hour: not rejections, not exits placed for it (Mac test F1)', async () => {
     const setCreated = (id: string, ms: number) => t.db.prepare('UPDATE orders SET created_at = ? WHERE id = ?').run(iso(ms), id);
     setCreated(openOrder('bot-1', { status: 'rejected_risk' }).id, NOW - 10 * 60_000);
+    setCreated(openOrder('bot-1', { status: 'cancelled' }).id, NOW - 20 * 60_000);
+    const pmExit = openOrder('bot-1', { status: 'open' }).id;
+    t.db.prepare("UPDATE orders SET placed_by = 'pm' WHERE id = ?").run(pmExit);
+    setCreated(pmExit, NOW - 5 * 60_000);
     setCreated(openOrder('bot-1', { status: 'filled' }).id, NOW - 30 * 60_000);
     setCreated(openOrder('bot-1', { status: 'filled' }).id, NOW - 2 * 3_600_000); // too old
     setCreated(openOrder('bot-2', { status: 'filled' }).id, NOW - 10 * 60_000); // other bot

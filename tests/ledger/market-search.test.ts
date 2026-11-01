@@ -44,3 +44,36 @@ describe('MarketService.searchLive (cache + Gamma 429 back-off)', () => {
     expect(searchGamma).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('MarketService.searchLive: category fan-out (Mac test F6 review)', () => {
+  it('one fan-out for different limits: fetched once at the maximum size, sliced per request', async () => {
+    const clock = { now: 1_000_000 };
+    const many = Array.from({ length: 80 }, (_, i) => ({ marketId: `m${i}` }));
+    const searchGamma = vi.fn(async () => many);
+    const svc = new MarketService({ searchGamma } as unknown as MarketCacheService, () => clock.now);
+    expect(await svc.searchLive({ category: 'economics', limit: 5 })).toHaveLength(5);
+    expect(await svc.searchLive({ category: 'economics', limit: 50 })).toHaveLength(50);
+    expect(await svc.searchLive({ category: 'economics' })).toHaveLength(50);
+    expect(searchGamma).toHaveBeenCalledTimes(1);
+    expect(searchGamma).toHaveBeenCalledWith(expect.objectContaining({ category: 'economics', limit: 100 }));
+  });
+
+  it('concurrent identical searches share one in-flight request', async () => {
+    let release!: (v: unknown) => void;
+    const searchGamma = vi.fn(() => new Promise((r) => (release = r)));
+    const svc = new MarketService({ searchGamma } as unknown as MarketCacheService, () => 1_000_000);
+    const a = svc.searchLive({ category: 'weather-climate', limit: 3 });
+    const b = svc.searchLive({ category: 'weather-climate', limit: 10 });
+    release([{ marketId: 'x' }]);
+    expect(await a).toEqual([{ marketId: 'x' }]);
+    expect(await b).toEqual([{ marketId: 'x' }]);
+    expect(searchGamma).toHaveBeenCalledTimes(1);
+  });
+
+  it('a category fan-out weighs more against the per-principal search limit', () => {
+    const svc = new MarketService({ categorySearchTagCount: (c: string) => (c === 'economics' ? 22 : 0) } as unknown as MarketCacheService, () => 0);
+    expect(svc.searchCost({ q: 'cpi', category: 'economics' })).toBe(1);
+    expect(svc.searchCost({ category: 'economics' })).toBe(6);
+    expect(svc.searchCost({})).toBe(1);
+  });
+});

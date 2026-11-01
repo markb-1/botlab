@@ -148,3 +148,62 @@ describe('L2-authenticated POST through the overridden axios, and credential red
   });
 });
 
+
+describe('L2 requests never follow a redirect (POLY_* headers stay on the CLOB host)', () => {
+  let a: http.Server;
+  let b: http.Server;
+  let hostA = '';
+  const atB: Array<{ url: string; headers: http.IncomingHttpHeaders }> = [];
+
+  beforeAll(async () => {
+    b = http.createServer((req, res) => {
+      atB.push({ url: req.url ?? '', headers: req.headers });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(req.url === '/time' ? '1793443411' : JSON.stringify({ closed_only: false }));
+    });
+    await new Promise<void>((resolve) => b.listen(0, '127.0.0.1', resolve));
+    // Another host name for the same loopback: a cross-host redirect
+    const hostB = `http://localhost:${(b.address() as AddressInfo).port}`;
+    a = http.createServer((req, res) => {
+      const target = req.url === '/time' ? '/time' : '/auth/ban-status/closed-only';
+      res.writeHead(302, { location: `${hostB}${target}` });
+      res.end();
+    });
+    await new Promise<void>((resolve) => a.listen(0, '127.0.0.1', resolve));
+    hostA = `http://127.0.0.1:${(a.address() as AddressInfo).port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise((resolve) => a.close(resolve));
+    await new Promise((resolve) => b.close(resolve));
+  });
+
+  it('an authenticated CLOB request is not redirected; nothing reaches the other host', async () => {
+    atB.length = 0;
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const wallet = ethers.Wallet.createRandom();
+      const clob = new ClobClient(hostA, 137, wallet, { key: 'api-key-SECRET', secret: Buffer.from('s3cret-bytes-0123').toString('base64'), passphrase: 'pp-SECRET' });
+      const r = await clob.getClosedOnlyMode();
+      // clob-client turns the refused redirect into an error result
+      expect(JSON.stringify(r)).toMatch(/302/);
+      expect(atB).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('unauthenticated requests still follow redirects (the rule only targets POLY_* requests)', async () => {
+    atB.length = 0;
+    const clob = new ClobClient(hostA, 137);
+    expect(await clob.getServerTime()).toBe(1793443411);
+    expect(atB.map((x) => x.url)).toEqual(['/time']);
+    expect(Object.keys(atB[0].headers).some((k) => k.startsWith('poly_'))).toBe(false);
+  });
+
+  it('refuseAuthRedirects sets maxRedirects 0 only for POLY_* headers', async () => {
+    const { refuseAuthRedirects } = await import('../../packages/core/src/exchange/polymarket/redactCredentials');
+    expect(refuseAuthRedirects({ headers: { POLY_API_KEY: 'x' } })).toMatchObject({ maxRedirects: 0 });
+    expect(refuseAuthRedirects({ headers: { Accept: 'application/json' } })).not.toHaveProperty('maxRedirects');
+  });
+});

@@ -51,6 +51,8 @@ import type {
   OrderHistoryEntry,
   CapitalDemand,
   MandateSummary,
+  FlaggedToken,
+  RecentStop,
   CopyContext,
   CopyLeaderStatus,
   CopyHoldings,
@@ -295,6 +297,8 @@ export function createBotContext(params: {
       getExitFlags: () => rpcCall('risk:getExitFlags') as Promise<BotExitFlag[]>,
       getExitPolicy: () => rpcCall('risk:getExitPolicy') as Promise<ExitPolicy>,
       getMandateSummary: () => rpcCall('risk:getMandateSummary') as Promise<MandateSummary | null>,
+      getFlaggedTokens: () => rpcCall('risk:getFlaggedTokens') as Promise<FlaggedToken[]>,
+      getRecentStops: (tokenId?: string) => rpcCall('risk:getRecentStops', tokenId) as Promise<RecentStop[]>,
     } as RiskContext,
 
     // Copy Trading template only: the server refuses it for any other bot

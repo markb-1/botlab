@@ -302,8 +302,16 @@ export interface MarketDetail {
   umaResolutionStatus: string | null;
   /** This bot may trade the market: it is in the bot's market_ids (or the bot is not market-scoped) */
   inScope: boolean;
-  /** Gamma liquidity (USD) the risk engine compares with the minimum; null if unknown */
+  /**
+   * Gamma order-book liquidity (USD); informational. NOT what the minimum-liquidity filter uses: see volume24hUsd.
+   * null if unknown.
+   */
   liquidityUsd: number | null;
+  /**
+   * Gamma 24h volume (USD): the measure the risk engine and the ledger compare with `min_liquidity_usd`
+   * (MandateSummary.minLiquidityUsd). null if unknown (buys are refused then).
+   */
+  volume24hUsd: number | null;
   /** When the cache row was last refreshed */
   updatedAt: string;
 }
@@ -322,6 +330,18 @@ export interface RiskBudget {
   remainingAllocation: number;
   remainingMarket: Record<string, number>;
   halted: boolean;
+  /** limits.yaml per_bot_defaults.max_orders_per_hour (null when unknown, e.g. in a backtest) */
+  ordersPerHour: number | null;
+  /**
+   * Orders this bot may still submit in the rolling hour: the limit minus its own submitted orders of the last hour
+   * (risk rejections and Position Manager exits placed for it do not count). null when unknown.
+   */
+  ordersRemainingThisHour: number | null;
+  /**
+   * Longest resting-order lifetime the server allows (limits.yaml orders.resting_order_ttl_minutes): a longer
+   * `ttlMinutes` is capped to it. null when unknown.
+   */
+  maxRestingTtlMinutes: number | null;
 }
 
 export interface RiskContext {
@@ -339,6 +359,32 @@ export interface RiskContext {
    * (every buy is refused then).
    */
   getMandateSummary(): Promise<MandateSummary | null>;
+  /**
+   * Tokens with an open exit flag on ANY bot's position in this bot's mode (read-only; no reasons): a bot should not
+   * buy a token, or its complement, that the Position Manager is told to sell.
+   */
+  getFlaggedTokens(): Promise<FlaggedToken[]>;
+  /**
+   * Position Manager stops in this bot's mode over the last 30 days, latest per token, on any bot's position
+   * (read-only). Optional token filter. A token stopped out should not be bought again until its forecast is renewed.
+   */
+  getRecentStops(tokenId?: string): Promise<RecentStop[]>;
+}
+
+/** A token with an open exit flag on some bot's position (ctx.risk.getFlaggedTokens). */
+export interface FlaggedToken {
+  tokenId: string;
+  /** Market (condition id) of the flagged position; null if unknown */
+  marketId: string | null;
+  /** When the (latest) flag was raised */
+  flaggedAt: string;
+}
+
+/** The latest Position Manager stop on a token (ctx.risk.getRecentStops). */
+export interface RecentStop {
+  tokenId: string;
+  /** Time of the latest stop exit attempt on the token (ISO) */
+  stoppedAt: string;
 }
 
 /** The mandate's market filters (ctx.risk.getMandateSummary). */
@@ -349,7 +395,10 @@ export interface MandateSummary {
   resolvesWithinDays: [number, number];
   /** Long horizon in days [min, max] (capped by a global share of exposure) */
   longHorizonDays: [number, number];
-  /** Minimum market liquidity (USD): the larger of the mandate's and limits.yaml per_market */
+  /**
+   * Minimum market 24h volume (USD; config key `min_liquidity_usd`): the larger of the mandate's and limits.yaml
+   * per_market. Compare with MarketDetail.volume24hUsd, as the risk engine does.
+   */
   minLiquidityUsd: number;
   /** Markets with ambiguity above this are not bought */
   maxAmbiguityScore: number;
@@ -865,6 +914,8 @@ export type RpcMethod =
   | 'risk:getExitFlags'
   | 'risk:getExitPolicy'
   | 'risk:getMandateSummary'
+  | 'risk:getFlaggedTokens'
+  | 'risk:getRecentStops'
   | 'copy:getLeaders'
   | 'copy:getHoldings'
   | 'bot:requestRetire'

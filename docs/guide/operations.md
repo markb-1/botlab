@@ -56,6 +56,13 @@ The UI works at phone width too, for checking on bots over Tailscale:
 
 A `.env` file in the working directory is read at start.
 
+**`min_liquidity_usd` is 24 h volume.** Both `limits.yaml per_market.min_liquidity_usd` and `mandate.yaml
+markets.min_liquidity_usd` (default 5000; the larger applies) are compared with the market's Gamma **24 h volume**
+— by the forecast ledger, the risk engine and copy trading alike — not with order-book liquidity. On the
+2026-10-31 Mac test only a handful of in-mandate markets (economics / politics-non-us / weather-climate ending
+within 90 days) cleared $5,000 of 24 h volume, so most forecasts and bids in those categories were refused. If you
+want BotLab to trade more of them, consider lowering `min_liquidity_usd` (your call; the agent cannot change it).
+
 ## Access, API and tokens
 
 - **UI / admin**: password login → session cookie (httpOnly, SameSite=Strict, 7 days idle / 30 days

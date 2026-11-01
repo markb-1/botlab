@@ -323,6 +323,18 @@ export function decideRights(input: RightsInput): RightsDecision {
   switch (current.state) {
     case 'trading': {
       if (!canTrade) return to('shadow', 0, null, `category is ${input.mandate === 'none' ? 'not in the mandate allow list' : `in mandate "${input.mandate}"`}`);
+      // Qualification basis: a medium bucket that qualified on the relaxed threshold (short bucket trading) loses it
+      // when the short bucket stops trading, unless its own record now meets the full threshold (review)
+      if (
+        bucket === 'medium' &&
+        !current.forced &&
+        !input.shortBucketTrading &&
+        current.qualifiedN !== null &&
+        current.qualifiedN < QUALIFY_MIN_EVENTS &&
+        !(skill.n >= QUALIFY_MIN_EVENTS && skill.lowerBound !== null && skill.lowerBound > 0)
+      ) {
+        return to('shadow', 0, null, `qualified on the medium relaxation (n=${current.qualifiedN} < ${QUALIFY_MIN_EVENTS}) and the short bucket no longer trades`);
+      }
       const last = input.skillVotes.slice(-SUSPEND_WINDOW_EVENTS).map((v) => v.value);
       if (last.length > 0 && mean(last) < 0) {
         return to('suspended', 0, current.qualifiedN, `mean skill over the last ${last.length} scored events ${fmt(mean(last))} < 0`);

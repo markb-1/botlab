@@ -121,6 +121,68 @@ describe.skipIf(!sqliteAvailable)('MarketCacheService', () => {
     await expect(h.cache.searchGamma({})).rejects.toThrow(/503/);
   });
 
+  it('category-only search queries Gamma by the category tags, paginates, merges, dedupes and ranks by 24h volume (Mac test F6)', async () => {
+    const ev = (id: string, title: string, tags: string[], markets: unknown[]) => ({ id, title, tags: tags.map((slug) => ({ slug, label: slug })), markets });
+    const cpi = ev('e1', 'US CPI', ['inflation', 'cpi'], [gammaMarket('m1', { volume24hr: 3000 }), gammaMarket('m2', { closed: true })]);
+    const fullPage = Array.from({ length: 50 }, (_, i) =>
+      ev(`u${i}`, 'Unemployment', ['unemployment'], [gammaMarket(`u${i}`, { question: `Unemployment above ${i}%?`, volume24hr: 100 + i })])
+    );
+    const urls: URL[] = [];
+    h.fetchFn.mockImplementation(async (url: string) => {
+      const u = new URL(url);
+      urls.push(u);
+      const tag = u.searchParams.get('tag_slug');
+      const offset = Number(u.searchParams.get('offset'));
+      const body = (() => {
+        if (u.pathname !== '/events') return [];
+        if (tag === 'inflation') return [cpi];
+        if (tag === 'cpi') return [cpi, ev('e3', 'Euro area CPI', ['cpi'], [gammaMarket('m5', { volume24hr: 9000 })])];
+        if (tag === 'unemployment') return offset === 0 ? fullPage : [ev('u-last', 'Unemployment', ['unemployment'], [gammaMarket('u-last', { question: 'Unemployment above 9%?', volume24hr: 5 })])];
+        if (tag === 'economy') return [ev('e9', 'Largest company', ['economy'], [gammaMarket('apple', { question: 'Will Apple be the largest company?', tags: [{ slug: 'economy', label: 'Economy' }] })])];
+        return [];
+      })();
+      if (tag === 'gdp') return { ok: false, status: 500, json: async () => ({}) } as unknown as Response; // one tag failing is tolerated
+      return { ok: true, status: 200, json: async () => structuredClone(body) } as unknown as Response;
+    });
+
+    const hits = await h.cache.searchGamma({ category: 'economics', limit: 100 });
+    // No global top-100 request; every request is an /events tag query, active / open, by 24h volume
+    expect(urls.every((u) => u.pathname === '/events' && u.searchParams.get('order') === 'volume24hr' && u.searchParams.get('closed') === 'false')).toBe(true);
+    const tags = new Set(urls.map((u) => u.searchParams.get('tag_slug')));
+    expect([...tags]).toEqual(expect.arrayContaining(['inflation', 'cpi', 'unemployment', 'economy', 'economics']));
+    expect(tags.has('sports')).toBe(false);
+    // Pagination: a full page fetches the next one; a short page ends it
+    expect(urls.filter((u) => u.searchParams.get('tag_slug') === 'unemployment').map((u) => u.searchParams.get('offset'))).toEqual(['0', '50']); // at most 2 pages
+    // Merged, deduplicated, only open economics markets, ranked by 24h volume
+    expect(hits.map((x) => x.marketId).slice(0, 3)).toEqual(['m5', 'm1', 'u49']);
+    expect(hits).toHaveLength(2 + 51);
+    expect(hits.every((x) => x.category === 'economics')).toBe(true);
+    expect(hits.find((x) => x.marketId === 'apple' || x.marketId === 'm2')).toBeUndefined();
+    expect(hits.at(-1)!.marketId).toBe('u-last');
+    expect((await h.cache.searchGamma({ category: 'economics', limit: 2 })).map((x) => x.marketId)).toEqual(['m5', 'm1']);
+
+    // A 429 on any tag is thrown (the service backs off); every tag failing throws
+    h.fetchFn.mockImplementation(async () => ({ ok: false, status: 429, headers: new Headers(), json: async () => ({}) }) as unknown as Response);
+    await expect(h.cache.searchGamma({ category: 'weather-climate' })).rejects.toMatchObject({ status: 429 });
+    h.fetchFn.mockImplementation(async () => ({ ok: false, status: 503, headers: new Headers(), json: async () => ({}) }) as unknown as Response);
+    await expect(h.cache.searchGamma({ category: 'weather-climate' })).rejects.toThrow(/503/);
+  });
+
+  it('category fan-out has a total deadline: tags finished by then are returned', async () => {
+    h.cache.categorySearchDeadlineMs = 100;
+    h.fetchFn.mockImplementation(async (url: string) => {
+      const tag = new URL(url).searchParams.get('tag_slug');
+      if (tag !== 'inflation') return new Promise(() => {}); // never answers
+      return { ok: true, status: 200, json: async () => [{ id: 'e1', title: 'US CPI', tags: [{ slug: 'inflation', label: 'Inflation' }], markets: [gammaMarket('m1')] }] } as unknown as Response;
+    });
+    const started = Date.now();
+    const hits = await h.cache.searchGamma({ category: 'economics' });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(hits.map((x) => x.marketId)).toEqual(['m1']);
+    h.fetchFn.mockImplementation(async () => new Promise(() => {}));
+    await expect(h.cache.searchGamma({ category: 'economics' })).rejects.toThrow(/timed out/);
+  });
+
   it('ambiguity: unassessed ⇒ null (buys rejected); assessed; auto-raised to 2 for 7 days after a rules change and on dispute', async () => {
     h.gamma.set('m1', gammaMarket('m1'));
     expect(await h.cache.get(info('m1'))).toEqual({ category: 'economics', ambiguityScore: null, rulesChangedAt: null });

@@ -9,7 +9,7 @@ npm start              # built server serving the built UI (production paths)
 npm run typecheck      # core + server + web
 npm test               # vitest (SKIP_NETWORK_TESTS=1 skips live-API tests)
 npm run lint           # ESLint (0 errors expected)
-npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke
+npm run cli -- <cmd>   # migrate-key | gen-key | set-password | token create/list/revoke | check-polymarket
 npm run gen:sdk        # regenerate botlab-sdk.d.ts (packages/core/src/sdk/sdkDts.generated.ts) after editing sdk/types.ts
 npm run mcp:stdio      # MCP stdio proxy (BOTLAB_URL, BOTLAB_AGENT_TOKEN); mcp:stdio:dev runs it from source
 ```
