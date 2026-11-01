@@ -27,6 +27,8 @@ import { ServiceError, conflict, notFound } from './errors';
 import type { BotCreateInput, BotUpdateInput } from './schemas';
 import type { LimitsConfig, MandateConfig } from '../config/schema';
 import { copyLeadersOf, MAX_COPY_LEADERS, type CopyLeaderService } from './CopyLeaderService';
+import { getBinancePrice } from '../exchange/binance/client';
+import { DEFAULT_PAPER_BALANCE } from '../runtime/PaperTradingState';
 
 // Module-level cache for token → market info resolution (static data)
 const tokenInfoCache = new Map<string, { market: string; outcome: string }>();
@@ -368,6 +370,8 @@ export interface BotServiceDeps {
   cachedTokenMarketInfo?: (tokenId: string) => StrategyMarketInfo | null;
   /** Every market of an event: `fetch` may call Gamma (creates), `cached` does not (updates) */
   eventMarketIds?: { fetch: (eventId: string) => Promise<string[] | null>; cached: (eventId: string) => string[] | null };
+  /** Current Binance spot price of a pair such as ETHUSDT (paper valuation); default: the public ticker */
+  binancePrice?: (symbol: string) => Promise<number>;
   /** A ledger forecast by id (resolution-rule `forecast_id`) */
   getForecast?: (id: string) => { tokenId: string; status: string } | null;
   /** Mandate in force (`strategies.allow` gates agent strategy bots); null = config unavailable */
@@ -1045,6 +1049,12 @@ export class BotService {
         } catch (err) {
           logger.error(`Failed to fetch price for ${pos.symbol}: ${err}`);
         }
+      } else if (pos.exchange === 'binance' && pos.symbol) {
+        try {
+          currentPrice = await this.binancePrice(pos.symbol);
+        } catch (err) {
+          logger.error(`Failed to fetch Binance price for ${pos.symbol}: ${err}`);
+        }
       }
 
       const currentValue = currentPrice != null ? pos.netQuantity * currentPrice : null;
@@ -1054,9 +1064,53 @@ export class BotService {
     return positions;
   }
 
+  private binancePrice(symbol: string): Promise<number> {
+    return this.deps.binancePrice ? this.deps.binancePrice(symbol) : getBinancePrice(symbol).then((p) => p.price);
+  }
+
+  /**
+   * A paper bot's cash and positions value. The paper state has two pots seeded with the same starting
+   * balance: Polymarket USDC (`balance`, positions priced on Gamma) and Binance (`binanceBalances`, assets
+   * priced against USDT). Cash is the Polymarket cash plus the Binance USDT change, so a bot trading on one
+   * exchange reads as one balance and a bot trading on both adds both pots' changes. Unpriced assets are left out.
+   */
+  private async paperValue(
+    botId: string,
+    config: { paperBalance?: unknown },
+    rawPositions: ReturnType<BotTradeRepository['getPositions']>
+  ): Promise<{ cashBalance: number; positionsValue: number }> {
+    const paperState = this.deps.storageRepo.get(botId, '__paper_state') as {
+      balance?: number;
+      binanceBalances?: Record<string, number>;
+    } | null;
+    let cashBalance = paperState?.balance ?? (config.paperBalance ? Number(config.paperBalance) : 0);
+
+    const polymarket = rawPositions.filter((p) => p.exchange === 'polymarket' && p.symbol);
+    const binanceBalances = paperState?.binanceBalances;
+    const binanceAssets = Object.entries(binanceBalances ?? {}).filter(([asset, qty]) => asset !== 'USDT' && qty > 0);
+    const [polymarketPrices, binancePrices] = await Promise.all([
+      Promise.allSettled(polymarket.map((p) => fetchCurrentPrice(p.symbol))),
+      Promise.allSettled(binanceAssets.map(([asset]) => this.binancePrice(`${asset}USDT`))),
+    ]);
+
+    let positionsValue = 0;
+    polymarketPrices.forEach((r, i) => {
+      if (r.status === 'fulfilled' && r.value != null) positionsValue += polymarket[i].netQuantity * r.value;
+    });
+    binancePrices.forEach((r, i) => {
+      if (r.status === 'fulfilled') positionsValue += binanceAssets[i][1] * r.value;
+    });
+
+    if (binanceBalances) {
+      const seed = Number(config.paperBalance) > 0 ? Number(config.paperBalance) : DEFAULT_PAPER_BALANCE;
+      cashBalance += (binanceBalances.USDT ?? 0) - seed;
+    }
+    return { cashBalance, positionsValue };
+  }
+
   /** Cash balance, positions value and P&L of one bot */
   async stats(botId: string): Promise<BotStatsView> {
-    const { botRepo, walletRepo, tradeRepo, storageRepo, settingsRepo } = this.deps;
+    const { botRepo, walletRepo, tradeRepo, settingsRepo } = this.deps;
     const botRow = botRepo.findById(botId);
     if (!botRow) throw notFound('Bot not found');
 
@@ -1068,30 +1122,8 @@ export class BotService {
     let pnlAllTime: number | null = null;
 
     if (mode === 'paper') {
-      // Paper mode: read state from bot_storage
-      const paperState = storageRepo.get(botId, '__paper_state') as {
-        balance?: number;
-        positions?: Array<{ tokenId: string; size: number; avgPrice: number }>;
-        binanceBalances?: Record<string, number>;
-      } | null;
-
-      cashBalance = paperState?.balance ?? (config.paperBalance ? Number(config.paperBalance) : 0);
       initialBalance = config.paperBalance ? Number(config.paperBalance) : null;
-
-      // Paper positions value from trade history + Gamma API prices
-      const rawPositions = tradeRepo.getPositions(botId);
-      for (const pos of rawPositions) {
-        if (pos.exchange === 'polymarket' && pos.symbol) {
-          try {
-            const price = await fetchCurrentPrice(pos.symbol);
-            if (price != null) {
-              positionsValue += pos.netQuantity * price;
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+      ({ cashBalance, positionsValue } = await this.paperValue(botId, config, tradeRepo.getPositions(botId)));
 
       const totalValue = cashBalance + positionsValue;
       pnlAllTime = initialBalance != null ? totalValue - initialBalance : null;
@@ -1139,7 +1171,7 @@ export class BotService {
 
   /** Dashboard stats for all bots: totalValue, positionCount and P&L per bot, fetched concurrently */
   async dashboardStats(): Promise<BotDashboardStat[]> {
-    const { botRepo, walletRepo, tradeRepo, storageRepo, settingsRepo } = this.deps;
+    const { botRepo, walletRepo, tradeRepo, settingsRepo } = this.deps;
     const rows = botRepo.findAll({});
     const settings = settingsRepo.get();
 
@@ -1153,33 +1185,11 @@ export class BotService {
         try {
           if (mode === 'paper') {
             const config = JSON.parse(botRow.config || '{}');
-            const paperState = storageRepo.get(botRow.id, '__paper_state') as {
-              balance?: number;
-              positions?: Array<{ tokenId: string; size: number; avgPrice: number }>;
-            } | null;
-
-            const cashBalance = paperState?.balance ?? (config.paperBalance ? Number(config.paperBalance) : 0);
             const initialBalance = config.paperBalance ? Number(config.paperBalance) : null;
-            let positionsValue = 0;
-
             const rawPositions = tradeRepo.getPositions(botRow.id);
             positionCount = rawPositions.length;
 
-            // Fetch prices concurrently for paper positions
-            const priceResults = await Promise.allSettled(
-              rawPositions
-                .filter((p) => p.exchange === 'polymarket' && p.symbol)
-                .map(async (pos) => {
-                  const price = await fetchCurrentPrice(pos.symbol);
-                  return { netQuantity: pos.netQuantity, price };
-                })
-            );
-            for (const pr of priceResults) {
-              if (pr.status === 'fulfilled' && pr.value.price != null) {
-                positionsValue += pr.value.netQuantity * pr.value.price;
-              }
-            }
-
+            const { cashBalance, positionsValue } = await this.paperValue(botRow.id, config, rawPositions);
             totalValue = cashBalance + positionsValue;
             pnlAllTime = initialBalance != null ? totalValue - initialBalance : null;
           } else {

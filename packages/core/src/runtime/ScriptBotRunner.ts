@@ -9,7 +9,7 @@ import type { BotRecord } from '../bots/types';
 import type { WalletManager } from '../bots/WalletManager';
 import { ScriptRunner } from './ScriptRunner';
 import type { LedgerReader, RpcHandlerDeps } from './RpcHandler';
-import { PaperTradingState } from './PaperTradingState';
+import { PaperTradingState, DEFAULT_PAPER_BALANCE } from './PaperTradingState';
 import type { BotStorageRepository } from '../db/repositories/BotStorageRepository';
 import type { BotTradeRepository } from '../db/repositories/BotTradeRepository';
 import type { OrderService } from '../orders/OrderService';
@@ -74,7 +74,7 @@ export interface ScriptBotRunnerDeps {
   copy?: RpcHandlerDeps['copy'];
 }
 
-export const DEFAULT_PAPER_BALANCE = 10_000;
+export { DEFAULT_PAPER_BALANCE };
 
 export class ScriptBotRunner extends BaseBotRunner {
   private scriptRunner: ScriptRunner | null = null;

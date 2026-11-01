@@ -37,6 +37,7 @@ const mockPaperState = {
 
 vi.mock('../../packages/core/src/runtime/PaperTradingState', () => ({
   PaperTradingState: vi.fn().mockImplementation(() => mockPaperState),
+  DEFAULT_PAPER_BALANCE: 10_000,
 }));
 
 import { ScriptBotRunner } from '../../packages/core/src/runtime/ScriptBotRunner';

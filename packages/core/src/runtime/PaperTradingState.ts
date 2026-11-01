@@ -9,6 +9,9 @@ import type { TradeResult, OrderBook, Position, OrderOpts, BinanceTradeResult, B
 
 const STORAGE_KEY = '__paper_state';
 
+/** Starting balance of each paper pot (Polymarket USDC and Binance USDT) when the bot config has no paperBalance */
+export const DEFAULT_PAPER_BALANCE = 10_000;
+
 interface PaperPosition {
   tokenId: string;
   size: number;
