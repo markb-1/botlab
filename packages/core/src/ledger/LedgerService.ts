@@ -662,8 +662,11 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     return result;
   }
 
-  /** Recompute stats for every bucket and apply rights transitions. Short buckets first (medium relaxation). */
-  evaluateRights(): ScorerRunResult['rightsChanges'] {
+  /**
+   * Recompute stats for every bucket (or just `only`) and apply rights transitions. Short buckets first (medium
+   * relaxation).
+   */
+  evaluateRights(only?: { category: string; bucket: HorizonBucket }): ScorerRunResult['rightsChanges'] {
     const changes: ScorerRunResult['rightsChanges'] = [];
     const nowMs = this.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -675,6 +678,8 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
       .sort((a, b) => BUCKET_ORDER.indexOf(a.horizon_bucket) - BUCKET_ORDER.indexOf(b.horizon_bucket));
 
     for (const row of rows) {
+      // A short bucket's state drives the medium relaxation: re-evaluate that category's medium bucket with it
+      if (only && (row.category !== only.category || (row.horizon_bucket !== only.bucket && !(only.bucket === 'short' && row.horizon_bucket === 'medium')))) continue;
       const votes = bucketVotes(groups.get(`${row.category}|${row.horizon_bucket}`) ?? []);
       const shortTrading = this.deps.rightsRepo.get(row.category, 'short')?.state === 'trading';
       const decision = decideRights({
@@ -759,8 +764,23 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     }
 
     if (state === 'auto') {
-      this.deps.rightsRepo.setState(category, bucket, { state: row.state, maxAllocationUsd: row.max_allocation_usd, qualifiedN: row.qualified_n, forced: false, reason: why, at: nowIso, stateChanged: false });
-      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state: 'auto', reason: why }, 'ok');
+      // Back to the rules (Mac test leftover): a forced `trading` never qualified on its own, so it restarts from
+      // shadow; other forced states just lose the force. The rules then run for this bucket at once (a qualified
+      // bucket is promoted again; before, a forced trading bucket kept trading with its allocation until the next
+      // scorer run, and the rules never demote a healthy trading bucket).
+      const resetToShadow = row.forced === 1 && row.state === 'trading';
+      this.deps.rightsRepo.setState(category, bucket, {
+        state: resetToShadow ? 'shadow' : row.state,
+        maxAllocationUsd: resetToShadow ? 0 : row.max_allocation_usd,
+        qualifiedN: resetToShadow ? null : row.qualified_n,
+        forced: false,
+        reason: `human: back to auto: ${why}`,
+        at: nowIso,
+        stateChanged: resetToShadow,
+      });
+      this.deps.audit?.record(actor, 'category_rights.force', `${category}/${bucket}`, { state: 'auto', reason: why, ...(resetToShadow ? { from: 'trading', to: 'shadow' } : {}) }, 'ok');
+      if (resetToShadow) this.auditRightsChange(actor, row, 'shadow', 0, `back to auto (was forced trading): ${why}`, false);
+      this.evaluateRights({ category, bucket });
     } else {
       const alloc = state === 'trading' ? Math.max(row.max_allocation_usd, Math.min(INITIAL_MAX_ALLOCATION_USD, mandate?.budget_usd ?? 0)) : 0;
       const qualifiedN = state === 'trading' ? (row.qualified_n ?? row.n_scored) : row.qualified_n;

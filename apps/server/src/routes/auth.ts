@@ -68,7 +68,7 @@ export class LoginLimiter {
  * Rate-limit key. Normally the client address. A loopback peer is usually a local proxy (`tailscale
  * serve`, the Vite dev server) through which every client arrives from 127.0.0.1: there the session is
  * added when there is one (re-auth, password change), so one browser cannot lock out another; logins
- * through such a proxy share one bucket (documented in the README).
+ * through such a proxy share one bucket (documented in docs/guide/operations.md).
  */
 export function limiterKey(addr: string, sessionId?: string): string {
   return isLoopbackAddress(addr) && sessionId ? `${addr}|${sessionId}` : addr;

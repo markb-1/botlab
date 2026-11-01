@@ -112,6 +112,13 @@ function buildSignedQuery(
 // HTTP helpers
 // ============================================================================
 
+/**
+ * Signed requests never follow a redirect: fetch would forward X-MBX-APIKEY (a custom header) to another
+ * host. A redirect makes the request fail (a thrown TypeError: for an order, an unknown outcome the
+ * Reconciler settles).
+ */
+export const SIGNED_REDIRECT: NonNullable<RequestInit['redirect']> = 'error';
+
 async function publicGet<T>(path: string, params?: Record<string, string | number>): Promise<T> {
   let url = `${BASE_URL}${path}`;
   if (params) {
@@ -137,6 +144,7 @@ async function signedGet<T>(
   const url = `${BASE_URL}${path}?${query}`;
   const resp = await fetch(url, {
     headers: { 'X-MBX-APIKEY': creds.apiKey },
+    redirect: SIGNED_REDIRECT,
   });
   if (!resp.ok) {
     const body = await resp.text();
@@ -157,6 +165,7 @@ async function signedPost<T>(
     resp = await fetch(url, {
       method: 'POST',
       headers: { 'X-MBX-APIKEY': creds.apiKey },
+      redirect: SIGNED_REDIRECT,
     });
   } catch (err) {
     throw new BinanceHttpError(err instanceof Error ? err.message : String(err));
@@ -329,7 +338,7 @@ export type BinanceOrderQuery =
  */
 export async function queryBinanceOrder(creds: BinanceCredentials, symbol: string, clientOrderId: string): Promise<BinanceOrderQuery> {
   const query = buildSignedQuery({ symbol: symbol.toUpperCase(), origClientOrderId: clientOrderId }, creds.apiSecret);
-  const resp = await fetch(`${BASE_URL}/api/v3/order?${query}`, { headers: { 'X-MBX-APIKEY': creds.apiKey } });
+  const resp = await fetch(`${BASE_URL}/api/v3/order?${query}`, { headers: { 'X-MBX-APIKEY': creds.apiKey }, redirect: SIGNED_REDIRECT });
   const text = await resp.text();
   if (!resp.ok) {
     let code: number | undefined;

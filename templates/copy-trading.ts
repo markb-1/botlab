@@ -21,10 +21,12 @@
  *     `max_trade_age_minutes` are not copied.
  *   - Off unless `copy` is in mandate.strategies.allow: without it no buys (sells still mirror to unwind).
  *   - Market filters (buys only): the market must pass the mandate (ctx.risk.getMandateSummary: category allowed,
- *     liquidity, settlement horizon, assessed ambiguity ≤ max), have no dispute and no rules change in the last 24 h,
- *     and not be inside the Position Manager's exit window (ctx.risk.getExitPolicy) or at its ambiguity exit score.
- *     A token with an open exit flag, or one the Position Manager sold (placedBy) in the last `pm_cooldown_days`, is
- *     not bought again.
+ *     24h volume ≥ min_liquidity_usd — MarketDetail.volume24hUsd, the measure the risk engine uses —, settlement
+ *     horizon, assessed ambiguity ≤ max), have no dispute and no rules change in the last 24 h, and not be inside
+ *     the Position Manager's exit window (ctx.risk.getExitPolicy) or at its ambiguity exit score.
+ *     A token with an open exit flag on any bot's position (ctx.risk.getFlaggedTokens), one the Position Manager
+ *     sold for this bot (placedBy) in the last `pm_cooldown_days`, or one it stopped out of on any bot's position
+ *     in that window (ctx.risk.getRecentStops), is not bought again.
  *   - Leaders: the server scores each leader's copies (copy_leaders; ctx.copy.getLeaders) and drops one whose last 20
  *     closed copied trades lost money with a hit rate under 50 % (audited + Telegram). A dropped leader is not copied
  *     again (its sells are still mirrored to unwind); only a human re-activates it. Orders carry the leader
@@ -458,7 +460,9 @@ export function marketSkipReason(m: MarketDetail | null, mandate: MandateSummary
   if (!mandate) return 'mandate unavailable (config invalid)';
   if (!mandate.strategiesAllow.includes('copy')) return 'copy is not in mandate.strategies.allow (copy trading is off)';
   if (!mandate.categoriesAllow.includes(m.category)) return `category ${m.category} not allowed by the mandate`;
-  if (m.liquidityUsd === null || m.liquidityUsd < mandate.minLiquidityUsd) return `liquidity ${m.liquidityUsd ?? 'unknown'} < ${mandate.minLiquidityUsd}`;
+  // The same measure as the risk engine and the ledger: Gamma 24h volume (limits.yaml min_liquidity_usd), Mac test F5
+  const volume = typeof m.volume24hUsd === 'number' ? m.volume24hUsd : null;
+  if (volume === null || volume < mandate.minLiquidityUsd) return `24h volume ${volume ?? 'unknown'} < ${mandate.minLiquidityUsd} (min_liquidity_usd)`;
   if (m.ambiguityScore === null) return 'market not assessed for ambiguity (buys are refused)';
   if (m.ambiguityScore > mandate.maxAmbiguityScore) return `ambiguity ${m.ambiguityScore} > mandate max ${mandate.maxAmbiguityScore}`;
   if (m.ambiguityScore >= policy.ambiguityExitScore) return `ambiguity ${m.ambiguityScore} ≥ Position Manager exit score`;
@@ -567,6 +571,12 @@ export async function runCopyCycle(ctx: BotContext): Promise<CopyCycleResult> {
   const mandate = await ctx.risk.getMandateSummary();
   const policy = await ctx.risk.getExitPolicy();
   const flags = await ctx.risk.getExitFlags();
+  // Flags and stops on any bot's position in this mode (server-side; older servers: own flags / history only)
+  const flaggedAnywhere = new Set<string>(typeof ctx.risk.getFlaggedTokens === 'function' ? (await ctx.risk.getFlaggedTokens()).map((f) => f.tokenId) : []);
+  const stopsAnywhere = new Map<string, number>();
+  if (typeof ctx.risk.getRecentStops === 'function') {
+    for (const st of await ctx.risk.getRecentStops()) stopsAnywhere.set(st.tokenId, Date.parse(st.stoppedAt));
+  }
   const history = await ctx.polymarket.getOrderHistory(30);
   const state = await loadState(ctx);
   const day = new Date(now).toISOString().slice(0, 10);
@@ -692,13 +702,17 @@ export async function runCopyCycle(ctx: BotContext): Promise<CopyCycleResult> {
         skip('leader trades both sides of the market (market making)', t, leader);
         continue;
       }
-      if (flags.some((f) => f.tokenId === t.tokenId)) {
+      if (flags.some((f) => f.tokenId === t.tokenId) || flaggedAnywhere.has(t.tokenId)) {
         skip('exit flag open on the token', t, leader);
         continue;
       }
       const cooldownFrom = now - cfg.pmCooldownDays * DAY_MS;
       if (history.some((h) => h.placedBy && h.side === 'sell' && h.tokenId === t.tokenId && Date.parse(h.createdAt) >= cooldownFrom)) {
         skip('the Position Manager sold this token recently', t, leader);
+        continue;
+      }
+      if ((stopsAnywhere.get(t.tokenId) ?? -Infinity) >= cooldownFrom) {
+        skip('the Position Manager stopped out of this token recently (any bot)', t, leader);
         continue;
       }
       if (!markets.has(t.tokenId)) {

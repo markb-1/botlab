@@ -10,15 +10,21 @@
  *      tick grid, never at or through the best ask (post-only); edge = p − bid − maker fee ≥ min_edge.
  *      This bot's own resting bids are left out of the book first (it never outbids itself). Quotes below
  *      `min_edge_per_day` (keep equal to the Position Manager's `min_hold_edge_per_day`) are skipped, and so is
- *      a token the Position Manager stopped out of until its forecast is renewed.
- *   2. Ranked by edge per day = edge / max(days to settlement, 1) (spec §3.4); at most `max_markets` markets.
+ *      a token the Position Manager stopped out of (on any bot's position in this mode, ctx.risk.getRecentStops)
+ *      until its forecast is renewed, and a forecast whose token or complement has an open exit flag on any
+ *      bot's position (ctx.risk.getFlaggedTokens): its bids there are cancelled.
+ *   2. Ranked by edge per day = edge / max(days to settlement, 1) (spec §3.4); at most `max_markets` markets,
+ *      and no more than the per-bot order rate can keep quoted (ctx.risk.getBudget().ordersPerHour: each quoted
+ *      market costs about 60 / (bid_ttl_minutes − refresh window) + 1 orders per hour).
  *   3. Size = kelly_fraction × Kelly × bucket allocation, Kelly = (p − c) / (1 − c) at cost c = bid + fee;
  *      capped by max_per_market_usd (minus what this bot already holds or bids in the market), the risk
  *      budget (remaining allocation and per-market room) and what is left after better-ranked candidates.
  *   4. Orders that still match (same token and forecast, at or above the best competing bid and within
- *      fair − min_edge, similar size, not about to expire) are kept;
- *      every other buy of this bot is cancelled (forecast superseded / withdrawn / no longer tradeable, edge
- *      gone, budget gone); missing ones are placed, tagged with the forecastId and a reason.
+ *      fair − min_edge, similar size, more than min(5 min, bid_ttl_minutes / 2) of life left) are kept; bids
+ *      rest for `bid_ttl_minutes` (default 60) and are re-placed only near expiry or when the price / size
+ *      must change; every other buy of this bot is cancelled (forecast superseded / withdrawn / no longer
+ *      tradeable, edge gone, budget gone, exit flag); missing ones are placed, tagged with the forecastId and
+ *      a reason, at most as many as `ordersRemainingThisHour` allows (best ranked first).
  * The best edge per day it could not fund is stored (`executor:demand`) for the Position Manager's low-edge exit.
  * The server re-checks every order (RiskEngine: edge ≥ 0.03 floor, category rights, exposure caps). The
  * executor never sells: exits belong to the Position Manager. It only cancels its own BUY orders.
@@ -58,6 +64,14 @@ export const meta = {
         default: 10,
         minimum: 1,
         maximum: 120,
+      },
+      bid_ttl_minutes: {
+        type: 'number',
+        title: 'Bid lifetime (minutes)',
+        description: 'Resting bids expire after this (GTD) and are re-placed shortly before; longer = fewer orders against max_orders_per_hour',
+        default: 60,
+        minimum: 3,
+        maximum: 240,
       },
       max_per_market_usd: {
         type: 'number',
@@ -106,6 +120,7 @@ export interface ExecutorConfig {
   maxPerMarketUsd: number;
   maxMarkets: number;
   minEdgePerDay: number;
+  bidTtlMinutes: number;
 }
 
 /**
@@ -126,7 +141,32 @@ export function executorConfig(raw: Record<string, any>): ExecutorConfig {
     maxPerMarketUsd: Math.max(num(raw.max_per_market_usd, 25), 0),
     maxMarkets: Math.max(Math.floor(num(raw.max_markets, 10)), 1),
     minEdgePerDay: Math.max(num(raw.min_edge_per_day, DEFAULT_MIN_EDGE_PER_DAY), 0),
+    bidTtlMinutes: Math.max(num(raw.bid_ttl_minutes, DEFAULT_BID_TTL_MINUTES), 3),
   };
+}
+
+/** Default resting-bid lifetime (Mac test F1: 2 × requote_minutes cost 3 orders per market per hour) */
+export const DEFAULT_BID_TTL_MINUTES = 60;
+/** A resting bid is re-placed once this little of its life is left (min(5 min, half the TTL)) */
+export function refreshWindowMs(cfg: Pick<ExecutorConfig, 'bidTtlMinutes'>): number {
+  return Math.min(5, cfg.bidTtlMinutes / 2) * 60_000;
+}
+
+/** Bid lifetime actually used: bid_ttl_minutes capped by the server's resting-order TTL (when known), at least 3. */
+export function effectiveBidTtl(cfg: Pick<ExecutorConfig, 'bidTtlMinutes'>, maxRestingTtlMinutes: number | null | undefined): number {
+  const cap = typeof maxRestingTtlMinutes === 'number' && Number.isFinite(maxRestingTtlMinutes) ? maxRestingTtlMinutes : Infinity;
+  return Math.max(Math.min(cfg.bidTtlMinutes, cap), 3);
+}
+
+/**
+ * Markets the per-bot order rate can keep quoted: each costs about one re-placement per (TTL − refresh window)
+ * plus one re-price an hour. Infinity when the rate is unknown.
+ */
+export function sustainableMarkets(cfg: Pick<ExecutorConfig, 'bidTtlMinutes'>, ordersPerHour: number | null | undefined): number {
+  if (typeof ordersPerHour !== 'number' || !Number.isFinite(ordersPerHour)) return Infinity;
+  const lifeMinutes = Math.max(cfg.bidTtlMinutes - refreshWindowMs(cfg) / 60_000, 1);
+  const perMarket = 60 / lifeMinutes + 1;
+  return Math.max(Math.floor(ordersPerHour / perMarket), 1);
 }
 
 const round6 = (n: number): number => Math.round(n * 1e6) / 1e6;
@@ -322,9 +362,9 @@ export function allocatePlan(
 /**
  * An open buy is kept (no re-quote, so the bot never steps over its own bid) while it is on the same token and
  * forecast, still at or above the best competing bid and at most the highest price leaving min_edge, with a
- * similar USD size (± 15 %, at least $1) and enough life left.
+ * similar USD size (± 15 %, at least $1) and more than `refreshMs` of life left.
  */
-export function keeps(order: OpenOrder, plan: PlannedOrder, now: number, requoteMinutes: number): boolean {
+export function keeps(order: OpenOrder, plan: PlannedOrder, now: number, refreshMs: number): boolean {
   const remaining = order.size - order.filledSize;
   const expiresAt = order.expiresAt ? Date.parse(order.expiresAt) : Infinity;
   return (
@@ -333,7 +373,7 @@ export function keeps(order: OpenOrder, plan: PlannedOrder, now: number, requote
     (plan.competingBid === null || order.price >= plan.competingBid - 1e-9) &&
     order.price <= plan.maxPrice + 1e-9 &&
     Math.abs(remaining * order.price - plan.usd) <= Math.max(plan.usd * 0.15, 1) &&
-    expiresAt - now > (requoteMinutes + 1) * 60_000
+    expiresAt - now > refreshMs
   );
 }
 
@@ -355,7 +395,10 @@ export function withoutOwnBids(book: OrderBook, own: OpenOrder[]): OrderBook {
   return { ...book, bids };
 }
 
-/** Tokens the Position Manager stopped out of (its exits with reason "position manager: stop…"), latest time each. */
+/**
+ * Tokens the Position Manager stopped out of (its exits with reason "position manager: stop…"), latest time each,
+ * from this bot's own order history: the fallback when ctx.risk.getRecentStops (any bot, server-side) is missing.
+ */
 export function stoppedTokens(history: OrderHistoryEntry[]): Map<string, number> {
   const out = new Map<string, number>();
   for (const h of history) {
@@ -373,15 +416,24 @@ export interface CycleResult {
   cancelled: number;
   planned: PlannedOrder[];
   unmetEdgePerDay: number | null;
+  /** Plans not placed because the hourly order budget ran out */
+  deferred: number;
+  /** When the earliest kept / placed bid enters its refresh window (the next cycle is due then at the latest); null if none */
+  refreshAt: number | null;
 }
 
 export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   const cfg = executorConfig(ctx.config);
   const now = ctx.now;
-  const result: CycleResult = { placed: 0, kept: 0, cancelled: 0, planned: [], unmetEdgePerDay: null };
+  const result: CycleResult = { placed: 0, kept: 0, cancelled: 0, planned: [], unmetEdgePerDay: null, deferred: 0, refreshAt: null };
+  // Effective bid lifetime set below, once the server's resting-order cap is known
+  let refreshMs = refreshWindowMs(cfg);
 
   const open = (await ctx.polymarket.getOpenOrders()).filter((o) => o.side === 'buy' && o.exchange === 'polymarket' && !o.placedBy);
   const budget = await ctx.risk.getBudget();
+  // The server caps GTD lifetimes at limits.yaml orders.resting_order_ttl_minutes: plan with the effective TTL
+  const ttlCfg = { ...cfg, bidTtlMinutes: effectiveBidTtl(cfg, budget.maxRestingTtlMinutes) };
+  refreshMs = refreshWindowMs(ttlCfg);
   if (budget.halted) {
     // Halted: the server refuses orders and cancels resting ones; drop ours too
     for (const o of open) {
@@ -416,11 +468,30 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
     if (m) marketUsed[m] = (marketUsed[m] ?? 0) + p.size * p.avgPrice;
   }
 
-  // After a stop by the Position Manager a token is skipped until its forecast is renewed (R166 amended)
-  const stops = stoppedTokens(await ctx.polymarket.getOrderHistory(30));
+  // After a stop by the Position Manager (on any bot's position in this mode) a token is skipped until its forecast
+  // is renewed (R166 amended, Mac test F4); without the server call, this bot's own history
+  const stops = new Map<string, number>();
+  if (typeof ctx.risk.getRecentStops === 'function') {
+    for (const s of await ctx.risk.getRecentStops()) {
+      const at = Date.parse(s.stoppedAt);
+      if (Number.isFinite(at)) stops.set(s.tokenId, at);
+    }
+  } else {
+    for (const [t, at] of stoppedTokens(await ctx.polymarket.getOrderHistory(30))) stops.set(t, at);
+  }
+  // Tokens (and markets) with an open exit flag on any bot's position: never buy what the manager must sell (F3)
+  const flaggedTokens = new Set<string>();
+  const flaggedMarkets = new Set<string>();
+  if (typeof ctx.risk.getFlaggedTokens === 'function') {
+    for (const f of await ctx.risk.getFlaggedTokens()) {
+      flaggedTokens.add(f.tokenId);
+      if (f.marketId) flaggedMarkets.add(f.marketId);
+    }
+  }
 
   const quotes: Quote[] = [];
   for (const f of forecasts) {
+    if (flaggedMarkets.has(f.marketId) || flaggedTokens.has(f.tokenId) || (f.complementTokenId && flaggedTokens.has(f.complementTokenId))) continue;
     const sides: Array<{ tokenId: string; fair: number }> = [{ tokenId: f.tokenId, fair: f.probability }];
     if (f.complementTokenId) sides.push({ tokenId: f.complementTokenId, fair: 1 - f.probability });
     const days = daysToSettlement(f, now);
@@ -456,7 +527,9 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
     }
   }
 
-  const plan = allocatePlan(quotes, cfg, available, marketUsed);
+  // No more markets than the hourly order rate can keep quoted (F1)
+  const sustainable = sustainableMarkets(ttlCfg, budget.ordersPerHour);
+  const plan = allocatePlan(quotes, { ...cfg, maxMarkets: Math.min(cfg.maxMarkets, sustainable) }, available, marketUsed);
   const planned = plan.orders;
   result.planned = planned;
   result.unmetEdgePerDay = plan.unmetEdgePerDay;
@@ -467,10 +540,12 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   const kept = new Set<string>();
   const covered = new Set<number>();
   for (const o of open) {
-    const i = planned.findIndex((p, idx) => !covered.has(idx) && keeps(o, p, now, cfg.requoteMinutes));
+    const i = planned.findIndex((p, idx) => !covered.has(idx) && keeps(o, p, now, refreshMs));
     if (i >= 0) {
       covered.add(i);
       kept.add(o.orderId);
+      const exp = o.expiresAt ? Date.parse(o.expiresAt) : NaN;
+      if (Number.isFinite(exp)) result.refreshAt = Math.min(result.refreshAt ?? Infinity, exp - refreshMs);
     }
   }
   for (const o of open) {
@@ -484,18 +559,29 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
   }
   result.kept = kept.size;
 
-  const ttlMinutes = Math.max(3, Math.ceil(cfg.requoteMinutes * 2 + 2));
+  const ttlMinutes = Math.max(3, Math.round(ttlCfg.bidTtlMinutes));
+  // Hourly order budget (own submissions; rejections and Position Manager exits do not count)
+  let ordersLeft = typeof budget.ordersRemainingThisHour === 'number' ? budget.ordersRemainingThisHour : Infinity;
   for (let i = 0; i < planned.length; i++) {
     if (covered.has(i)) continue;
     const p = planned[i];
+    if (ordersLeft <= 0) {
+      result.deferred++;
+      continue;
+    }
+    ordersLeft--;
     const r = await ctx.polymarket.placeLimit(p.tokenId, 'buy', p.price, p.size, {
       postOnly: true,
       ttlMinutes,
       forecastId: p.forecastId,
       reason: `executor: fair edge ${p.edge.toFixed(3)} (${p.edgePerDay.toFixed(4)}/day)`,
     });
-    if (r.ok) result.placed++;
-    else ctx.log.info(`executor: bid ${p.size} @ ${p.price} on ${p.tokenId} not placed: ${r.error ?? r.status}`);
+    if (r.ok) {
+      result.placed++;
+      // The server's expiry (it may have capped the TTL), else what was asked for
+      const exp = r.expiresAt ? Date.parse(r.expiresAt) : NaN;
+      result.refreshAt = Math.min(result.refreshAt ?? Infinity, (Number.isFinite(exp) ? exp : now + ttlMinutes * 60_000) - refreshMs);
+    } else ctx.log.info(`executor: bid ${p.size} @ ${p.price} on ${p.tokenId} not placed: ${r.error ?? r.status}`);
   }
   return result;
 }
@@ -505,10 +591,13 @@ export async function runExecutorCycle(ctx: BotContext): Promise<CycleResult> {
 let lastRunAt = 0;
 let dirty = true;
 let running = false;
+/** The earliest resting bid's refresh time: a cycle runs then even between re-quotes */
+let refreshAt: number | null = null;
 
 export async function onStart(ctx) {
   lastRunAt = 0;
   dirty = true;
+  refreshAt = null;
   const wake = () => {
     dirty = true;
   };
@@ -516,19 +605,23 @@ export async function onStart(ctx) {
   ctx.events.on('rules_changed', wake);
   ctx.events.on('halt', wake);
   const cfg = executorConfig(ctx.config);
-  ctx.log.info(`Forecast executor started: min_edge ${cfg.minEdge}, kelly ${cfg.kellyFraction}, re-quote ${cfg.requoteMinutes} min, max ${cfg.maxMarkets} markets`);
+  ctx.log.info(`Forecast executor started: min_edge ${cfg.minEdge}, kelly ${cfg.kellyFraction}, re-quote ${cfg.requoteMinutes} min, bids rest ${cfg.bidTtlMinutes} min, max ${cfg.maxMarkets} markets`);
 }
 
 export async function onTick(ctx) {
   const cfg = executorConfig(ctx.config);
   if (running) return;
-  if (!dirty && ctx.now - lastRunAt < cfg.requoteMinutes * 60_000) return;
+  const refreshDue = refreshAt !== null && ctx.now >= refreshAt;
+  if (!dirty && !refreshDue && ctx.now - lastRunAt < cfg.requoteMinutes * 60_000) return;
   running = true;
   dirty = false;
   try {
     const r = await runExecutorCycle(ctx);
     lastRunAt = ctx.now;
-    if (r.placed || r.cancelled) ctx.log.info(`executor: ${r.planned.length} quotes, placed ${r.placed}, kept ${r.kept}, cancelled ${r.cancelled}`);
+    refreshAt = r.refreshAt;
+    if (r.placed || r.cancelled || r.deferred) {
+      ctx.log.info(`executor: ${r.planned.length} quotes, placed ${r.placed}, kept ${r.kept}, cancelled ${r.cancelled}${r.deferred ? `, ${r.deferred} deferred (hourly order budget)` : ''}`);
+    }
   } finally {
     running = false;
   }

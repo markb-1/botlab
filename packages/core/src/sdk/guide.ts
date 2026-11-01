@@ -42,7 +42,10 @@ caps, category rights and the monthly budget; every tool call is in the audit lo
 - \`submit_forecast\`: probability (0.01–0.99) that the token resolves YES, rationale (markdown, ≤ 4000 chars),
   sources (URLs) and an ambiguity score 0–3. The server captures the market price itself; a forecast on a token
   supersedes the previous one (at most once per 6 h; withdrawing is always allowed). Markets must be open, have
-  24h volume ≥ the mandate minimum, a two-sided book with spread ≤ 0.10 and end in 6 h – 90 days.
+  24h volume ≥ the mandate minimum (\`min_liquidity_usd\` is **24h volume**, not order-book liquidity), a
+  two-sided book with spread ≤ 0.10 and end in 6 h – 90 days. Few in-mandate markets clear the default $5,000 of
+  24h volume (a handful on the 2026-10-31 test): an empty or short scan is expected; do not lower your standards
+  to fill it, and only the human can change the threshold.
 - Ambiguity (spec §7.4): 0 objective source, clear criteria, fixed date · 1 clear but one reporting source or a
   term to interpret · 2 several reasonable readings / "consensus of credible reporting" · 3 clarifications issued,
   active dispute or criteria likely contested. The server raises it to ≥ 2 for 7 days after a rules change and on
@@ -165,7 +168,7 @@ copy bots are paper bots like any other and not market-scoped (no \`marketIds\`)
   moved beyond (never chased); sells mirror the fraction of their position the leader sold, applied only to what the
   bot bought copying **that** leader (a sell by leader B never sells shares bought copying leader A; positions without
   attribution — bought before 5c — use the whole holding). Buys only in markets that
-  pass the mandate (category, liquidity, horizon, **assessed** ambiguity), outside the Position Manager's exit window,
+  pass the mandate (category, 24h volume ≥ \`min_liquidity_usd\`, horizon, **assessed** ambiguity), outside the Position Manager's exit window,
   without an exit flag and not sold by the Position Manager recently — so \`assess_market\` the leaders' markets you
   want copied.
 - Scoring: \`get_copy_leaders(botId)\` → per leader: status, orders copied, closed / open copied trades, hit rate,
@@ -244,11 +247,16 @@ a status object. Use \`ctx.now\` instead of \`Date.now()\` (it is the candle / s
   orders that act on a forecast (edge check against it; on the complement token the server uses 1 − p).
 - Events: \`ctx.events.on('forecast_changed' | 'rules_changed' | 'halt', handler)\` — pushed by the server as hints to
   re-check now; always re-read the current state (they are not replayed after a restart).
-- Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted; \`ctx.risk.getExitFlags()\` → open
-  exit flags on this bot's positions; \`ctx.risk.getExitPolicy()\` → the Position Manager's exit window and ambiguity
+- Risk: \`ctx.risk.getBudget()\` → remaining allocation, per-market room, halted, and \`ordersPerHour\` /
+  \`ordersRemainingThisHour\` (\`max_orders_per_hour\` counts only orders the bot itself submitted; after 6 risk
+  rejections in 10 minutes its own submissions pause briefly — \`rejection_cooldown\` — so do not retry refused
+  orders in a loop); \`ctx.risk.getExitFlags()\` → open exit flags on this bot's positions;
+  \`ctx.risk.getFlaggedTokens()\` → tokens with an open exit flag on **any** bot's position in this mode (do not buy
+  them or their complement); \`ctx.risk.getRecentStops(tokenId?)\` → the Position Manager's stops in this mode over 30
+  days, any bot (do not re-buy a stopped token until its forecast is renewed); \`ctx.risk.getExitPolicy()\` → the Position Manager's exit window and ambiguity
   exit score (from its config) — do not buy what it would sell at once; \`ctx.risk.getMandateSummary()\` → the
-  mandate's market filters (allowed categories, horizons, minimum liquidity, maximum ambiguity; null when the config is
-  invalid). \`ctx.polymarket.getEventMarketIds(eventId)\` lists every market of an event.
+  mandate's market filters (allowed categories, horizons, minimum 24h volume — compare \`MarketDetail.volume24hUsd\`, not \`liquidityUsd\` —, maximum ambiguity;
+  null when the config is invalid). \`ctx.polymarket.getEventMarketIds(eventId)\` lists every market of an event.
 - \`ctx.copy.getLeaders(addresses)\` — builtin Copy Trading template only: each leader's status (active / dropped).
 - \`ctx.requestRetire(reason)\` retires this bot (terminal; the server stops it right after) — for per-opportunity
   bots whose opportunity is over.

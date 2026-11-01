@@ -231,6 +231,13 @@ export class PositionExitFlagRepository {
       | undefined;
   }
 
+  /** Open flags in one mode (paper / live), newest first (ctx.risk.getFlaggedTokens). */
+  listOpen(simulated: boolean): PositionExitFlagRow[] {
+    return this.db
+      .prepare("SELECT * FROM position_exit_flags WHERE status = 'open' AND simulated = ? ORDER BY created_at DESC")
+      .all(simulated ? 1 : 0) as PositionExitFlagRow[];
+  }
+
   list(filter: { status?: string; limit?: number } = {}): PositionExitFlagRow[] {
     const n = Math.min(Math.max(Math.floor(filter.limit ?? 200), 1), 1000);
     return filter.status

@@ -293,7 +293,7 @@ export class AgentScheduler {
     this.warnedConfig = state;
     if (state === 'nokey') {
       console.warn(
-        '[Agent] WARNING: agent.enabled is true in server.yaml but ANTHROPIC_API_KEY is not set: no agent runs are scheduled. Set it in the server environment (README "Running the agent").'
+        '[Agent] WARNING: agent.enabled is true in server.yaml but ANTHROPIC_API_KEY is not set: no agent runs are scheduled. Set it in the server environment (docs/guide/agent.md, "Running the agent").'
       );
     } else if (state === 'ok') {
       this.log(`[Agent] Scheduled agent enabled (${server!.agent.model}); next: ${this.status().nextRuns[0]?.local ?? 'none'}`);

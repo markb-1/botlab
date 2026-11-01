@@ -54,6 +54,28 @@ const EXPIRY_GRACE_MS = 60_000;
 const OPEN_STATUSES: OrderStatus[] = ['submitted', 'open', 'partially_filled'];
 /** Used when the book does not report a tick size; 0.01 multiples are valid on finer ticks too */
 const DEFAULT_TICK = 0.01;
+/**
+ * Rejection cooldown (Mac test F1): a bot whose own orders were refused by the risk checks this many times within
+ * the window has its own new submissions refused (`rejection_cooldown`, not counted as rejections themselves)
+ * until the oldest of them leaves the window. Orders another bot places for it (Position Manager exits) are exempt.
+ */
+export const REJECTION_COOLDOWN_COUNT = 6;
+export const REJECTION_COOLDOWN_WINDOW_MS = 10 * MS_PER_MINUTE;
+/**
+ * Refusals that say nothing about the bot (system-wide states, outages, the cooldown itself): not counted by the
+ * cooldown.
+ */
+export const COOLDOWN_IGNORED_CHECKS: readonly RiskCheckName[] = [
+  'rejection_cooldown',
+  'clock_skew',
+  'clock_unverified',
+  'live_disabled',
+  'market_data_unavailable',
+  'market_data',
+  'state_invalid',
+  'global_halt',
+  'exchange_enabled',
+];
 /** USD-quoted Binance pairs; anything else has no USD notional and is rejected */
 const BINANCE_USD_QUOTES = ['USDT', 'USDC', 'FDUSD'];
 
@@ -437,6 +459,13 @@ export class OrderService {
     }
     const unavailable = this.polymarketUnavailable();
     if (unavailable) return invalid(unavailable);
+    const cooling = this.cooldownGate(input, {
+      exchange: 'polymarket', tokenId: input.tokenId, side: input.side, orderType: 'market',
+      price: input.side === 'buy' ? (input.maxPrice ?? 0) : (input.minPrice ?? 0),
+      size: input.side === 'sell' ? input.amount : 0,
+      notionalUsd: input.side === 'buy' ? input.amount : 0,
+    });
+    if (cooling) return cooling;
 
     await this.syncOpenOrders();
     const ctx = await this.polymarketContext(input.tokenId);
@@ -491,6 +520,11 @@ export class OrderService {
     // The config minimum is GTD_MIN_TTL_MINUTES too; max() guards an older in-memory config
     const ttl = Math.max(Math.min(input.ttlMinutes ?? maxTtl, maxTtl), GTD_MIN_TTL_MINUTES);
     const postOnly = input.postOnly !== false;
+    const cooling = this.cooldownGate(input, {
+      exchange: 'polymarket', tokenId: input.tokenId, side: input.side, orderType: 'limit',
+      price: input.price, size: input.size, notionalUsd: input.price * input.size,
+    });
+    if (cooling) return cooling;
 
     await this.syncOpenOrders();
     const ctx = await this.polymarketContext(input.tokenId);
@@ -679,6 +713,72 @@ export class OrderService {
     return after;
   }
 
+  /**
+   * Rejection cooldown gate, at the entry of every place method (before any order sync or book read): null when the
+   * bot may submit. While cooling down, the refusal is stored (one `rejected_risk` row with `rejection_cooldown` and
+   * one audit entry per cooldown episode, not one per attempt) and returned. Orders placed for the bot by another
+   * bot and risk exits never wait.
+   */
+  private cooldownGate(
+    intent: OrderIntentOpts,
+    order: { exchange: Exchange; tokenId: string; side: OrderSide; orderType: 'limit' | 'market'; price: number; size: number; notionalUsd: number }
+  ): OrderResult | null {
+    if (intent.placedBy || intent.riskExit) return null;
+    const now = this.now();
+    const repo = this.deps.orderRepo;
+    const times = repo.ownRejectionTimesSince(
+      this.bot.botId,
+      new Date(now - REJECTION_COOLDOWN_WINDOW_MS).toISOString(),
+      this.paper,
+      COOLDOWN_IGNORED_CHECKS
+    );
+    if (times.length < REJECTION_COOLDOWN_COUNT) return null;
+    // Free again once fewer than COUNT rejections remain in the window
+    const until = Date.parse(times[times.length - REJECTION_COOLDOWN_COUNT]) + REJECTION_COOLDOWN_WINDOW_MS;
+    const seconds = Math.max(Math.ceil((until - now) / 1000), 1);
+    const detail = `${times.length} risk rejections in the last ${REJECTION_COOLDOWN_WINDOW_MS / MS_PER_MINUTE} min: new orders paused for ${seconds} s`;
+    const result: OrderResult = {
+      ok: false,
+      orderId: null,
+      status: 'rejected_risk',
+      filledSize: 0,
+      avgFillPrice: null,
+      filledNotionalUsd: 0,
+      feeUsd: 0,
+      expiresAt: null,
+      failedCheck: 'rejection_cooldown',
+      error: `Risk check failed: ${detail}`,
+    };
+    // This episode began with the latest counted rejection: one stored refusal per episode
+    if (repo.hasRejectionSince(this.bot.botId, times[times.length - 1], this.paper, 'rejection_cooldown')) return result;
+    const decision = preDecision('rejection_cooldown', detail, now);
+    const row = repo.create({
+      botId: this.bot.botId,
+      exchange: order.exchange,
+      marketId: '',
+      tokenId: order.tokenId,
+      side: order.side,
+      orderType: order.orderType,
+      price: dbNum(order.price),
+      size: dbNum(order.size),
+      notionalUsd: dbNum(order.notionalUsd),
+      status: 'rejected_risk',
+      riskDecision: decision,
+      reason: typeof intent.reason === 'string' ? intent.reason.slice(0, 500) : null,
+      forecastId: intent.forecastId ?? null,
+      simulated: this.paper,
+    });
+    logger.warning(`[OrderService] ${this.bot.botName}: own orders paused (rejection_cooldown): ${detail}`);
+    this.deps.audit?.record(
+      `bot:${this.bot.botId}`,
+      'order.rejected',
+      row.id,
+      { exchange: order.exchange, tokenId: order.tokenId, side: order.side, failedCheck: 'rejection_cooldown', reason: detail, simulated: this.paper },
+      'rejected_risk'
+    );
+    return { ...result, orderId: row.id };
+  }
+
   private async lookupForecast(forecastId: string, tokenId: string): Promise<ForecastEdgeInfo | null> {
     try {
       return await (this.deps.forecasts ?? NoForecastSource).get(forecastId, tokenId);
@@ -732,7 +832,8 @@ export class OrderService {
         simulated: this.paper,
         placedBy: intent.placedBy ?? null,
       });
-      if (!decision.allowed) {
+      // Cooldown refusals are recorded and audited but not notified again (the burst before them already counted)
+      if (!decision.allowed && decision.failedCheck !== 'rejection_cooldown') {
         try {
           this.deps.events?.orderRejected({
             botId: order.botId,
@@ -744,6 +845,8 @@ export class OrderService {
         } catch (err) {
           logger.error(`[OrderService] Rejection notification failed: ${err instanceof Error ? err.message : err}`);
         }
+      }
+      if (!decision.allowed) {
         logger.warning(
           `[OrderService] ${this.bot.botName}: ${order.side} ${order.tokenId} rejected (${decision.failedCheck}): ${decision.reason}`
         );
@@ -873,6 +976,11 @@ export class OrderService {
     if (input.side !== 'buy' && input.side !== 'sell') return invalid('side must be buy or sell');
     if (!finite(input.amount) || input.amount <= 0) return invalid('amount must be a positive number');
     const symbol = input.symbol.toUpperCase();
+    const cooling = this.cooldownGate(input, {
+      exchange: 'binance', tokenId: symbol, side: input.side, orderType: 'market', price: 0,
+      size: input.side === 'sell' ? input.amount : 0, notionalUsd: input.side === 'buy' ? input.amount : 0,
+    });
+    if (cooling) return cooling;
 
     let book: BinanceOrderBook | null = null;
     try {
@@ -1236,15 +1344,32 @@ export class OrderService {
     return info ? this.deps.fees.ratesFor(info.feeSchedule, this.deps.fees.feeCategoryFor(info.labels)) : this.deps.fees.getRates(null);
   }
 
+  /**
+   * ctx.risk.getRecentStops(): latest Position Manager stop per token in this bot's mode over the last 30 days,
+   * on any bot's position (Mac test F4: the stop marker must not live in one executor's own history).
+   */
+  getRecentStops(tokenId?: string): Array<{ tokenId: string; stoppedAt: string }> {
+    const since = new Date(this.now() - 30 * 24 * 3_600_000).toISOString();
+    return this.deps.orderRepo.recentStops(this.paper, since, tokenId).map((r) => ({ tokenId: r.token_id, stoppedAt: r.stopped_at }));
+  }
+
   /** ctx.risk.getBudget(): what this bot can still add before limits bite. */
   async getBudget(): Promise<RiskBudget> {
     const { provider, riskEngine } = this.deps;
     const bot = provider.getBotInfo(this.bot.botId);
     const global = provider.isGloballyHalted();
-    if (!bot) return { remainingAllocation: 0, remainingMarket: {}, halted: true };
+    const limits0 = riskEngine.getConfig().limits;
+    const ordersPerHour = limits0.per_bot_defaults.max_orders_per_hour;
+    const ordersLastHour = this.deps.orderRepo.countByBotSince(this.bot.botId, new Date(this.now() - 3_600_000).toISOString(), this.paper);
+    const orders = {
+      ordersPerHour,
+      ordersRemainingThisHour: Math.max(ordersPerHour - ordersLastHour, 0),
+      maxRestingTtlMinutes: limits0.orders.resting_order_ttl_minutes,
+    };
+    if (!bot) return { remainingAllocation: 0, remainingMarket: {}, halted: true, ...orders };
 
     const exposure = provider.computeExposure(this.bot.botId);
-    const limits = riskEngine.getConfig().limits;
+    const limits = limits0;
     const liveStage = bot.stage === 'probation' || bot.stage === 'full';
     const allocation = liveStage ? riskEngine.effectiveAllocation(bot, 'polymarket') : 0;
     const cash = await provider.getCash('polymarket');
@@ -1262,6 +1387,6 @@ export class OrderService {
     for (const m of markets) {
       remainingMarket[m] = Math.max(0, Math.min(limits.per_market.max_exposure_usd - (exposure.marketUsd.get(m) ?? 0), remainingAllocation));
     }
-    return { remainingAllocation, remainingMarket, halted: global.halted || bot.halted };
+    return { remainingAllocation, remainingMarket, halted: global.halted || bot.halted, ...orders };
   }
 }
