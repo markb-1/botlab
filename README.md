@@ -52,15 +52,48 @@ Forecast Executor bot then rests post-only bids on the ones with enough edge aft
 |---|---|
 | ![Markets](docs/screenshots/markets.png) | ![Ledger](docs/screenshots/ledger.png) |
 
-### Human-owned limits, an AI agent that can't touch them
+### Talk to the agent in Claude Code or Claude Desktop
+
+BotLab is an MCP server. Connect Claude Code or Claude Desktop to `/mcp` with an agent token
+([setup](#mcp-server-ai-agent)) and you converse with the agent directly: ask for a status, have it research
+markets, assess their rules, submit forecasts, build and backtest templates, or run paper bots. It works as
+the **agent**: paper bots only, only bots it created, every call audited, and it can never change limits,
+the mandate, wallets or credentials.
+
+This is a real session against the demo instance above (rendered from the recorded transcript). One request
+asked for a status check and a short research cycle:
+
+![A Claude Code session driving BotLab over MCP](docs/screenshots/agent-chat.png)
+
+The red calls are the server saying no: all four forecasts were refused because the markets trade less than
+the mandate's $5k a day. The agent then rated the CPI markets as ambiguous (it found that BLS won't publish
+the October year-on-year figure, so they would resolve on a fallback rule), started recording their order books, left a note
+and handed the mandate question back to the owner:
+
+![The agent's answer: findings, actions, and a decision for the owner](docs/screenshots/agent-answer.png)
+
+Everything it did lands in BotLab: the run with its summary and every tool call on the **Agent** page, the
+notes it keeps for future runs, and the audit log (`mcp.*`, actor `agent`).
+
+| Run summary and tool calls | Agent notes |
+|---|---|
+| ![Agent run with summary and tool calls](docs/screenshots/agent-run.png) | ![A note the agent left for future runs](docs/screenshots/agent-notes.png) |
+
+The same agent can also run **on its own** on a schedule ([Running the agent](#running-the-agent)): the
+server starts it with the Claude Agent SDK at set times or on events, under a monthly budget. That one doesn't
+chat: you steer it with the mandate (including its free-text `notes:`), the limits and **Run now**, and it
+reports back through run summaries, notes and Telegram.
+
+![Agent page: schedule, Run now and budget](docs/screenshots/agent.png)
+
+### Human-owned limits
 
 Limits, mandate, categories and fees are YAML files with a validated form editor (risk raises are flagged,
-every change is kept with a diff and restore). The optional Claude agent works only through MCP: paper bots,
-forecasts and notes, on a schedule and a monthly budget. It can never change limits, wallets or credentials.
+every change is kept with a diff and restore). The audit log records what you, the system and the agent do.
 
-| Risk limits | Agent |
+| Risk limits | Audit log |
 |---|---|
-| ![Risk limits editor](docs/screenshots/risk.png) | ![Agent schedule and budget](docs/screenshots/agent.png) |
+| ![Risk limits editor](docs/screenshots/risk.png) | ![Audit log with the agent's MCP calls](docs/screenshots/audit.png) |
 
 ### Dashboard, and your phone
 
