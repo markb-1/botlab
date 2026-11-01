@@ -243,7 +243,7 @@ WantedBy=default.target
 
 Then:  systemctl --user daemon-reload && systemctl --user enable --now botlab
        loginctl enable-linger $USER     # keep it running without a login session
-(Or use Docker: see README.) Generate the key first if needed: npm run cli -- gen-key --prod`);
+(Or use Docker: see docs/guide/install.md.) Generate the key first if needed: npm run cli -- gen-key --prod`);
 }
 
 if (action !== 'install' && action !== 'uninstall') fail('Usage: node scripts/service.mjs install|uninstall');

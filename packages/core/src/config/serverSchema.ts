@@ -127,7 +127,7 @@ recorder:                            # order-book snapshots for backtests (top 1
   interval_seconds: 60
   max_tokens: 200                    # tokens per cycle: bot scopes, active forecasts, held, watchlist
 agent:                               # scheduled AI agent (spec §7.1); needs ANTHROPIC_API_KEY in the environment
-  enabled: false                     # off until you switch it on (paper bots only; see README "Running the agent")
+  enabled: false                     # off until you switch it on (paper bots only; see docs/guide/agent.md)
   model: claude-sonnet-5-5           # or claude-opus-5-5 (about 2x the cost)
   max_turns: 80                      # model turns per run; cost per run: limits.yaml agent.max_run_cost_usd
   schedule:                          # local times in \`timezone\`; nothing between 00:00 and 07:00

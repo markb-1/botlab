@@ -1,7 +1,7 @@
 /**
  * Polymarket (and optionally Binance) connectivity check: can this machine / IP use every endpoint BotLab
- * depends on? Used by `npm run cli -- check-polymarket` to vet a VPS before migrating (see README "Hosting on a
- * VPS"). Every request is a read-only GET: no order is placed or cancelled, no API key is created.
+ * depends on? Used by `npm run cli -- check-polymarket` to vet a VPS before migrating (see docs/guide/install.md,
+ * "Hosting on a VPS"). Every request is a read-only GET: no order is placed or cancelled, no API key is created.
  *
  * Two failure kinds are kept apart:
  * - **geo-block** (the country / region is restricted): Polymarket's geoblock endpoint says `blocked`, an HTTP
