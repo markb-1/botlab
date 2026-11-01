@@ -49,7 +49,9 @@ most the orders left this hour. The hourly rate counts only orders a bot itself 
 not the Position Manager's exits placed for it); 6 risk rejections within 10 minutes pause a bot's own
 submissions until the window drains (`rejection_cooldown`). After the Position Manager stops a position out — on
 any bot's position in the same mode — the token is skipped until its forecast is renewed, and a token (or its
-complement) with an open exit flag on any bot's position is not bid on. Each cycle it records the best edge per day it could not fund (read by the Position Manager).
+complement) with an open exit flag on any bot's position is not bid on. Markets whose 24h volume is below the trading
+floor (`min_liquidity_usd`) are skipped and its bids there cancelled: forecasts may sit below it when the mandate sets
+`min_forecast_volume_usd`, and the risk engine would refuse the bids anyway. Each cycle it records the best edge per day it could not fund (read by the Position Manager).
 
 **Position Manager** (`templates/position-manager.ts`, spec §9.2) — the only bot that can see other bots'
 positions (`ctx.portfolio`, granted by the server to this builtin template only; forks do not get it). It exits a

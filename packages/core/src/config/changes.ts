@@ -151,6 +151,8 @@ const MANDATE_RULES: Record<string, Rule> = {
   'markets.resolves_within_days': 'range-widens',
   'markets.long_horizon_days': 'range-widens',
   'markets.min_liquidity_usd': 'down',
+  // Forecasts only (shadow record); orders still need min_liquidity_usd (R209)
+  'markets.min_forecast_volume_usd': 'neutral',
   'markets.max_ambiguity_score': 'up',
   'strategies.allow': 'set-grows',
   'strategies.allow_custom_templates': 'enable',

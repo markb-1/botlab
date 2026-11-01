@@ -187,10 +187,20 @@ export const MandateSchema = z.strictObject({
       resolves_within_days: dayRange.default([0, 30]),
       long_horizon_days: dayRange.default([30, 90]),
       min_liquidity_usd: usd.default(5000),
+      // Lower 24h-volume floor for recording forecasts only (shadow track record, R209); unset = the trading floor.
+      // Orders always need min_liquidity_usd (and limits.yaml per_market).
+      min_forecast_volume_usd: usd.optional(),
       max_ambiguity_score: z.number().int().min(0).max(3).default(1),
     })
     .prefault({})
     .superRefine((m, ctx) => {
+      if (m.min_forecast_volume_usd !== undefined && m.min_forecast_volume_usd > m.min_liquidity_usd) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['min_forecast_volume_usd'],
+          message: 'must be at most min_liquidity_usd (it only lowers the floor for forecasts)',
+        });
+      }
       if (m.resolves_within_days[1] > LONG_HORIZON_DAYS) {
         ctx.addIssue({
           code: 'custom',

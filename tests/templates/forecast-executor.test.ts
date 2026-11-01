@@ -67,6 +67,9 @@ function fakeCtx(opts: {
   /** Server-side mode-wide reads (ctx.risk.getFlaggedTokens / getRecentStops); missing ⇒ the calls are absent */
   flagged?: Array<{ tokenId: string; marketId: string | null; flaggedAt: string }>;
   stops?: Array<{ tokenId: string; stoppedAt: string }>;
+  /** Trading floor (ctx.risk.getMandateSummary().minLiquidityUsd) and 24h volume per market id; missing ⇒ the calls are absent */
+  minLiquidityUsd?: number;
+  volumes?: Record<string, number | null>;
 }) {
   const placeLimit = vi.fn().mockResolvedValue({ ok: true, status: 'open', orderId: 'new' });
   const cancel = vi.fn().mockResolvedValue(undefined);
@@ -82,8 +85,10 @@ function fakeCtx(opts: {
       getBudget: vi.fn().mockResolvedValue(opts.budget ?? { remainingAllocation: 1000, remainingMarket: {}, halted: false }),
       ...(opts.flagged ? { getFlaggedTokens: vi.fn().mockResolvedValue(opts.flagged) } : {}),
       ...(opts.stops ? { getRecentStops: vi.fn().mockResolvedValue(opts.stops) } : {}),
+      ...(opts.minLiquidityUsd !== undefined ? { getMandateSummary: vi.fn().mockResolvedValue({ minLiquidityUsd: opts.minLiquidityUsd }) } : {}),
     },
     polymarket: {
+      ...(opts.volumes ? { getMarket: vi.fn(async (id: string) => (id in opts.volumes! ? { volume24hUsd: opts.volumes![id] } : null)) } : {}),
       getOpenOrders: vi.fn().mockResolvedValue(opts.open ?? []),
       getOrderHistory: vi.fn().mockResolvedValue(opts.history ?? []),
       getFee: vi.fn().mockResolvedValue(opts.fee ?? NO_FEE),
@@ -175,6 +180,22 @@ describe('forecast executor: cycle', () => {
     const r = await runExecutorCycle(ctx);
     expect(r.planned).toEqual([]);
     expect(placeLimit).not.toHaveBeenCalled();
+  });
+
+  it('skips markets whose 24h volume is below the trading floor (forecasts may sit below it, R209) and cancels its bids there', async () => {
+    const books = { yes1: book(0.49, 0.52), no1: book(0.3, 0.33) };
+    const live = { orderId: 'o1', exchange: 'polymarket', marketId: 'm1', tokenId: 'yes1', side: 'buy', orderType: 'limit', price: 0.5, size: 20, filledSize: 0, status: 'open', expiresAt: new Date(NOW + 60 * 60_000).toISOString(), createdAt: '', forecastId: 'f1', placedBy: null };
+    let f = fakeCtx({ forecasts: [forecast()], books, open: [live], minLiquidityUsd: 5000, volumes: { m1: 1500 } });
+    let r = await runExecutorCycle(f.ctx);
+    expect(r.planned).toEqual([]);
+    expect(f.placeLimit).not.toHaveBeenCalled();
+    expect(f.cancel).toHaveBeenCalledWith('o1');
+    // At or above the floor, unknown volume (the risk engine decides) or no mandate summary (backtests): quoted as before
+    for (const opts of [{ minLiquidityUsd: 5000, volumes: { m1: 5000 } }, { minLiquidityUsd: 5000, volumes: { m1: null } }, { minLiquidityUsd: 5000, volumes: {} }, {}]) {
+      f = fakeCtx({ forecasts: [forecast()], books, ...opts });
+      r = await runExecutorCycle(f.ctx);
+      expect(r.planned).toHaveLength(2);
+    }
   });
 
   it('keeps a matching order, replaces one tagged with a superseded forecast, cancels when the forecast is gone', async () => {

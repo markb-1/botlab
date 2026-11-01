@@ -213,6 +213,7 @@ export class MarketService {
     const mandate = this.extras.getMandate?.() ?? null;
     const limits = this.extras.getLimits?.() ?? null;
     const minLiq = Math.max(mandate?.markets.min_liquidity_usd ?? 0, limits?.per_market.min_liquidity_usd ?? 0);
+    const forecastFloor = mandate?.markets.min_forecast_volume_usd;
     const now = this.now();
     const out: AgentSearchHit[] = [];
     for (const h of hits) {
@@ -234,7 +235,13 @@ export class MarketService {
         const inHorizon = (daysToEnd >= s0 && daysToEnd <= s1) || (daysToEnd >= l0 && daysToEnd <= Math.min(l1, MAX_HORIZON_DAYS));
         if (!inHorizon) flags.push(`settles in ${daysToEnd.toFixed(1)} days (outside the mandate horizons)`);
       }
-      if ((h.volume24hUsd ?? 0) < minLiq) flags.push(`24h volume ${h.volume24hUsd ?? 'unknown'} < ${minLiq}`);
+      const volume = h.volume24hUsd ?? 0;
+      if (volume < minLiq) {
+        // Between the forecast floor (R209) and the trading floor a forecast can still be recorded
+        if (forecastFloor === undefined) flags.push(`24h volume ${h.volume24hUsd ?? 'unknown'} < ${minLiq}`);
+        else if (volume >= forecastFloor) flags.push(`24h volume ${h.volume24hUsd} < ${minLiq}: forecast only (orders need min_liquidity_usd)`);
+        else flags.push(`24h volume ${h.volume24hUsd ?? 'unknown'} < ${forecastFloor} (min_forecast_volume_usd): no forecast either`);
+      }
       if (mandate && h.ambiguityScore !== null && h.ambiguityScore > mandate.markets.max_ambiguity_score) {
         flags.push(`ambiguity ${h.ambiguityScore} > mandate max ${mandate.markets.max_ambiguity_score}`);
       }

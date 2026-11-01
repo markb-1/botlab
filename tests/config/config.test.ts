@@ -196,6 +196,14 @@ describe('config loader', () => {
     write('mandate.yaml', 'markets:\n  resolves_within_days: [1, 14]\n  long_horizon_days: [45, 60]\n');
     expect(loadConfig(dir).mandate.markets.long_horizon_days).toEqual([45, 60]);
   });
+
+  it('min_forecast_volume_usd is optional (unset: forecasts use the trading floor) and at most min_liquidity_usd', () => {
+    expect(MandateSchema.parse({}).markets.min_forecast_volume_usd).toBeUndefined();
+    write('mandate.yaml', 'markets:\n  min_forecast_volume_usd: 1000\n');
+    expect(loadConfig(dir).mandate.markets.min_forecast_volume_usd).toBe(1000);
+    write('mandate.yaml', 'markets:\n  min_liquidity_usd: 2000\n  min_forecast_volume_usd: 3000\n');
+    expect(() => loadConfig(dir)).toThrow(/min_forecast_volume_usd/);
+  });
 });
 
 describe('cross-file validation', () => {

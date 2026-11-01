@@ -306,9 +306,13 @@ export class LedgerService implements ForecastSource, CategoryBucketSource {
     const mandateNow = this.deps.getMandate();
     if (!mandateNow) throw new LedgerValidationError('Mandate unavailable (config invalid); cannot check the market');
     const limitsNow = this.deps.getLimits?.() ?? null;
-    const minLiquidity = Math.max(mandateNow.markets.min_liquidity_usd, limitsNow?.per_market.min_liquidity_usd ?? 0);
+    // The mandate may set a lower floor for forecasts only (shadow track record, R209); orders keep the trading floor
+    const forecastFloor = mandateNow.markets.min_forecast_volume_usd;
+    const minLiquidity = forecastFloor ?? Math.max(mandateNow.markets.min_liquidity_usd, limitsNow?.per_market.min_liquidity_usd ?? 0);
     if (market.volume24hUsd === null || market.volume24hUsd < minLiquidity) {
-      throw new LedgerValidationError(`Market liquidity ${market.volume24hUsd ?? 'unknown'} (24h volume) < ${minLiquidity}`);
+      throw new LedgerValidationError(
+        `Market liquidity ${market.volume24hUsd ?? 'unknown'} (24h volume) < ${minLiquidity}${forecastFloor !== undefined ? ' (min_forecast_volume_usd)' : ''}`
+      );
     }
 
     const now = this.now();

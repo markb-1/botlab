@@ -72,6 +72,7 @@ markets:
   resolves_within_days: [0, 30]       # default horizon
   long_horizon_days: [30, 90]         # allowed only within limits.global.max_long_horizon_pct
   min_liquidity_usd: 5000            # 24h volume (USD), not order-book liquidity
+  # min_forecast_volume_usd: 1000    # lower 24h-volume floor for recording forecasts only (orders keep the one above)
   max_ambiguity_score: 1              # skip markets rated 2-3
 strategies:
   allow: [forecast, consistency, resolution_rule]   # template keys
