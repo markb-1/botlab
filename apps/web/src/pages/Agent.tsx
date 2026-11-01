@@ -56,7 +56,7 @@ function ScheduleCard({ schedule }: { schedule: AgentSchedule }) {
             <Link to="/risk?tab=server" className="text-accent hover:underline">
               Risk → Server
             </Link>
-            ): <code>agent.enabled: true</code>, with <code>ANTHROPIC_API_KEY</code> in the server environment (README “Running the agent”).
+            ): <code>agent.enabled: true</code>, with <code>ANTHROPIC_API_KEY</code> in the server environment (docs/guide/agent.md, “Running the agent”).
           </Notice>
         )}
         <Facts
